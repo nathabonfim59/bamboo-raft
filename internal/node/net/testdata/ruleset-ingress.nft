@@ -1,0 +1,116 @@
+# Managed by bbraft-node; replaced atomically. Do not edit.
+# Isolation for VM TAPs on bbraft0. Own tables only: hardening's inet
+# bbraft_filter is never named, flushed or edited by this ruleset.
+
+table bridge bbraft_bridge
+delete table bridge bbraft_bridge
+table inet bbraft_net
+delete table inet bbraft_net
+
+table bridge bbraft_bridge {
+	set vm_ports {
+		type ifname
+		elements = { "bt01264065", "bt049ddaa7" }
+	}
+
+	# Source validation for every frame a guest TAP emits. The arp
+	# family has no forward hook, so ARP is inspected here.
+	chain vm_source {
+		iifname "bt01264065" ether saddr != 52:54:00:2a:00:02 drop
+		iifname "bt01264065" ether type != { ip, arp } drop
+		iifname "bt01264065" ether type ip ip saddr != 10.42.0.2 drop
+		iifname "bt01264065" ether type arp arp saddr ip != 10.42.0.2 drop
+		iifname "bt01264065" ether type arp arp saddr ether != 52:54:00:2a:00:02 drop
+		iifname "bt049ddaa7" ether saddr != 52:54:00:2a:00:03 drop
+		iifname "bt049ddaa7" ether type != { ip, arp } drop
+		iifname "bt049ddaa7" ether type ip ip saddr != 10.42.0.3 drop
+		iifname "bt049ddaa7" ether type arp arp saddr ip != 10.42.0.3 drop
+		iifname "bt049ddaa7" ether type arp arp saddr ether != 52:54:00:2a:00:03 drop
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		jump vm_source
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		jump vm_source
+		# No frame may pass between two guest TAPs, even with forged L2.
+		# The bridge slave isolation flag is the first line; this rule also
+		# covers broadcast and hairpin copies.
+		iifname @vm_ports oifname @vm_ports drop
+		# ARP never crosses the bridge: guests only resolve the gateway.
+		ether type arp drop
+	}
+}
+
+table inet bbraft_net {
+	set vm_addrs {
+		type ipv4_addr
+		elements = { 10.42.0.2, 10.42.0.3 }
+	}
+	set dns_addrs {
+		type ipv4_addr
+		elements = { 1.1.1.1, 8.8.8.8 }
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		# Nothing a guest sends may reach a service on the node itself.
+		iifname "bbraft0" drop
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		# Nothing may traverse the node between two guests, whatever
+		# conntrack says. This also blocks a hairpin through DNAT.
+		iifname "bbraft0" oifname "bbraft0" drop
+		# Inbound is admitted before any egress destination drop, and never
+		# from a guest: replies to guest flows, and the exact SSH ingress
+		# tuples this node published. The generic return excludes DNAT
+		# connections; otherwise an established SSH flow could enter through
+		# it and bypass the ingress interface binding below.
+		oifname "bbraft0" iifname != "bbraft0" ct state established,related ct status and dnat != dnat accept
+		oifname "bbraft0" iifname != "bbraft0" ip daddr 10.42.0.2 tcp dport 22 ct status dnat ct original ip daddr 203.0.113.10 ct original proto-dst 30000 accept
+		oifname "bbraft0" iifname != "bbraft0" ip daddr 10.42.0.3 tcp dport 22 ct status dnat ct original ip daddr 203.0.113.10 ct original proto-dst 30001 accept
+		oifname "bbraft0" drop
+		# Egress: routed IPv4 from a guest, sanitized by the bridge table.
+		# Routed IPv6 per VM is not part of Phase 1.
+		iifname "bbraft0" meta nfproto != ipv4 drop
+		# Invalid conntrack state is dropped instead of being NATed.
+		iifname "bbraft0" ct state invalid drop
+		# Replies of our own SSH ingress, for clients (a tailnet address,
+		# for example) that the egress policy blocks. This is the only
+		# established exception, and it is bound to the owned DNAT tuple and
+		# (when configured) leaves through the same external interface the
+		# connection arrived on.
+		iifname "bbraft0" ip saddr 10.42.0.2 tcp sport 22 ct state established ct status dnat ct original ip daddr 203.0.113.10 ct original proto-dst 30000 accept
+		iifname "bbraft0" ip saddr 10.42.0.3 tcp sport 22 ct state established ct status dnat ct original ip daddr 203.0.113.10 ct original proto-dst 30001 accept
+		# No guest-to-guest path, whether spoofed or routed.
+		iifname "bbraft0" ip daddr @vm_addrs drop
+		# No route into the node's private, link-local, management or
+		# loopback networks; the guest prefix itself is included.
+		iifname "bbraft0" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 10.42.0.0/16, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.2.0/24, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } drop
+		# DNS answers come from the configured resolvers only.
+		iifname "bbraft0" udp dport 53 ip daddr != @dns_addrs drop
+		iifname "bbraft0" tcp dport 53 ip daddr != @dns_addrs drop
+		# Everything left is IPv4 egress, subject to NAT below.
+		iifname "bbraft0" accept
+	}
+
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		# Bounded SSH ingress: one DNAT rule per allocated guest, never
+		# from the guest bridge (that would let a guest hairpin to a peer).
+		# When an ingress interface is configured, only frames arriving on
+		# it are DNATed, even if their destination address matches.
+		iifname != "bbraft0" ip daddr 203.0.113.10 tcp dport 30000 dnat ip to 10.42.0.2:22
+		iifname != "bbraft0" ip daddr 203.0.113.10 tcp dport 30001 dnat ip to 10.42.0.3:22
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		iifname "bbraft0" ip saddr @vm_addrs oifname != "bbraft0" masquerade
+	}
+}

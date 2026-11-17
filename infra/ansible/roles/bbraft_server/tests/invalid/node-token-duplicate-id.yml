@@ -1,0 +1,6 @@
+# Invalid input: two entries may share a digest, but not an id.
+bbraft_server_node_tokens:
+  - id: node-example
+    tokenSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  - id: node-example
+    tokenSha256: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"

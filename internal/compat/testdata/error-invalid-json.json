@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 400,
+  "code": "invalid_json",
+  "message": "Request body must be valid JSON.",
+  "error": {"code": "invalid_json", "message": "Request body must be valid JSON.", "status": 400},
+  "requestId": "req_01HXEXAMPLE"
+}

@@ -1,0 +1,5 @@
+# Real inventory: addresses, key paths, disk serials. Never committed;
+# start from inventory.example/.
+/inventory/
+# Galaxy collections from `ansible-galaxy collection install -r requirements.yml`
+/.collections/

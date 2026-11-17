@@ -1,0 +1,119 @@
+# One stale-state transition case (included by legacy-transition.yml): the
+# role's read-only recognition runs, the tree changes (lt.plant), then the
+# role's acquisition runs with that earlier observation. A refusal must leave
+# the whole parent identical to the state right after the plant; then the
+# test undoes its plant (lt.undo) and a fresh recognition plus acquisition
+# must succeed (positive retry). A refusal counts only with the plant
+# witness: lt_planted is set (with the post-plant snapshot) only after both
+# the plant and its snapshot succeeded, so a failed plant rescued by the
+# block is never mistaken for an expected refusal. A case with
+# lt.unwitnessed (the failed-plant control) must end without that witness.
+- name: "{{ lt.name }}: fresh temporary parent"
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: bbraft-transition
+  register: lt_parent
+
+- name: "{{ lt.name }}: name the data dir"
+  ansible.builtin.set_fact:
+    lt_data: "{{ lt_parent.path }}/data"
+    lt_result: unknown
+    lt_msg: ""
+    lt_planted: false
+    lt_before_out: ""
+    lt_env:
+      D: "{{ lt_parent.path }}/data"
+      M: .bbraft-node-data-v1
+
+- name: "{{ lt.name }}: starting tree"
+  ansible.builtin.shell: "{{ lt.setup }}"
+  args: {executable: /bin/sh}
+  environment: "{{ lt_env }}"
+  when: lt.setup | length > 0
+  changed_when: false
+
+- name: "{{ lt.name }}: recognize, change the tree, then acquire"
+  block:
+    - name: "{{ lt.name }}: recognition"
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: data-dir-check
+      vars: &lt_vars
+        bbraft_node_data_dir: "{{ lt_data }}"
+        bbraft_node_data_owner: "{{ lt_user }}"
+        bbraft_node_data_group: "{{ lt_group }}"
+    - name: "{{ lt.name }}: plant"
+      ansible.builtin.shell: "{{ lt.plant }}"
+      args: {executable: /bin/sh}
+      environment: "{{ lt_env }}"
+      changed_when: false
+    - name: "{{ lt.name }}: snapshot after the plant"
+      ansible.builtin.command:
+        argv: [python3, "{{ playbook_dir }}/tree_snapshot.py", "{{ lt_parent.path }}"]
+      register: lt_before_raw
+      changed_when: false
+    - name: "{{ lt.name }}: plant witness"
+      ansible.builtin.set_fact:
+        lt_planted: true
+        lt_before_out: "{{ lt_before_raw.stdout }}"
+    - name: "{{ lt.name }}: acquisition with the earlier observation"
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: "{{ lt.step | default('data-dir-create') }}"
+      vars: *lt_vars
+    - name: "{{ lt.name }}: accepted"
+      ansible.builtin.set_fact:
+        lt_result: accepted
+  rescue:
+    - name: "{{ lt.name }}: refused"
+      ansible.builtin.set_fact:
+        lt_result: refused
+        lt_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "{{ lt.name }}: snapshot after the acquisition"
+  ansible.builtin.command:
+    argv: [python3, "{{ playbook_dir }}/tree_snapshot.py", "{{ lt_parent.path }}"]
+  register: lt_after
+  changed_when: false
+
+- name: "{{ lt.name }}: judge the case"
+  ansible.builtin.set_fact:
+    lt_expected_refusal: "{{ lt_planted and lt_result == 'refused' and lt_before_out == lt_after.stdout }}"
+
+- name: "{{ lt.name }}: record a refusal that changed the tree, did not happen or has no plant witness"
+  ansible.builtin.set_fact:
+    lt_failures: "{{ lt_failures + [lt.name ~ ': result ' ~ lt_result ~ ' (' ~ lt_msg ~ '); planted: ' ~ lt_planted ~ '; tree changed: ' ~ (lt_before_out != lt_after.stdout)] }}"
+  when: not (lt.unwitnessed | default(false)) and not lt_expected_refusal
+
+- name: "{{ lt.name }}: record a failed-plant control that was counted as a refusal"
+  ansible.builtin.set_fact:
+    lt_failures: "{{ lt_failures + [lt.name ~ ': the failed plant was not detected (planted: ' ~ lt_planted ~ ', expected refusal: ' ~ lt_expected_refusal ~ ')'] }}"
+  when: (lt.unwitnessed | default(false)) and (lt_planted or lt_expected_refusal)
+
+- name: "{{ lt.name }}: undo the plant"
+  ansible.builtin.shell: "{{ lt.undo }}"
+  args: {executable: /bin/sh}
+  environment: "{{ lt_env }}"
+  changed_when: false
+
+- name: "{{ lt.name }}: positive retry"
+  block:
+    - name: "{{ lt.name }}: retry recognition"
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: data-dir-check
+      vars: *lt_vars
+    - name: "{{ lt.name }}: retry acquisition"
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: data-dir-create
+      vars: *lt_vars
+    - name: "{{ lt.name }}: retry verification"
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: data-dir-verify
+      vars: *lt_vars
+  rescue:
+    - name: "{{ lt.name }}: the retry failed"
+      ansible.builtin.set_fact:
+        lt_failures: "{{ lt_failures + [lt.name ~ ': positive retry failed: ' ~ (ansible_failed_result.msg | default(''))] }}"

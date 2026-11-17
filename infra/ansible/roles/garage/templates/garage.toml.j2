@@ -1,0 +1,28 @@
+# Managed by bamboo-raft infra/ansible (role garage). Secrets live in files
+# under {{ garage_secrets_dir }}, generated on this host, never in the repo.
+
+metadata_dir = "{{ garage_meta_dir }}"
+data_dir = "{{ garage_data_dir }}"
+db_engine = "lmdb"
+
+# One node, no replicas: fsync both, so an acknowledged write survives a
+# crash.
+replication_factor = 1
+metadata_fsync = true
+data_fsync = true
+
+# bbraft compresses its chunks with zstd already.
+compression_level = "none"
+
+rpc_bind_addr = "{{ garage_rpc_bind }}"
+rpc_public_addr = "{{ garage_rpc_bind }}"
+rpc_secret_file = "{{ garage_secrets_dir }}/rpc_secret"
+
+[s3_api]
+s3_region = "{{ garage_region }}"
+api_bind_addr = "{{ garage_s3_bind }}"
+
+[admin]
+api_bind_addr = "{{ garage_admin_bind }}"
+admin_token_file = "{{ garage_secrets_dir }}/admin_token"
+metrics_token_file = "{{ garage_secrets_dir }}/metrics_token"

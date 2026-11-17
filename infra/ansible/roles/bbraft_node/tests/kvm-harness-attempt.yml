@@ -1,0 +1,50 @@
+# One harness attempt (included by kvm-harness-render.yml): the role's own
+# validate.yml and unit template with attempt-unique names.
+- name: "{{ kt_name }}: derive the attempt names"
+  ansible.builtin.set_fact:
+    kt_a: "{{ kt_ids[kt_name] }}"
+    bbraft_node_service: "bbraft-kt-{{ kt_ids[kt_name] }}"
+    bbraft_node_id: "kt-{{ kt_ids[kt_name] }}"
+    bbraft_node_data_dir: "/var/lib/bbraft-kt-{{ kt_ids[kt_name] }}"
+    bbraft_node_image_dir: "/var/lib/bbraft-kt-{{ kt_ids[kt_name] }}/images"
+    bbraft_node_config_dir: "/etc/bbraft-kt-{{ kt_ids[kt_name] }}"
+    bbraft_node_token_file: "/etc/bbraft-kt-{{ kt_ids[kt_name] }}/node.token"
+    bbraft_node_binary_path: "/var/lib/bbraft-kt-stage-{{ kt_ids[kt_name] }}/bin/bbraft-node"
+    bbraft_node_unit_path: "/run/systemd/system/bbraft-kt-{{ kt_ids[kt_name] }}.service"
+    bbraft_node_binary_src: "{{ kt_binary }}"
+    bbraft_node_binary_sha256: "{{ kt_binary_sha256 }}"
+    bbraft_node_images: ["{{ kt_image }}"]
+    bbraft_node_default_image: "{{ kt_image | basename }}"
+    bbraft_node_jail_uid_range: "{{ kt_jail_uid_range }}"
+    bbraft_node_jail_io_device: "{{ kt_io_device }}"
+    bbraft_node_jail_io_write_bps: "{{ kt_io_write_bps }}"
+
+# public: the role defaults and validate's normalized facts stay visible to
+# the template task below.
+- name: "{{ kt_name }}: validate with the role"
+  ansible.builtin.include_role:
+    name: bbraft_node
+    tasks_from: validate
+    public: true
+
+- name: "{{ kt_name }}: render the unit with the role template"
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../templates/bbraft-node.service.j2"
+    dest: "{{ kt_out }}/{{ bbraft_node_service }}.service"
+    mode: "0644"
+
+- name: "{{ kt_name }}: record the attempt"
+  ansible.builtin.set_fact:
+    kt_manifest: >-
+      {{ kt_manifest | default({}) | combine({kt_name: {
+           'attempt': kt_a,
+           'unit': kt_out ~ '/' ~ bbraft_node_service ~ '.service',
+           'service': bbraft_node_service,
+           'nodeId': bbraft_node_id,
+           'configDir': bbraft_node_config_dir,
+           'dataDir': bbraft_node_data_dir,
+           'imageDir': bbraft_node_image_dir,
+           'stageDir': '/var/lib/bbraft-kt-stage-' ~ kt_a,
+           'binaryPath': bbraft_node_binary_path,
+           'binarySha256': kt_binary_sha256,
+           'unitPath': bbraft_node_unit_path}}) }}

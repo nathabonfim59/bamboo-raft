@@ -1,0 +1,170 @@
+# Close the host to everything but the tailnet. Order matters: SSH and DNS
+# settings first (harmless), then the inbound filter, which is applied with an
+# automatic rollback and confirmed only after Ansible reconnects.
+
+# --- Preconditions ---------------------------------------------------------
+
+- name: Read the address this SSH session arrived on
+  ansible.builtin.command:
+    argv: [sh, -c, 'printf "%s\n" "$SSH_CONNECTION"']
+  # sudo clears SSH_CONNECTION, and an inventory `ansible_become: true`
+  # outranks the `become` keyword, so turn it off as a variable.
+  vars:
+    ansible_become: false
+  register: hardening_ssh_connection
+  changed_when: false
+  check_mode: false
+  when: hardening_require_tailnet_connection | bool
+
+- name: Ansible reaches the host through the tailnet
+  ansible.builtin.assert:
+    that:
+      - hardening_local_addr is match('^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.') or
+        hardening_local_addr is match('^fd7a:115c:a1e0:')
+    fail_msg: >-
+      Ansible is connected to {{ hardening_local_addr }}, not a tailnet address.
+      Point ansible_host at the host's tailnet name first, or the inbound filter
+      would cut this connection.
+    quiet: true
+  vars:
+    hardening_local_addr: "{{ (hardening_ssh_connection.stdout.split() + ['', '', ''])[2] }}"
+  when: hardening_require_tailnet_connection | bool
+
+- name: The tailnet interface is up
+  ansible.builtin.command:
+    argv: [ip, link, show, dev, "{{ item }}"]
+  loop: "{{ hardening_trusted_interfaces }}"
+  changed_when: false
+  check_mode: false
+
+# --- OpenSSH ---------------------------------------------------------------
+
+# sshd uses the first value it reads and includes sshd_config.d/*.conf at the
+# top, so 05- wins over cloud-init's 50- drop-in.
+- name: Restrict OpenSSH logins
+  block:
+    - name: Write the sshd drop-in
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/05-bbraft.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by bamboo-raft infra/ansible (role hardening).
+          PermitRootLogin no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          AllowUsers {{ hardening_ssh_allow_users | join(' ') }}
+          X11Forwarding no
+      notify: Reload sshd
+      register: hardening_sshd_dropin
+
+    - name: The sshd configuration is valid
+      ansible.builtin.command:
+        argv: [sshd, -t]
+      changed_when: false
+      when: hardening_sshd_dropin is changed and not ansible_check_mode
+  rescue:
+    - name: Remove the invalid sshd drop-in
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/05-bbraft.conf
+        state: absent
+
+    - name: Stop on the invalid sshd configuration
+      ansible.builtin.fail:
+        msg: sshd -t rejected the drop-in; it was removed and sshd was not reloaded
+
+# --- Resolver --------------------------------------------------------------
+
+- name: Create the resolved drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/resolved.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Turn off the LLMNR and mDNS responders
+  ansible.builtin.copy:
+    dest: /etc/systemd/resolved.conf.d/bbraft.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by bamboo-raft infra/ansible (role hardening).
+      [Resolve]
+      LLMNR=no
+      MulticastDNS=no
+  notify: Restart systemd-resolved
+
+- name: Apply SSH and resolver changes before the firewall
+  ansible.builtin.meta: flush_handlers
+
+# --- Inbound filter --------------------------------------------------------
+
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+
+- name: Write the inbound filter
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: nft -c -f %s
+  register: hardening_nft_conf
+
+- name: Read the live inbound filter
+  ansible.builtin.command:
+    argv: [nft, list, table, inet, bbraft_filter]
+  register: hardening_nft_live
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Apply the inbound filter with an automatic rollback
+  when:
+    - not ansible_check_mode
+    - hardening_nft_conf is changed or hardening_nft_live.rc != 0
+  block:
+    # Never `systemctl stop nftables`: Debian's unit flushes the whole
+    # ruleset on stop, including tailscaled's tables.
+    - name: Arm the rollback timer
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - --unit=bbraft-firewall-rollback
+          - "--on-active={{ hardening_firewall_rollback_seconds }}"
+          - --timer-property=AccuracySec=1s
+          - /bin/sh
+          - -c
+          - nft delete table inet bbraft_filter; systemctl disable nftables
+      changed_when: true
+
+    - name: Load the inbound filter
+      ansible.builtin.command:
+        argv: [nft, -f, /etc/nftables.conf]
+      changed_when: true
+
+    - name: Drop the current SSH connection
+      ansible.builtin.meta: reset_connection
+
+    - name: Reconnect through the filter
+      ansible.builtin.wait_for_connection:
+        timeout: 60
+
+    - name: Disarm the rollback timer
+      ansible.builtin.systemd_service:
+        name: bbraft-firewall-rollback.timer
+        state: stopped
+
+- name: Load the inbound filter at boot
+  ansible.builtin.systemd_service:
+    name: nftables
+    enabled: true
+  # A first --check installs nothing, so the unit does not exist yet.
+  when: not ansible_check_mode or hardening_nft_live.rc == 0

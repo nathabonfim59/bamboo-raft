@@ -1,0 +1,2 @@
+# Rejected because it is not a plain SQL identifier.
+postgres_user: "bbraft;drop"

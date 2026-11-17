@@ -1,0 +1,100 @@
+# Tailscale's resolver (MagicDNS, 100.100.100.100) as the host's primary DNS
+# server for every name, not only the tailnet domain. Run alone with
+#   ansible-playbook site.yml --tags tailscale_dns
+#
+# systemd-resolved sends a query to every scope whose routing domain
+# matches; `Domains=~.` on the global scope makes Tailscale's resolver match
+# everything. The provider's DHCP resolver stays on its link as a parallel
+# path, and FallbackDNS only applies when no server is configured, so name
+# resolution survives a tailscaled restart. tailscaled reaches its control
+# plane through its own bootstrap DNS, so this creates no loop.
+
+- name: The host runs systemd-resolved
+  ansible.builtin.stat:
+    path: /run/systemd/resolve/stub-resolv.conf
+  register: tailscale_resolved_stub
+
+- name: Tailscale DNS needs systemd-resolved in stub mode
+  ansible.builtin.assert:
+    that:
+      - tailscale_resolved_stub.stat.exists
+    fail_msg: systemd-resolved's stub resolver is not running; this role only configures resolved
+    quiet: true
+
+- name: Create the resolved drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/resolved.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Tailscale's resolver forwards non-tailnet names only to the tailnet's
+# global nameservers (admin console, DNS). Without them, making it primary
+# turns every public lookup into SERVFAIL, so prove it first by asking it
+# directly, before anything changes.
+- name: Tailscale's resolver answers public names
+  ansible.builtin.command:
+    argv: [resolvectl, query, --legend=no, --interface=tailscale0, "{{ item }}"]
+  loop: "{{ tailscale_dns_check_names }}"
+  register: tailscale_dns_precheck
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: tailscale_dns_primary | bool
+
+- name: Refuse to make a resolver primary that cannot answer public names
+  ansible.builtin.assert:
+    that:
+      - tailscale_dns_precheck.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+    fail_msg: >-
+      Tailscale's resolver cannot resolve
+      {{ tailscale_dns_precheck.results | rejectattr('rc', 'equalto', 0) | map(attribute='item') | join(', ') }}.
+      Add global nameservers for the tailnet (admin console, DNS, Nameservers)
+      first; nothing was changed.
+    quiet: true
+  when: tailscale_dns_primary | bool
+
+- name: Make Tailscale the primary resolver
+  ansible.builtin.copy:
+    dest: /etc/systemd/resolved.conf.d/tailscale.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by bamboo-raft infra/ansible (role tailscale, tag tailscale_dns).
+      [Resolve]
+      DNS={{ tailscale_dns_servers | join(' ') }}
+      Domains=~.
+  when: tailscale_dns_primary | bool
+  notify: Restart systemd-resolved for Tailscale DNS
+
+- name: Remove the primary-resolver drop-in when turned off
+  ansible.builtin.file:
+    path: /etc/systemd/resolved.conf.d/tailscale.conf
+    state: absent
+  when: not (tailscale_dns_primary | bool)
+  notify: Restart systemd-resolved for Tailscale DNS
+
+- name: Tailscale accepts the tailnet's DNS settings
+  ansible.builtin.command:
+    argv: [tailscale, set, --accept-dns=true]
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Apply the resolver change now
+  ansible.builtin.meta: flush_handlers
+
+- name: Read the host's tailnet name
+  ansible.builtin.command:
+    argv: [tailscale, status, --json, --peers=false]
+  register: tailscale_dns_status
+  changed_when: false
+  check_mode: false
+
+- name: Tailnet and public names resolve
+  ansible.builtin.command:
+    argv: [resolvectl, query, --legend=no, "{{ item }}"]
+  loop: "{{ tailscale_dns_check_names + [(tailscale_dns_status.stdout | from_json).Self.DNSName | regex_replace('\\.$', '')] }}"
+  changed_when: false
+  when: not ansible_check_mode

@@ -1,0 +1,20 @@
+# Read-only recognition of the data root (A10 D-b, fix A). It runs before any
+# task that changes the host and never creates, chowns, chmods or removes
+# anything. Phase 0.5 -> Phase 1 requires a fresh data dir: an existing
+# directory is accepted only when it is exactly the supervisor's own 0700
+# directory that is either empty or holds the exact v1 marker (a regular,
+# single-link, 0600 file of the supervisor with exactly
+# bbraft_node_data_marker_content). Everything else, including root-owned
+# legacy data without the marker, a symlink, a foreign owner, group or mode,
+# and a marker of any other shape, is refused. The configured parent must
+# already exist. The observation (state plus the parent, root and marker
+# identities) is what data-dir-create.yml later acquires, exactly.
+- name: Recognize the data root (read-only)
+  bbraft_node_data_root:
+    path: "{{ bbraft_node_data_dir }}"
+    owner: "{{ bbraft_node_data_owner }}"
+    group: "{{ bbraft_node_data_group }}"
+    marker_name: "{{ bbraft_node_data_marker_name }}"
+    marker_content: "{{ bbraft_node_data_marker_content }}"
+    mode: observe
+  register: bbraft_node_data_root_observed

@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "type": "snapshot.saved.info",
+  "snapshot": {
+    "name": "make-check-base",
+    "status": "ready",
+    "sourceSandboxId": "bx_23456789",
+    "snapshotId": "snap-0123456789abcdef0123456789abcdef",
+    "type": "default",
+    "sizeBytes": 123456,
+    "createdAt": "2026-11-08T12:00:00Z"
+  }
+}

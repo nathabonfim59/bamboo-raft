@@ -1,0 +1,7 @@
+# Valid input: different node ids may share a digest (auth only requires
+# unique ids).
+bbraft_server_node_tokens:
+  - id: node-one
+    tokenSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  - id: node-two
+    tokenSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

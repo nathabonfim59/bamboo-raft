@@ -1,0 +1,4 @@
+# Invalid input: tokenSha256 must be lowercase hexadecimal.
+bbraft_server_node_tokens:
+  - id: node-example
+    tokenSha256: "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"

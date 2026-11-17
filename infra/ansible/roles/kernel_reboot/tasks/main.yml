@@ -1,0 +1,39 @@
+- name: Find the newest installed kernel
+  ansible.builtin.shell: |
+    set -o pipefail
+    ls -1 /boot/vmlinuz-* | sed 's|^/boot/vmlinuz-||' | sort -V | tail -n 1
+  args:
+    executable: /bin/bash
+  register: kernel_newest
+  changed_when: false
+  check_mode: false   # read-only probe; must run in --check too
+
+- name: Report the kernel state
+  ansible.builtin.debug:
+    msg: >-
+      running {{ ansible_facts.kernel }}, newest installed {{ kernel_newest.stdout }}
+      {{ '(reboot needed)' if kernel_newest.stdout != ansible_facts.kernel else '(up to date)' }}
+
+- name: Reboot into the newest kernel
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ kernel_reboot_timeout }}"
+    msg: "bamboo-raft: reboot into kernel {{ kernel_newest.stdout }}"
+  when:
+    - kernel_reboot_allowed | bool
+    - kernel_newest.stdout != ansible_facts.kernel
+
+- name: Running kernel after reboot
+  ansible.builtin.command: uname -r
+  register: kernel_after
+  changed_when: false
+  when:
+    - kernel_reboot_allowed | bool
+    - kernel_newest.stdout != ansible_facts.kernel
+    - not ansible_check_mode   # --check does not really reboot
+
+- name: The node must run the newest kernel
+  ansible.builtin.assert:
+    that: kernel_after.stdout == kernel_newest.stdout
+    fail_msg: "still on {{ kernel_after.stdout }} after reboot; check GRUB's default entry"
+    quiet: true
+  when: kernel_after is not skipped

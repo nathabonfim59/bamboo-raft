@@ -1,0 +1,47 @@
+# Inputs and safety checks. Imported first by tasks/main.yml and directly by
+# the role-local tests, so an invalid install never touches a host.
+- name: PostgreSQL password is supplied by the caller
+  ansible.builtin.assert:
+    that:
+      - postgres_password is string
+      - postgres_password | length > 0
+    fail_msg: "postgres_password is required; set it from a vault or inventory, never a repository default"
+    quiet: true
+  no_log: true
+
+- name: PostgreSQL names and port are valid
+  ansible.builtin.assert:
+    that:
+      - postgres_user is string
+      - postgres_user is match('^[A-Za-z_][A-Za-z0-9_]*$')
+      - postgres_database is string
+      - postgres_database is match('^[A-Za-z_][A-Za-z0-9_]*$')
+      - postgres_version is string
+      - postgres_version is match('^[0-9]+$')
+      - postgres_version | postgres_positive_int >= 17
+      - postgres_cluster is string
+      - postgres_cluster is match('^[A-Za-z0-9_-]+$')
+      - postgres_port | postgres_positive_int <= 65535
+      - postgres_unix_socket is string
+      - postgres_unix_socket | length > 0
+      - postgres_unix_socket is not search("\\n")
+      - postgres_unix_socket is not search("\\r")
+    fail_msg: >-
+      invalid PostgreSQL settings: user/database must be simple SQL
+      identifiers, version must be 17 or newer, cluster must contain only
+      letters, digits, underscore or dash, and the port must be 1-65535
+    quiet: true
+
+# postgres_listen_addresses is interpolated into a single-quoted PostgreSQL
+# setting. A quote, backslash or line break would escape the value.
+- name: PostgreSQL listen address is a plain list
+  ansible.builtin.assert:
+    that:
+      - postgres_listen_addresses is string
+      - postgres_listen_addresses | length > 0
+      - postgres_listen_addresses is not search("[']")
+      - postgres_listen_addresses is not search("[\\\\]")
+      - postgres_listen_addresses is not search("\\n")
+      - postgres_listen_addresses is not search("\\r")
+    fail_msg: "postgres_listen_addresses must be a comma-separated address list without quotes, backslashes or line breaks"
+    quiet: true

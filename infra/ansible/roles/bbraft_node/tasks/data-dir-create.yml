@@ -1,0 +1,16 @@
+# Acquires exactly the data root data-dir-check.yml observed (A10 fix A): an
+# absent root is created by an exclusive mkdir (anything that appeared is
+# refused untouched), an empty root is marked by an exclusive no-follow create
+# (a planted or wrong marker is refused, never skipped), a current root is
+# re-proven by root and marker identity; every path repays the marker, root
+# and parent fsync barriers.
+- name: Acquire the observed data root
+  bbraft_node_data_root:
+    path: "{{ bbraft_node_data_dir }}"
+    owner: "{{ bbraft_node_data_owner }}"
+    group: "{{ bbraft_node_data_group }}"
+    marker_name: "{{ bbraft_node_data_marker_name }}"
+    marker_content: "{{ bbraft_node_data_marker_content }}"
+    mode: acquire
+    expect: "{{ bbraft_node_data_root_observed }}"
+  register: bbraft_node_data_root_acquired

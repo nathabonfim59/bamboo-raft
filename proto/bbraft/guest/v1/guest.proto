@@ -1,0 +1,291 @@
+// Node ⇄ guest contract. bbraft-guest serves this inside
+// every VM over AF_VSOCK on a fixed port; the node is the only client.
+//
+// The guest proto mirrors the Exec, PutFile and Phase 1 (processes, files,
+// SSH) halves of nodev1 (frozen) by importing its message types, but omits
+// sandbox routing fields: the node addresses exactly one guest per
+// connection. Errors are gRPC status codes with the same meaning as nodev1
+// documents for the matching operation (INVALID_ARGUMENT for bad paths,
+// NOT_FOUND for a missing path or process, ALREADY_EXISTS for a conflicting
+// destination, OUT_OF_RANGE for a file over max_bytes, FAILED_PRECONDITION
+// for a stale freeze token, UNAVAILABLE for a missing SSH host key,
+// INTERNAL for guest-side failures).
+syntax = "proto3";
+
+package bbraft.guest.v1;
+
+import "bbraft/node/v1/node.proto";
+
+option go_package = "github.com/nathabonfim59/bamboo-raft/internal/proto/guestv1;guestv1";
+
+service Guest {
+  // Ping is the guest's readiness signal: bbraft-node retries it with a
+  // deadline until CreateVM can report READY. It never touches the
+  // filesystem, so it answers while the root filesystem is frozen.
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // Exec runs `bash -lc <command>` as the unprivileged sandbox user and
+  // streams nodev1.ExecEvent frames with the nodev1 order: one `started`,
+  // any number of `stdout`/`stderr` chunks, then one `exit`. Cancelling
+  // the RPC kills the command's whole process group.
+  rpc Exec(ExecRequest) returns (stream bbraft.node.v1.ExecEvent);
+
+  // PutFile writes one file as the sandbox user. The first message is the
+  // header (and the only header; a second one is INVALID_ARGUMENT), the
+  // rest are data chunks of at most 1 MiB each (larger is
+  // INVALID_ARGUMENT; the total is unbounded). Parent directories are
+  // created owned by the user; an existing file is replaced atomically
+  // once all data arrived — a canceled or malformed stream leaves the
+  // previous file intact. Paths resolve as in the v1 API: relative to
+  // the home directory, and must end up under the home directory or /tmp
+  // (else INVALID_ARGUMENT).
+  rpc PutFile(stream PutFileRequest) returns (bbraft.node.v1.PutFileResponse);
+
+  // Freeze freezes the guest's root filesystem for a snapshot and returns
+  // an opaque lease token. The guest thaws by itself when the lease
+  // expires (bounded watchdog), so a dead node cannot leave the VM frozen.
+  // Idempotent: a Freeze while already frozen returns the existing lease
+  // token and expiry unchanged — it never extends the lease. The handler
+  // performs no filesystem writes after the freeze takes effect, and the
+  // service keeps serving (Thaw in particular) while the root filesystem
+  // is frozen.
+  rpc Freeze(FreezeRequest) returns (FreezeResponse);
+
+  // Thaw unfreezes the guest. Idempotent: thawing an unfrozen guest is
+  // OK, whatever the token. Thawing with a token that is not the current
+  // lease while frozen fails FAILED_PRECONDITION, so a stale cleanup from
+  // an earlier snapshot cannot thaw a later one.
+  rpc Thaw(ThawRequest) returns (ThawResponse);
+
+  // --- Detached processes (Phase 1) ---------------------------------------
+  //
+  // Same contract as nodev1's process RPCs, minus sandbox routing: a
+  // detached process runs `bash -lc <command>` like Exec, in its own
+  // session and process group, independent of any RPC: cancelling a call
+  // never touches it. Its stdout and stderr go to log files on the guest
+  // disk and are read back by byte offset. Logs and the final status
+  // survive StopVM/StartVM; a process that was running when the VM stopped
+  // (or when bbraft-guest restarted) reports LOST. process_id is chosen by
+  // the server and passed through by the node, unique per sandbox and
+  // never reused.
+
+  // StartProcess starts a detached process and returns once it runs (state
+  // RUNNING, pid set) or already ended. Idempotent on process_id: an
+  // existing process_id returns that process, whatever the other fields
+  // say. INVALID_ARGUMENT for process_id 0 or a bad cwd.
+  rpc StartProcess(StartProcessRequest) returns (bbraft.node.v1.Process);
+
+  // GetProcess returns the process and a window of each log (see
+  // GetProcessRequest). NOT_FOUND for an unknown process_id.
+  rpc GetProcess(GetProcessRequest) returns (bbraft.node.v1.ProcessOutput);
+
+  // AttachProcess streams a process's output from the given offsets: one
+  // `attached`, then `stdout`/`stderr` chunks in write order per stream
+  // (no gaps, no repeats), then, once the process has ended and all of its
+  // output was sent, one `exit`, and the stream closes. A process that
+  // already ended sends its remaining output and `exit` at once.
+  // Cancelling the RPC only stops the stream. Offsets past the end of a
+  // log start at its end.
+  rpc AttachProcess(AttachProcessRequest) returns (stream bbraft.node.v1.ProcessEvent);
+
+  // KillProcess sends SIGTERM to the process group, then SIGKILL to
+  // whatever is left after grace_seconds, and returns once the process
+  // ended. Idempotent: an ended process returns with signaled=false.
+  rpc KillProcess(KillProcessRequest) returns (bbraft.node.v1.KillProcessResponse);
+
+  // --- Files (Phase 1) -----------------------------------------------------
+  //
+  // Paths resolve as for PutFile: relative to the home directory, and the
+  // cleaned path must be under the home directory or /tmp, with symlinks
+  // never escaping those roots (INVALID_ARGUMENT otherwise). Operations
+  // run as the sandbox user. NOT_FOUND: the path does not exist. File type
+  // problems (reading a directory, listing a file, a non-empty directory
+  // without recursive) are INVALID_ARGUMENT. The roots themselves cannot
+  // be deleted or moved (INVALID_ARGUMENT).
+
+  // ReadFile streams one regular file: first `info`, then `data` chunks of
+  // at most 1 MiB in order. A file larger than max_bytes (when non-zero)
+  // is OUT_OF_RANGE before any data is sent.
+  rpc ReadFile(ReadFileRequest) returns (stream bbraft.node.v1.ReadFileResponse);
+
+  // StatFile describes one path (see nodev1.FileInfo for symlinks).
+  rpc StatFile(StatFileRequest) returns (bbraft.node.v1.FileInfo);
+
+  // ListFiles lists a directory's direct entries, sorted by name, at most
+  // limit of them (truncated set when more exist).
+  rpc ListFiles(ListFilesRequest) returns (bbraft.node.v1.ListFilesResponse);
+
+  // DeleteFile removes a file, a symlink (not its target) or an empty
+  // directory; with recursive, a directory and everything in it.
+  rpc DeleteFile(DeleteFileRequest) returns (bbraft.node.v1.DeleteFileResponse);
+
+  // MakeDir creates a directory and its missing parents (owned by the
+  // sandbox user). An existing directory is OK and keeps its mode; an
+  // existing non-directory is ALREADY_EXISTS.
+  rpc MakeDir(MakeDirRequest) returns (bbraft.node.v1.FileInfo);
+
+  // MoveFile renames source to destination, creating destination's missing
+  // parents. An existing destination is ALREADY_EXISTS unless overwrite,
+  // which replaces a file or an empty directory.
+  rpc MoveFile(MoveFileRequest) returns (bbraft.node.v1.MoveFileResponse);
+
+  // ChmodFile sets permission bits (at most 0o7777, else INVALID_ARGUMENT).
+  rpc ChmodFile(ChmodFileRequest) returns (bbraft.node.v1.FileInfo);
+
+  // --- SSH (Phase 1) ---------------------------------------------------------
+
+  // AddSSHKey adds one OpenSSH public key to the sandbox user's
+  // authorized_keys (an identical key is not added twice) and returns the
+  // user and the guest's current ed25519 host public key. The node turns
+  // that into nodev1.SSHAccess by supplying the externally reachable host
+  // and port itself — the guest cannot know them. INVALID_ARGUMENT for a
+  // key that is not one valid public key line (no options, no newlines).
+  // UNAVAILABLE while the guest's host key does not exist yet.
+  rpc AddSSHKey(AddSSHKeyRequest) returns (AddSSHKeyResponse);
+}
+
+message PingRequest {}
+
+message PingResponse {
+  string version = 1;  // bbraft-guest build version
+}
+
+message ExecRequest {
+  string command = 1;  // run by bash -lc
+  // Relative to the home directory, or absolute. Empty: the home directory.
+  string cwd = 2;
+  // Environment for this exec, already merged by the node (per-command
+  // values win over VM values). Applied over the guest's base environment;
+  // it never changes the effective uid.
+  map<string, string> env = 3;
+  // 0: no limit. On expiry the process group is killed and exit.timed_out set.
+  uint32 timeout_seconds = 4;
+}
+
+message PutFileRequest {
+  oneof part {
+    Header header = 1;
+    bytes data = 2;
+  }
+
+  message Header {
+    string path = 1;
+    uint32 mode = 2;  // permission bits; 0 means 0644
+  }
+}
+
+message FreezeRequest {
+  // How long the guest may stay frozen before its watchdog thaws: 0 means
+  // the guest's configured default lease, anything above the guest's
+  // maximum lease is INVALID_ARGUMENT. Callers (the node) pass an
+  // explicit lease sized to the work planned under the freeze — never a
+  // duration derived from the guest's clock.
+  uint32 lease_ms = 1;
+}
+
+message FreezeResponse {
+  string lease_token = 1;  // opaque; Thaw needs it while the lease holds
+  // Guest wall-clock expiry of the lease, for diagnostics only. The node
+  // must not derive its deadline from the guest's absolute clock: it
+  // bounds elapsed time on its own clock, from the START of its first
+  // Freeze attempt for this snapshot (kept across retries) plus the
+  // lease_ms it requested, and invalidates the snapshot if that deadline
+  // passes.
+  int64 lease_expires_at_unix_ms = 2;
+  // Conservative whole milliseconds remaining, measured on the guest's
+  // monotonic lease clock when this response is built and rounded down. The
+  // node combines it with the START of this RPC attempt on its own monotonic
+  // clock; it never treats the guest's absolute expiry as a host deadline.
+  // An expired lease is never returned as still valid.
+  uint64 lease_remaining_ms = 3;
+}
+
+message ThawRequest {
+  string lease_token = 1;
+}
+
+message ThawResponse {}
+
+// --- Phase 1 messages -------------------------------------------------------
+//
+// Guest-owned mirrors of the nodev1 requests, without sandbox_id (no routing
+// meaning inside the guest). Response types come from nodev1 unchanged.
+
+message StartProcessRequest {
+  uint32 process_id = 1;  // >= 1, chosen by the server
+  string command = 2;     // run by bash -lc
+  string cwd = 3;         // as ExecRequest.cwd
+  // Already merged by the node (per-command values win over VM values), as
+  // ExecRequest.env.
+  map<string, string> env = 4;
+}
+
+// GetProcessRequest selects a window of each log.
+//
+// Without an offset for a stream, the window is the last limit_bytes of
+// that log (truncated set when the log is longer). With an offset, it is
+// the bytes from that offset, at most limit_bytes (more set when the log
+// goes on). Offsets past the end return no data at the log's end.
+message GetProcessRequest {
+  uint32 process_id = 1;
+  optional int64 stdout_offset = 2;
+  optional int64 stderr_offset = 3;
+  uint32 limit_bytes = 4;  // per stream; 0: 1 MiB; at most 8 MiB (INVALID_ARGUMENT above)
+}
+
+message AttachProcessRequest {
+  uint32 process_id = 1;
+  int64 stdout_offset = 2;
+  int64 stderr_offset = 3;
+}
+
+message KillProcessRequest {
+  uint32 process_id = 1;
+  uint32 grace_seconds = 2;  // 0: 5 s
+}
+
+message ReadFileRequest {
+  string path = 1;
+  int64 max_bytes = 2;  // 0: no limit
+}
+
+message StatFileRequest {
+  string path = 1;
+}
+
+message ListFilesRequest {
+  string path = 1;
+  uint32 limit = 2;  // 0: 1000; at most 10000 (INVALID_ARGUMENT above)
+}
+
+message DeleteFileRequest {
+  string path = 1;
+  bool recursive = 2;
+}
+
+message MakeDirRequest {
+  string path = 1;
+  uint32 mode = 2;  // 0: 0755
+}
+
+message MoveFileRequest {
+  string source = 1;
+  string destination = 2;
+  bool overwrite = 3;
+}
+
+message ChmodFileRequest {
+  string path = 1;
+  uint32 mode = 2;
+}
+
+message AddSSHKeyRequest {
+  string public_key = 1;  // one authorized_keys line: type, base64, optional comment
+}
+
+// AddSSHKeyResponse is the guest's half of nodev1.SSHAccess: the node adds
+// the externally reachable host and port itself.
+message AddSSHKeyResponse {
+  string user = 1;      // "user"
+  string host_key = 2;  // the guest's ed25519 host public key, OpenSSH format
+}

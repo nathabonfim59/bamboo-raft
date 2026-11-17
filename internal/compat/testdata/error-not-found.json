@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 404,
+  "code": "not_found",
+  "message": "Sandbox not found",
+  "error": {"code": "not_found", "message": "Sandbox not found", "status": 404},
+  "requestId": "req_01HXEXAMPLE"
+}

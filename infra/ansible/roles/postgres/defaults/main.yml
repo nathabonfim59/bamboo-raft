@@ -1,0 +1,39 @@
+# PostgreSQL for bbraft-server (PostgreSQL 17+).
+#
+# The role installs the distro package and adds one drop-in file to the
+# existing cluster. It never runs initdb, never drops a role or database and
+# never rewrites postgresql.conf or pg_hba.conf.
+
+# Debian 13 (trixie) ships PostgreSQL 17. Point this at a newer major only
+# when that package is available on the host.
+postgres_version: "17"
+postgres_cluster: main
+postgres_packages:
+  - "postgresql-{{ postgres_version }}"
+  - python3-psycopg2
+
+postgres_service: postgresql
+postgres_group: postgres
+postgres_unix_socket: /var/run/postgresql
+
+# Loopback only: bbraft-server and the tests run on the same host by default.
+# Expose the port only through an explicit override and a matching pg_hba rule.
+postgres_listen_addresses: "127.0.0.1"
+postgres_port: 5432
+
+# Required, caller-supplied. There is no default password and no generated
+# one: an install without a secret stops before creating anything.
+postgres_password: ""
+postgres_user: bbraft
+postgres_database: bbraft
+
+postgres_config_dir: "/etc/postgresql/{{ postgres_version }}/{{ postgres_cluster }}"
+postgres_dropin: "{{ postgres_config_dir }}/conf.d/bbraft.conf"
+
+# Root owns the drop-in; the postgres group reads it. Tests override these.
+postgres_file_owner: root
+postgres_file_group: "{{ postgres_group }}"
+postgres_file_mode: "0640"
+
+# Set false only in role-local render tests, which have no cluster to restart.
+postgres_manage_service: true

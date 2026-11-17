@@ -1,0 +1,11 @@
+# Syntax fixture for the complete role, including tasks/main.yml. Only ever
+# invoked with --syntax-check: executing it would install PostgreSQL. Local
+# connection and documentation/placeholder values only.
+- name: Full-role syntax check for postgres
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars.yml
+  roles:
+    - postgres

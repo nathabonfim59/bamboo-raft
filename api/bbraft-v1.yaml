@@ -1,0 +1,1515 @@
+openapi: 3.1.0
+info:
+  title: bamboo-raft API v1
+  version: 0.1.0
+  description: |
+    The sandbox API bamboo-raft serves under /api/v1: sandboxes, durable
+    stop and resume, commands (synchronous, streamed and detached), files,
+    signed upload and download URLs, SSH access and saved snapshots.
+    Behavior beyond the schema is described in docs/api.md.
+
+    Extensions live under /api/bbraft and never add fields to these shapes.
+servers:
+  - url: /api/v1
+security:
+  - BearerAuth: []
+tags:
+  - name: Account
+    description: The authenticated account.
+  - name: Sandboxes
+    description: Create, list, inspect, update and delete sandboxes.
+  - name: Lifecycle
+    description: Durable stop and resume.
+  - name: Commands
+    description: Synchronous, streamed and detached commands.
+  - name: Files
+    description: Files inside a sandbox and signed upload/download URLs.
+  - name: SSH
+    description: SSH access to a running sandbox.
+  - name: 'Saved snapshots'
+    description: Disk snapshots that new sandboxes can start from.
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: sandbox_api_key
+  parameters:
+    SandboxId:
+      name: sandboxId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$'
+    StopId:
+      name: stopId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    OperationId:
+      name: operationId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^bdop_[a-f0-9]{32}$'
+    SnapshotName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+    ProcessId:
+      name: processId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: [string, 'null'] }
+      description: Opaque cursor returned as pageInfo.nextCursor.
+    Sort:
+      name: sort
+      in: query
+      schema: { type: string, enum: [asc, desc], default: desc }
+    ConfirmDelete:
+      name: X-Ascii-Confirm-Delete
+      in: header
+      required: true
+      schema: { type: string }
+      description: Must exactly equal the target sandbox id; a missing or mismatched value returns 409.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, maxLength: 255 }
+  responses:
+    BadRequest:
+      description: Invalid request body or parameters.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Conflict:
+      description: The request conflicts with the current state of the sandbox or account.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    BadGateway:
+      description: The node RPC failed. A command may already have run on the sandbox.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    FileTooLarge:
+      description: The decoded file exceeds the 5 MiB inline limit; use a signed URL.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NoReadyMachine:
+      description: No node has capacity; nothing was created.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    InternalServerError:
+      description: Internal control-plane fault; the request may be retried safely only when it is idempotent.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    ServiceUnavailable:
+      description: The node has no capacity; error.details.retryAfterSeconds carries the retry hint.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    SSHHostKeyUnavailable:
+      description: >-
+        The guest SSH host key is not generated yet. error.details.retryAfterSeconds
+        carries the positive retry hint (currently 5); no connection metadata is stored.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  schemas:
+    SuccessBase:
+      type: object
+      required: [ok, type]
+      properties:
+        ok: { type: boolean }
+        type: { type: string }
+    ErrorEnvelope:
+      type: object
+      required: [ok, type, status, code, message, error, requestId]
+      properties:
+        ok: { type: boolean }
+        type: { type: string }
+        status: { type: integer }
+        code: { type: string }
+        message: { type: string }
+        requestId: { type: string }
+        error:
+          type: object
+          required: [code, message, status]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            status: { type: integer }
+            details:
+              type: object
+              additionalProperties: true
+    SandboxState:
+      type: string
+      enum: [init, provisioning, provisioned, cloning, ready, idle, running, archiving, archived, error, cancelled]
+    Sandbox:
+      type: object
+      required: [id, name, state, desktopAvailable, snapshotAvailable]
+      properties:
+        id:
+          type: string
+          pattern: '^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$'
+        name: { type: string }
+        state: { $ref: '#/components/schemas/SandboxState' }
+        error: { type: [string, 'null'] }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+        type: { type: string, enum: [small, default, large, xlarge] }
+        vcpu: { type: integer }
+        memoryGB: { type: integer }
+        billingMultiplier: { type: number }
+        url: { type: [string, 'null'], format: uri }
+        ip: { type: [string, 'null'] }
+        sshEndpoint:
+          type: [string, 'null']
+          description: >-
+            Node-confirmed public host:port that forwards to the sandbox SSH
+            server. Null until a successful sshKey call for the current boot;
+            cleared by stop or resume until the next sshKey call.
+        subdomain: { type: [string, 'null'] }
+        createdAt: { type: [string, 'null'], format: date-time }
+        updatedAt: { type: [string, 'null'], format: date-time }
+        archiveAfter: { type: [string, 'null'], format: date-time }
+        ttlSeconds: { type: [integer, 'null'] }
+        desktopAvailable: { type: boolean }
+        desktopUrl: { type: [string, 'null'], format: uri }
+        snapshots: { type: boolean }
+        monitoring: { type: boolean }
+        snapshotAvailable: { type: boolean }
+        snapshotCompletedAt: { type: [string, 'null'], format: date-time }
+        stoppedAt: { type: [string, 'null'], format: date-time }
+        dataExpiredAt: { type: [string, 'null'], format: date-time }
+        stop: { $ref: '#/components/schemas/StopOperation' }
+    PageInfo:
+      type: object
+      required: [nextCursor, hasMore, limit]
+      properties:
+        nextCursor: { type: [string, 'null'] }
+        hasMore: { type: boolean }
+        limit: { type: integer }
+    SandboxListResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [sandboxes]
+          properties:
+            type: { type: string, const: sandbox.list }
+            sandboxes:
+              type: array
+              items: { $ref: '#/components/schemas/Sandbox' }
+            pageInfo: { $ref: '#/components/schemas/PageInfo' }
+    SandboxInfoResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [sandbox]
+          properties:
+            type: { type: string, const: sandbox.info }
+            sandbox: { $ref: '#/components/schemas/Sandbox' }
+            giftLimitNotice: { type: string }
+    StopStatus:
+      type: string
+      enum: [pending, failing, completed, superseded]
+    StopOperation:
+      type: object
+      required: [id, status, requestedAt, lastAttemptAt, error, endedAt]
+      properties:
+        id: { type: string }
+        status: { $ref: '#/components/schemas/StopStatus' }
+        requestedAt: { type: [string, 'null'], format: date-time }
+        lastAttemptAt: { type: [string, 'null'], format: date-time }
+        error: { type: [string, 'null'] }
+        endedAt: { type: [string, 'null'], format: date-time }
+        forced: { type: boolean }
+    SandboxActionResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [id, status]
+          properties:
+            type: { type: string }
+            id: { type: string }
+            status: { type: string }
+            sandbox: { $ref: '#/components/schemas/Sandbox' }
+            forced: { type: boolean }
+            operation: { $ref: '#/components/schemas/StopOperation' }
+            statusUrl: { type: [string, 'null'] }
+            giftLimitNotice: { type: string }
+    StopOperationResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [id, stop]
+          properties:
+            type: { type: string, const: stop.status }
+            id: { type: string }
+            stop: { $ref: '#/components/schemas/StopOperation' }
+    UpdateSandboxRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: Empty names are rejected; longer names are truncated to 120 characters.
+        ttlSeconds:
+          oneOf:
+            - type: integer
+              minimum: 1
+              maximum: 2592000
+            - type: 'null'
+          description: Omitted keeps the current auto-stop; null disables it; a value resets the deadline from now.
+        subdomain:
+          type: string
+          minLength: 3
+          maxLength: 40
+          pattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+          description: Must be globally unique among live sandboxes; reserved -desktop and -<number> suffixes are refused.
+    StopRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        force:
+          type: boolean
+          default: false
+    ResumeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        failFast: { type: boolean, default: false }
+        type: { type: string, enum: [small, default, large, xlarge] }
+        env:
+          type: object
+          additionalProperties: { type: string }
+          maxProperties: 100
+        environment:
+          type: string
+          description: Only base is supported; other names answer 400 unknown_environment. noEnv is refused.
+        noEnv: { type: boolean, default: false }
+        ttlSeconds:
+          oneOf:
+            - type: integer
+              minimum: 1
+              maximum: 2592000
+            - type: 'null'
+          description: Omitted keeps the configured TTL; null disables auto-stop.
+    SshKeyRequest:
+      type: object
+      required: [key]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          description: One OpenSSH public key line. Private keys and options are rejected.
+    SshKeyResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [success, sshUser, hostKey]
+          properties:
+            type: { type: string, const: ssh_key.configured }
+            success: { type: boolean }
+            machineIp: { type: [string, 'null'] }
+            sshUser: { type: string }
+            sshEndpoint: { type: [string, 'null'] }
+            hostKey: { type: string, description: Public host key; pin it in known_hosts. }
+    CreateSandboxRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        type: { type: string, enum: [small, default, large, xlarge], default: default }
+        ttlSeconds:
+          oneOf:
+            - type: integer
+              minimum: 1
+              maximum: 2592000
+            - type: 'null'
+            - type: string
+              enum: [infinite]
+          default: 3600
+          description: Seconds until auto-stop (the sandbox is archived with its disk kept). null or the legacy "infinite" disables auto-stop.
+        labels:
+          type: object
+          additionalProperties: { type: string }
+          maxProperties: 20
+        env:
+          type: object
+          additionalProperties: { type: string }
+          maxProperties: 100
+        environment: { type: string }
+        noEnv: { type: boolean, default: false }
+        snapshots: { type: boolean, default: true }
+        monitoring: { type: boolean, default: true }
+        failFast: { type: boolean, default: false }
+        count: { type: integer, minimum: 1, maximum: 1000, default: 1 }
+        setupScript: { type: string, maxLength: 65536 }
+        name: { type: string, maxLength: 120 }
+        visibility: { type: string, enum: [private, shared] }
+        hostedPorts:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/HostedPortRequest' }
+        files:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/CreateSandboxFile' }
+        org: { type: string }
+        from:
+          type: string
+          description: >-
+            Create from a saved snapshot name. Omitted type inherits the
+            snapshot's type; disk may stay the same or grow. The sandbox boots
+            only on the node that holds the immutable artifact. Missing or
+            foreign names answer 404 snapshot_not_found.
+        teamId: { type: string }
+    HostedPortRequest:
+      type: object
+      required: [port]
+      additionalProperties: false
+      properties:
+        port: { type: integer, minimum: 1, maximum: 65535 }
+        public: { type: boolean, default: false }
+        localhost: { type: boolean, default: false }
+        title: { type: string }
+    CreateSandboxFile:
+      type: object
+      required: [path, content]
+      additionalProperties: false
+      properties:
+        path: { type: string }
+        content: { type: string }
+        encoding: { type: string, enum: [utf8, base64], default: utf8 }
+    HostedPortInfo:
+      type: object
+      required: [port]
+      properties:
+        port: { type: integer }
+        url: { type: string, format: uri }
+        access: { type: string, enum: [private, public] }
+        isProtected: { type: boolean }
+        localhost: { type: boolean }
+        error: { type: string }
+        message: { type: string }
+    CreateSandboxResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [status, ttlSeconds, sandbox]
+          properties:
+            type: { type: string, const: sandbox.created }
+            status: { type: string, enum: [provisioning, ready] }
+            ttlSeconds: { type: [integer, 'null'] }
+            sandbox: { $ref: '#/components/schemas/Sandbox' }
+            sandboxes:
+              type: array
+              items: { $ref: '#/components/schemas/Sandbox' }
+            hostedPorts:
+              type: array
+              items: { $ref: '#/components/schemas/HostedPortInfo' }
+            giftLimitNotice: { type: string }
+    DeletionOperation:
+      type: object
+      required: [id, kind, targetId, reason, status, attemptCount, requestedAt, completedAt]
+      properties:
+        id:
+          type: string
+          pattern: '^bdop_[a-f0-9]{32}$'
+        kind: { type: string, enum: [sandbox, snapshot] }
+        targetId: { type: string }
+        reason: { type: string, enum: [explicit, zdr, account] }
+        status: { type: string, enum: [pending, processing, blocked, completed] }
+        stage: { type: string, enum: [removing, waiting_for_uploads, retrying, completed] }
+        expectedBy: { type: [string, 'null'], format: date-time }
+        attemptCount: { type: integer, minimum: 0 }
+        requestedAt: { type: string, format: date-time }
+        completedAt: { type: [string, 'null'], format: date-time }
+    DeletionOperationResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [operation]
+          properties:
+            type:
+              type: string
+              enum: [deletion.operation, sandbox.deleting, snapshot.deleting]
+            operation: { $ref: '#/components/schemas/DeletionOperation' }
+    MeResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [user]
+          properties:
+            type: { type: string, const: user.info }
+            user:
+              type: object
+              properties:
+                id: { type: string }
+                login: { type: string }
+                email: { type: [string, 'null'] }
+                displayName: { type: string }
+                connectionMethod: { type: string, enum: [github, google, email, agentid, service] }
+                connectionMethods:
+                  type: array
+                  items: { type: string }
+                accountPlan: { type: string }
+                serviceAccount: { type: boolean }
+                accountStatus: { type: string, enum: [active, suspended, closed] }
+                suspended: { type: boolean }
+                suspendedAt: { type: [string, 'null'], format: date-time }
+                suspendedReason: { type: [string, 'null'] }
+                closed: { type: boolean }
+                closedAt: { type: [string, 'null'], format: date-time }
+                purgeAt: { type: [string, 'null'], format: date-time }
+                purgedAt: { type: [string, 'null'], format: date-time }
+                zeroDataRetention: { type: boolean }
+                zeroDataRetentionEnabledAt: { type: [string, 'null'], format: date-time }
+    CommandRequest:
+      type: object
+      required: [command]
+      additionalProperties: false
+      properties:
+        command: { type: string }
+        cwd: { type: string }
+        timeoutSeconds:
+          type: integer
+          minimum: 1
+          maximum: 7200
+          default: 30
+          description: Synchronous commands cap at 600. Stream mode allows up to commands.stream-max-seconds (default 7200).
+        detached:
+          type: boolean
+          default: false
+          description: Start in the background and return command.started; the process has no timeout and is read with commandStatus/attachCommand.
+        stream: { type: boolean, default: false }
+    CommandResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [success, exitCode, stdout, stderr, timedOut]
+          properties:
+            type: { type: string, const: command.finished }
+            success: { type: boolean }
+            commandId: { type: string }
+            exitCode: { type: [integer, 'null'] }
+            signal: { type: [string, 'null'] }
+            oomKilled: { type: boolean }
+            stdout: { type: string }
+            stderr: { type: string }
+            stdoutTruncated: { type: boolean }
+            stderrTruncated: { type: boolean }
+            timedOut: { type: boolean }
+            cwd: { type: string }
+            startedAt: { type: string, format: date-time }
+            finishedAt: { type: string, format: date-time }
+    CommandStartedResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [success, processId, pid, command, startedAt]
+          properties:
+            type: { type: string, const: command.started }
+            success: { type: boolean }
+            commandId: { type: string }
+            processId: { type: integer }
+            pid: { type: integer }
+            command: { type: string }
+            cwd: { type: string }
+            startedAt: { type: string, format: date-time }
+            logPath: { type: string }
+            errLogPath: { type: string }
+    CommandStreamFrame:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, enum: [started, stdout, stderr, exit, error] }
+        commandId: { type: string }
+        data: { type: string }
+        exitCode: { type: [integer, 'null'] }
+        success: { type: boolean }
+        timedOut: { type: boolean }
+        error: { type: string }
+        message: { type: string }
+        retryable: { type: boolean }
+    CommandStatusResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [success, processId, status, running, exitCode, stdout, stderr]
+          properties:
+            type: { type: string, const: command.status }
+            success: { type: boolean }
+            processId: { type: integer }
+            pid: { type: integer }
+            status: { type: string, enum: [running, exited, lost] }
+            known: { type: boolean }
+            running: { type: boolean }
+            exitCode: { type: [integer, 'null'] }
+            signal: { type: [string, 'null'] }
+            oomKilled: { type: boolean }
+            command: { type: [string, 'null'] }
+            cwd: { type: [string, 'null'] }
+            startedAt: { type: [string, 'null'], format: date-time }
+            finishedAt: { type: [string, 'null'], format: date-time }
+            stdout: { type: string }
+            stderr: { type: string }
+            stdoutTruncated: { type: boolean }
+            stderrTruncated: { type: boolean }
+            logPath: { type: string }
+            errLogPath: { type: string }
+            stdoutOffset: { type: integer }
+            stderrOffset: { type: integer }
+            stdoutNextOffset: { type: integer }
+            stderrNextOffset: { type: integer }
+            more: { type: boolean }
+    CommandAttachFrame:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, enum: [attached, stdout, stderr, heartbeat, exit, reconnect, error] }
+        processId: { type: integer }
+        data: { type: string }
+        nextOffset: { type: integer }
+        stdoutOffset: { type: integer }
+        stderrOffset: { type: integer }
+        status: { type: string, enum: [running, exited, lost] }
+        exitCode: { type: [integer, 'null'] }
+        signal: { type: [string, 'null'] }
+        error: { type: string }
+        message: { type: string }
+    CommandRecord:
+      type: object
+      required: [commandId, sandboxId, command, mode, status, stdoutBytes, stderrBytes, outputTruncated, startedAt]
+      properties:
+        commandId: { type: string }
+        sandboxId: { type: string }
+        command: { type: string }
+        cwd: { type: [string, 'null'] }
+        mode: { type: string, enum: [sync, stream, detached, process] }
+        processId: { type: [integer, 'null'] }
+        status: { type: string, enum: [running, exited, timed_out, failed, killed, lost] }
+        exitCode: { type: [integer, 'null'] }
+        signal: { type: [string, 'null'] }
+        stdoutBytes: { type: integer }
+        stderrBytes: { type: integer }
+        outputTruncated: { type: boolean }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+    CommandStopResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [processId, running, signaled, command]
+          properties:
+            type: { type: string, const: command.stopped }
+            processId: { type: integer }
+            running: { type: boolean }
+            signaled: { type: boolean }
+            command:
+              oneOf:
+                - $ref: '#/components/schemas/CommandRecord'
+                - type: 'null'
+    SavedSnapshotStatus:
+      type: string
+      enum: [saving, ready, failed]
+    SavedSnapshot:
+      type: object
+      required: [name, status, sourceSandboxId, createdAt]
+      properties:
+        name:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+        status: { $ref: '#/components/schemas/SavedSnapshotStatus' }
+        error: { type: string }
+        sourceSandboxId: { type: string }
+        snapshotId: { type: string }
+        type: { type: string }
+        sizeBytes: { type: integer }
+        createdAt: { type: string, format: date-time }
+    SavedSnapshotAllowance:
+      type: object
+      properties:
+        org: { type: [string, 'null'] }
+        orgName: { type: [string, 'null'] }
+        included: { type: integer }
+        free: { type: integer, deprecated: true }
+        used: { type: integer }
+        extra: { type: integer }
+        extraMonthlyDollars: { type: number }
+        extraDailyDollars: { type: number }
+        pricePerExtraMonthlyDollars: { type: number }
+        pricePerExtraDailyDollars: { type: number }
+    SavedSnapshotListResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [snapshots]
+          properties:
+            type: { type: string, const: snapshot.saved.list }
+            snapshots:
+              type: array
+              items: { $ref: '#/components/schemas/SavedSnapshot' }
+            allowance: { $ref: '#/components/schemas/SavedSnapshotAllowance' }
+    SavedSnapshotInfoResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [snapshot]
+          properties:
+            type: { type: string, const: snapshot.saved.info }
+            snapshot: { $ref: '#/components/schemas/SavedSnapshot' }
+    SavedSnapshotSaveRequest:
+      type: object
+      required: [sandboxId, name]
+      additionalProperties: false
+      properties:
+        sandboxId: { type: string }
+        name:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+    SavedSnapshotSavingResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [status, snapshot]
+          properties:
+            type: { type: string, const: snapshot.saved.saving }
+            status: { type: string, const: saving }
+            snapshot: { $ref: '#/components/schemas/SavedSnapshot' }
+    SavedSnapshotDeletedResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [name, status]
+          properties:
+            type: { type: string, const: snapshot.saved.deleted }
+            name: { type: string }
+            status: { type: string, const: deleted }
+    FileEncoding:
+      type: string
+      enum: [utf8, base64]
+    FileEntry:
+      type: object
+      required: [name, path, isDir, isSymlink, size, mode, modifiedAt]
+      properties:
+        name: { type: string }
+        path: { type: string }
+        isDir: { type: boolean }
+        isSymlink: { type: boolean }
+        size: { type: integer }
+        mode: { type: string }
+        modifiedAt: { type: string, format: date-time }
+    FileReadResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [success, path, encoding, size, content]
+          properties:
+            type: { type: string, const: file.read }
+            success: { type: boolean }
+            path: { type: string }
+            encoding: { $ref: '#/components/schemas/FileEncoding' }
+            size: { type: integer }
+            content: { type: string }
+    FileWriteRequest:
+      type: object
+      required: [path, content]
+      additionalProperties: false
+      properties:
+        path: { type: string }
+        content: { type: string }
+        encoding: { $ref: '#/components/schemas/FileEncoding' }
+    FileWriteResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [success, path, encoding, size]
+          properties:
+            type: { type: string, const: file.written }
+            success: { type: boolean }
+            path: { type: string }
+            encoding: { $ref: '#/components/schemas/FileEncoding' }
+            size: { type: integer }
+    FileDeleteResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [success, path]
+          properties:
+            type: { type: string, const: file.deleted }
+            success: { type: boolean }
+            path: { type: string }
+    FileListResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [success, path, files, truncated]
+          properties:
+            type: { type: string, const: file.list }
+            success: { type: boolean }
+            path: { type: string }
+            files:
+              type: array
+              items: { $ref: '#/components/schemas/FileEntry' }
+            truncated: { type: boolean }
+    FileInfoResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - $ref: '#/components/schemas/FileEntry'
+        - type: object
+          required: [success]
+          properties:
+            type: { type: string, enum: [file.info, folder.created, file.permissions_set] }
+            success: { type: boolean }
+    FileFolderRequest:
+      type: object
+      required: [path]
+      additionalProperties: false
+      properties:
+        path: { type: string }
+        mode: { type: string }
+    FileMoveRequest:
+      type: object
+      required: [source, destination]
+      additionalProperties: false
+      properties:
+        source: { type: string }
+        destination: { type: string }
+        overwrite: { type: boolean, default: false }
+    FileMoveResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [success, path, destination]
+          properties:
+            type: { type: string, const: file.moved }
+            success: { type: boolean }
+            path: { type: string }
+            destination: { type: string }
+    FilePermissionsRequest:
+      type: object
+      required: [path, mode]
+      additionalProperties: false
+      properties:
+        path: { type: string }
+        mode: { type: string }
+    FileUrlRequest:
+      type: object
+      required: [path]
+      additionalProperties: false
+      properties:
+        path: { type: string }
+        ttlSeconds: { type: integer, minimum: 1, maximum: 3600, default: 900 }
+    FileUrlResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [url, method, path, expiresAt]
+          properties:
+            type: { type: string, enum: [file.download_url, file.upload_url] }
+            url: { type: string, format: uri }
+            method: { type: string, enum: [GET, PUT] }
+            path: { type: string }
+            expiresAt: { type: string, format: date-time }
+paths:
+  /me:
+    get:
+      tags: [Account]
+      summary: Get current user
+      operationId: me
+      responses:
+        '200':
+          description: Current user information.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /sandboxes:
+    get:
+      tags: [Sandboxes]
+      summary: List sandboxes
+      description: Supports limit, cursor, sort, state, name, namePrefix and label. Other query parameters are refused with 400 invalid_query.
+      operationId: sandboxes
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Sort'
+        - { name: state, in: query, schema: { type: string }, description: 'Comma-separated state filter.' }
+        - { name: name, in: query, schema: { type: string } }
+        - { name: namePrefix, in: query, schema: { type: string } }
+        - name: label
+          in: query
+          style: form
+          explode: true
+          schema: { type: array, items: { type: string } }
+          description: 'key=value, repeated to require several labels.'
+      responses:
+        '200':
+          description: Sandboxes owned by the authenticated account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SandboxListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    post:
+      tags: [Sandboxes]
+      summary: Create sandbox
+      description: >-
+        Creates from the node's base image, or from a saved snapshot with
+        `from` (placed only on the node that holds the immutable artifact).
+        Recognized fields whose feature is not implemented are rejected.
+      operationId: create
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateSandboxRequest' }
+      responses:
+        '202':
+          description: Accepted for provisioning.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateSandboxResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '503': { $ref: '#/components/responses/NoReadyMachine' }
+  /sandboxes/{sandboxId}:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    get:
+      tags: [Sandboxes]
+      summary: Get sandbox
+      operationId: get
+      responses:
+        '200':
+          description: Sandbox details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SandboxInfoResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    patch:
+      tags: [Sandboxes]
+      summary: Update sandbox
+      description: Rename, change auto-stop or rename the stable subdomain. Every member is optional.
+      operationId: update
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateSandboxRequest' }
+      responses:
+        '200':
+          description: Updated sandbox details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SandboxInfoResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    delete:
+      tags: [Sandboxes]
+      summary: Permanently delete sandbox data
+      description: Requires X-Ascii-Confirm-Delete to equal sandboxId. Poll the returned operation.
+      operationId: deleteSandbox
+      parameters:
+        - $ref: '#/components/parameters/ConfirmDelete'
+      responses:
+        '202':
+          description: Deletion accepted for background processing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletionOperationResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /sandboxes/{sandboxId}/stop:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      tags: [Lifecycle]
+      summary: Stop and archive sandbox
+      description: >-
+        A new or pending stop answers 202 with the canonical operation and its
+        statusUrl; an already archived sandbox answers 200 with its last
+        completed stop. force escalates a pending stop.
+      operationId: stop
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StopRequest' }
+      responses:
+        '200':
+          description: The sandbox is already stopped.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SandboxActionResponse' }
+        '202':
+          description: Archival started or already in progress.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SandboxActionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /sandboxes/{sandboxId}/stops/{stopId}:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+      - $ref: '#/components/parameters/StopId'
+    get:
+      tags: [Lifecycle]
+      summary: Get a stop by id
+      description: Old stops stay readable after a resume or a later stop; a foreign or unknown id answers 404.
+      operationId: getStop
+      responses:
+        '200':
+          description: The stop.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StopOperationResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /sandboxes/{sandboxId}/resume:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      tags: [Lifecycle]
+      summary: Resume sandbox
+      description: >-
+        Resume a stopped sandbox on the node that retains its disk. type, env
+        and ttlSeconds are applied; environment accepts only base, and noEnv is
+        refused. Shrinking below the retained disk answers 409
+        type_too_small; a resume that cannot take over an in-flight stop answers
+        409 sandbox_stopping.
+      operationId: resume
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResumeRequest' }
+      responses:
+        '202':
+          description: Resume started.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SandboxActionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '503': { $ref: '#/components/responses/NoReadyMachine' }
+  /sandboxes/{sandboxId}/sshkey:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      tags: [SSH]
+      summary: Configure sandbox SSH key
+      description: >-
+        Installs one OpenSSH public key for user user through the sandbox's
+        node and returns the connection metadata. The endpoint and host key are
+        persisted only after a successful installation for the current boot;
+        a stop or resume clears them until the next sshKey call. A stopped or
+        stale sandbox answers 400 machine_not_running, never 409.
+      operationId: sshKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SshKeyRequest' }
+      responses:
+        '200':
+          description: SSH key configured.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SshKeyResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/SSHHostKeyUnavailable' }
+  /deletion-operations/{operationId}:
+    get:
+      tags: [Sandboxes]
+      summary: Get deletion operation
+      description: Owner-scoped poll of an accepted deletion. Responses are never cached.
+      operationId: getDeletionOperation
+      parameters:
+        - $ref: '#/components/parameters/OperationId'
+      responses:
+        '200':
+          description: Current deletion operation state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletionOperationResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /sandboxes/{sandboxId}/commands:
+    post:
+      tags: [Commands]
+      summary: Execute a command
+      description: Synchronous by default; stream true returns newline-delimited JSON CommandStreamFrame lines; detached true returns command.started and runs in the background.
+      operationId: command
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CommandRequest' }
+      responses:
+        '200':
+          description: Command result, detached start confirmation or the output stream.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/CommandResponse'
+                  - $ref: '#/components/schemas/CommandStartedResponse'
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/CommandStreamFrame' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /sandboxes/{sandboxId}/commands/{processId}:
+    get:
+      tags: [Commands]
+      summary: Get detached command status and logs
+      operationId: commandStatus
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+        - $ref: '#/components/parameters/ProcessId'
+        - name: tailBytes
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 8388608 }
+        - name: stdoutOffset
+          in: query
+          schema: { type: integer, minimum: 0 }
+        - name: stderrOffset
+          in: query
+          schema: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: Process status and log tails, or output since the offsets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommandStatusResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+    delete:
+      tags: [Commands]
+      summary: Stop a detached command
+      operationId: stopCommand
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+        - $ref: '#/components/parameters/ProcessId'
+      responses:
+        '200':
+          description: The command is stopped.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommandStopResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /sandboxes/{sandboxId}/commands/{processId}/stream:
+    get:
+      tags: [Commands]
+      summary: Attach to a detached command
+      operationId: attachCommand
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+        - $ref: '#/components/parameters/ProcessId'
+        - name: stdoutOffset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: stderrOffset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: The output stream.
+          content:
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/CommandAttachFrame' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /sandboxes/{sandboxId}/files/upload-url:
+    post:
+      tags: [Files]
+      summary: Get an upload URL
+      description: The returned URL is server-served and streams the body to the sandbox without a size limit.
+      operationId: createUploadUrl
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileUrlRequest' }
+      responses:
+        '200':
+          description: Signed upload URL.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileUrlResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /sandboxes/{sandboxId}/files:
+    get:
+      tags: [Files]
+      summary: Read a file from a sandbox
+      description: Files up to 5 MiB; a larger file needs a signed download URL. A starting sandbox is waited for up to 60 seconds.
+      operationId: readFile
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+        - name: encoding
+          in: query
+          schema: { $ref: '#/components/schemas/FileEncoding' }
+      responses:
+        '200':
+          description: File contents.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileReadResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/FileTooLarge' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+    put:
+      tags: [Files]
+      summary: Write a file in a sandbox
+      description: Files up to 5 MiB after decoding; a larger file needs a signed upload URL. A 200 means the file is on the sandbox disk.
+      operationId: writeFile
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileWriteRequest' }
+      responses:
+        '200':
+          description: File written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileWriteResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/FileTooLarge' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+    delete:
+      tags: [Files]
+      summary: Delete a file or directory in a sandbox
+      description: A non-empty directory needs recursive=true; a symlink is removed itself, never its target.
+      operationId: deleteFile
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+        - name: recursive
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileDeleteResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /sandboxes/{sandboxId}/files/list:
+    get:
+      tags: [Files]
+      summary: List a directory in a sandbox
+      description: One level, sorted by name, at most 10,000 entries; truncated reports more.
+      operationId: listFiles
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+        - name: path
+          in: query
+          schema: { type: string, default: /home/user }
+      responses:
+        '200':
+          description: Directory entries.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /sandboxes/{sandboxId}/files/info:
+    get:
+      tags: [Files]
+      summary: Stat a path in a sandbox
+      operationId: getFileInfo
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: File details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileInfoResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /sandboxes/{sandboxId}/files/folder:
+    post:
+      tags: [Files]
+      summary: Create a directory in a sandbox
+      description: Missing parents are created; an existing directory keeps its mode and is not an error.
+      operationId: createFolder
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileFolderRequest' }
+      responses:
+        '200':
+          description: Directory created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileInfoResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /sandboxes/{sandboxId}/files/move:
+    post:
+      tags: [Files]
+      summary: Move a path to a new location in a sandbox
+      operationId: moveFile
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileMoveRequest' }
+      responses:
+        '200':
+          description: Moved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileMoveResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /sandboxes/{sandboxId}/files/permissions:
+    post:
+      tags: [Files]
+      summary: Set file permissions in a sandbox
+      operationId: setFilePermissions
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FilePermissionsRequest' }
+      responses:
+        '200':
+          description: Permissions set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileInfoResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+  /sandboxes/{sandboxId}/files/download-url:
+    post:
+      tags: [Files]
+      summary: Get a signed download URL
+      description: The returned URL is server-served, needs no bearer header and streams the file from the sandbox without a size limit.
+      operationId: createDownloadUrl
+      parameters:
+        - $ref: '#/components/parameters/SandboxId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileUrlRequest' }
+      responses:
+        '200':
+          description: Signed download URL.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileUrlResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /saved-snapshots:
+    get:
+      tags: ['Saved snapshots']
+      summary: List saved snapshots
+      operationId: listSavedSnapshots
+      parameters:
+        - { name: name, in: query, schema: { type: string } }
+        - { name: namePrefix, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Saved snapshots owned by the authenticated account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SavedSnapshotListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    post:
+      tags: ['Saved snapshots']
+      summary: Save a saved snapshot
+      operationId: saveSavedSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SavedSnapshotSaveRequest' }
+      responses:
+        '202':
+          description: Accepted; the snapshot is being saved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SavedSnapshotSavingResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /saved-snapshots/{name}:
+    parameters:
+      - $ref: '#/components/parameters/SnapshotName'
+    get:
+      tags: ['Saved snapshots']
+      summary: Get a saved snapshot
+      operationId: getSavedSnapshot
+      responses:
+        '200':
+          description: The saved snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SavedSnapshotInfoResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    delete:
+      tags: ['Saved snapshots']
+      summary: Remove a saved snapshot
+      operationId: deleteSavedSnapshot
+      responses:
+        '200':
+          description: Removed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SavedSnapshotDeletedResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }

@@ -1,0 +1,56 @@
+# bamboo-raft guest SSH server.
+#
+# The image ships no host key: bbraft-ssh-host-key.service generates a fresh
+# ed25519 key in /run/ssh on every boot before this daemon starts, so a
+# sandbox resumed from its disk advertises a current key. /run is tmpfs, so
+# no private key ever reaches the image or a snapshot.
+#
+# Authentication is public key only and restricted to the sandbox user. The
+# node installs one authorized key through AddSSHKey; the user's
+# ~/.ssh/authorized_keys lives on the sandbox disk and survives stop/start.
+# The node supplies the externally reachable host and port.
+#
+# This file deliberately has no Include: a package drop-in cannot loosen the
+# policy below.
+
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+
+# Exactly one host key algorithm and file. Naming HostKey disables sshd's
+# compiled-in /etc/ssh/ssh_host_* defaults, so a stale or package-generated
+# key can never be served.
+HostKey /run/ssh/ssh_host_ed25519_key
+HostKeyAlgorithms ssh-ed25519
+
+PidFile /run/sshd.pid
+
+# Public key only, sandbox user only.
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+AuthenticationMethods publickey
+PermitRootLogin no
+AllowUsers user
+AuthorizedKeysFile .ssh/authorized_keys
+StrictModes yes
+UsePAM yes
+LoginGraceTime 30
+MaxAuthTries 6
+
+# Nothing in the sandbox needs agent/X11/TUN forwarding; SFTP and SCP do
+# need the sftp subsystem.
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+PermitTunnel no
+X11Forwarding no
+PermitUserEnvironment no
+
+PrintMotd no
+UseDNS no
+LogLevel VERBOSE
+
+Subsystem sftp /usr/lib/openssh/sftp-server

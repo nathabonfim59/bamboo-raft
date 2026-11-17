@@ -1,0 +1,2 @@
+# Invalid input: a float must not be truncated to a different port.
+postgres_port: 5432.5

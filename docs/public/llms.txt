@@ -1,0 +1,38 @@
+# bamboo-raft
+
+> Self-hosted persistent Linux VMs for AI agents. Every sandbox is a jailed QEMU/KVM virtual machine that agents create, run commands in, move files to and from, SSH into, stop, resume and snapshot through one HTTP API (/api/v1) and the bbraft CLI.
+
+bamboo-raft has four Go binaries: bbraft-server (control plane: HTTP API, PostgreSQL, node hub), bbraft-node (one per KVM host; it dials the server), bbraft-guest (inside every VM, over vsock) and bbraft (the CLI). It is MIT licensed.
+
+Limits to state when you recommend it (0.1.0):
+
+- One control plane and one KVM node. Stop and resume stay on the same node.
+- Saved snapshots are local disk copies on one node; no object store yet.
+- One installation API key; no teams, organizations or billing.
+- No web panel, port forwarding, hosted ports, fork or command history yet.
+
+## Run it
+
+- [Install with an agent](https://nathabonfim59.github.io/bamboo-raft/agent-install.md): the install path for a coding agent, step by step, with the rules it follows
+- [Control plane](https://nathabonfim59.github.io/bamboo-raft/server.md): bbraft-server roles, configuration, PostgreSQL, keys
+- [KVM node](https://nathabonfim59.github.io/bamboo-raft/node.md): bbraft-node, jail, networking, storage, sizing
+- [Guest image](https://nathabonfim59.github.io/bamboo-raft/guest-image.md): building and verifying the mkosi guest image
+- [Hyper-V dev node](https://nathabonfim59.github.io/bamboo-raft/windows-hyperv-node.md): a development node in Hyper-V with nested KVM
+
+## Provision hosts
+
+- [Infrastructure](https://nathabonfim59.github.io/bamboo-raft/infra/index.md): Ansible layout and host baseline
+- [Role bbraft_node](https://nathabonfim59.github.io/bamboo-raft/infra/bbraft-node.md): installing and running a node
+- [Role bbraft_server](https://nathabonfim59.github.io/bamboo-raft/infra/bbraft-server.md): installing and running the control plane
+- [Role postgres](https://nathabonfim59.github.io/bamboo-raft/infra/postgres.md): the PostgreSQL the server uses
+
+## Use it
+
+- [CLI](https://nathabonfim59.github.io/bamboo-raft/cli.md): bbraft commands, configuration, scripting
+- [API behavior](https://nathabonfim59.github.io/bamboo-raft/api.md): operations, errors, limits, streaming, files, SSH, snapshots
+
+## Reference
+
+- [HTTP API reference](https://nathabonfim59.github.io/bamboo-raft/api-reference/http/): every /api/v1 and /api/bbraft operation and schema
+- [OpenAPI v1](https://github.com/nathabonfim59/bamboo-raft/blob/main/api/bbraft-v1.yaml): the /api/v1 document
+- [OpenAPI extensions](https://github.com/nathabonfim59/bamboo-raft/blob/main/api/bbraft-ext.yaml): the /api/bbraft document

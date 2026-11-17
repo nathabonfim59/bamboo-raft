@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "id": "image-string-root",
+  "createdAt": "2026-11-09T00:00:00Z",
+  "sourceDateEpoch": 1762646400,
+  "distribution": {
+    "id": "ubuntu",
+    "version": "24.04",
+    "codename": "noble",
+    "architecture": "amd64",
+    "snapshot": "placeholder"
+  },
+  "kernel": {
+    "version": "placeholder"
+  },
+  "root": {
+    "filesystem": "ext4",
+    "format": "qcow2",
+    "diskGiB": "10",
+    "virtualSizeBytes": 10737418240,
+    "growth": "placeholder"
+  },
+  "toolchain": {
+    "go": "placeholder",
+    "node": "placeholder",
+    "podman": "placeholder"
+  },
+  "build": {
+    "mkosi": "placeholder"
+  },
+  "artifacts": {
+    "kernel": {
+      "sha256": "cb46064cf7f241aa057739dd1f9d741631f663d91680592824dc5f7051f24bbd",
+      "size": 19
+    },
+    "initrd": {
+      "sha256": "252e01c251e6038fa0e4da46f8d007bfeb320d059f833cbd6355e62efb27b8a0",
+      "size": 19
+    },
+    "root.qcow2": {
+      "sha256": "f4a4a1e0dd47e44971d9adb4d991154523d7b62722ae769124de8e7860a84cc8",
+      "size": 18
+    },
+    "packages.json": {
+      "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "size": 3
+    }
+  }
+}

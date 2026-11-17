@@ -1,0 +1,60 @@
+# Only read-only host checks run, including the nested data-mount tasks.
+# Run normally and with --check; the systemctl fixture pins version parsing.
+# Use a known regular executable and synthetic mount options, so this does
+# not require QEMU, firmware, a service, or a writable host configuration.
+- name: Host probes run normally and in check mode
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    bbraft_node_data_dir: /tmp
+    bbraft_node_jail_uid_range: 900000-900999
+    bbraft_node_jail_qemu_binary: /usr/bin/true
+    bbraft_node_jail_tool_binary: /usr/bin/true
+    bbraft_node_jail_firmware: []
+    bbraft_node_findmnt: [python3, -c, "print('rw,relatime')"]
+    hc_version: "systemd 257 (257.13-1~deb13u1)"
+  environment:
+    PATH: "{{ playbook_dir }}/fixtures/host-checks-bin:{{ lookup('env', 'PATH') }}"
+    BBRAFT_TEST_SYSTEMD_VERSION: "{{ hc_version }}"
+  tasks:
+    - name: Run the real host checks with supported systemd
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: host-checks
+
+    - name: Both command probes produced real output
+      ansible.builtin.assert:
+        that:
+          - not (bbraft_node_systemctl_version.skipped | default(false))
+          - bbraft_node_systemctl_version.stdout == 'systemd 257 (257.13-1~deb13u1)'
+          - not (bbraft_node_data_mount.skipped | default(false))
+          - bbraft_node_data_mount.stdout == 'rw,relatime'
+        quiet: true
+
+    - name: Select unsupported systemd
+      ansible.builtin.set_fact:
+        hc_version: "systemd 252 (252.1)"
+        hc_refused: false
+
+    - name: Unsupported systemd is refused by the real assertion
+      block:
+        - name: Check unsupported systemd
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: host-checks
+      rescue:
+        - name: The version assertion caused the refusal
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_task.name == 'systemd supports DelegateSubgroup='
+              - "'systemd 252 (252.1)' in ansible_failed_result.msg"
+            quiet: true
+        - name: Record the refusal
+          ansible.builtin.set_fact:
+            hc_refused: true
+
+    - name: Unsupported systemd was refused
+      ansible.builtin.assert:
+        that: hc_refused
+        quiet: true

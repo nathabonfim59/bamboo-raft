@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "type": "user.info",
+  "user": {
+    "id": "acct_example",
+    "login": "user",
+    "email": null,
+    "displayName": "User",
+    "connectionMethod": "service",
+    "connectionMethods": ["service"],
+    "accountPlan": "service",
+    "serviceAccount": true,
+    "accountStatus": "active",
+    "suspended": false,
+    "closed": false,
+    "zeroDataRetention": false,
+    "zeroDataRetentionEnabledAt": null
+  }
+}

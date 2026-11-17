@@ -1,0 +1,34 @@
+[Unit]
+Description=bamboo-raft guest agent (vsock)
+Documentation=man:bbraft-guest(8)
+# Root growth is required: the unit has Requires=bbraft-grow-root.service and
+# is ordered after it, so a failed grow means the sandbox never reports
+# readiness instead of exposing a smaller filesystem. The per-boot SSH host
+# key unit is ordered before this one too (Wants=, for AddSSHKey); if it fails,
+# the agent still starts and AddSSHKey stays UNAVAILABLE until a key exists
+#, rather than making Exec/files unavailable. Network-online is
+# best-effort because a guest without a route must still serve vsock; the
+# smoke toolchain check separately proves DHCP/DNS.
+After=local-fs.target systemd-udevd.service bbraft-grow-root.service bbraft-ssh-host-key.service systemd-tmpfiles-setup.service network-online.target
+Requires=bbraft-grow-root.service
+Wants=bbraft-ssh-host-key.service network-online.target
+StartLimitIntervalSec=0
+# The agent must remain able to serve Thaw while the root filesystem is
+# frozen, and Freeze/Thaw need CAP_SYS_ADMIN. Do not add filesystem or
+# privilege sandboxing here; per-command credentials are dropped by the agent.
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/bbraft/guest.env
+# BBRAFT_GUEST_ARGS comes from /etc/bbraft/guest.env and is expanded as
+# separate words.
+ExecStart=/usr/local/bin/bbraft-guest $BBRAFT_GUEST_ARGS
+Restart=always
+RestartSec=1
+# A graceful stop must not SIGKILL the agent while it is retrying FITHAW.
+# Unavoidable SIGKILL/crash recovery runs before logging on the next start.
+TimeoutStopSec=infinity
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

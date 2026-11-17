@@ -1,0 +1,2 @@
+# YAML .inf loads as float infinity: a non-finite ratio must be rejected.
+bbraft_node_disk_overcommit: .inf

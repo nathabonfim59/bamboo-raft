@@ -1,0 +1,222 @@
+# Installs one supplied image version. Called with bbraft_node_image, a spec
+# built by validate.yml from the controller directory and its manifest.
+#
+# Published versions are immutable: an existing directory is only compared and
+# reported unchanged, never replaced or deleted. A first install is copied to
+# a hidden staging sibling (outside the version directory), checked against
+# the manifest, made read-only, and renamed into place atomically. The node
+# ignores invalid image-id directories such as the staging leaf.
+- name: Name the destination path for {{ bbraft_node_image.manifest.id }}
+  ansible.builtin.set_fact:
+    bbraft_node_image_dest: "{{ bbraft_node_image_dir }}/{{ bbraft_node_image.manifest.id }}"
+
+- name: Check whether image {{ bbraft_node_image.manifest.id }} is published
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_image_dest }}"
+    get_checksum: false
+    follow: false
+  register: bbraft_node_image_published
+
+- name: Reuse the immutable published image
+  when: bbraft_node_image_published.stat.exists
+  block:
+    - name: A published image version is a plain directory
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_image_published.stat.isdir
+          - not bbraft_node_image_published.stat.islnk
+        fail_msg: "{{ bbraft_node_image_dest }} must be a plain directory, not a symlink"
+        quiet: true
+
+    - name: Read the published image manifest
+      ansible.builtin.slurp:
+        src: "{{ bbraft_node_image_dest }}/manifest.json"
+      register: bbraft_node_image_published_manifest_raw
+
+    - name: The published manifest is the intended immutable version
+      ansible.builtin.assert:
+        that:
+          - (bbraft_node_image_published_manifest_raw.content | b64decode | from_json) == bbraft_node_image.manifest
+        fail_msg: >-
+          {{ bbraft_node_image_dest }} is already published with different
+          schema, root metadata or artifact hashes; published image versions
+          are immutable. Bump the image id instead of replacing a version that
+          VM disks may depend on.
+        quiet: true
+
+    - name: List the published image entries
+      ansible.builtin.find:
+        paths: "{{ bbraft_node_image_dest }}"
+        recurse: false
+        hidden: true
+        file_type: any
+      register: bbraft_node_image_published_entries
+
+    - name: The published image has exactly the five fixed entries
+      ansible.builtin.assert:
+        that:
+          - (bbraft_node_image_published_entries.files | map(attribute='path') | map('basename') | sort | list) == bbraft_node_image_entries
+        fail_msg: >-
+          {{ bbraft_node_image_dest }} contains entries outside the fixed
+          published set {{ bbraft_node_image_entries }}; the node rejects extras
+        quiet: true
+
+    - name: Re-hash every published image artifact
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_image_dest }}/{{ item }}"
+        checksum_algorithm: sha256
+        follow: false
+      loop: "{{ bbraft_node_image_files }}"
+      register: bbraft_node_image_published_stats
+
+    - name: The published image is complete, intact and read-only
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not item.stat.islnk
+          - item.stat.mode == bbraft_node_image_file_mode
+          - item.stat.pw_name == bbraft_node_image_owner
+          - item.stat.gr_name == bbraft_node_image_group
+          - item.stat.size == bbraft_node_image.manifest.artifacts[item.item].size
+          - item.stat.checksum == bbraft_node_image.manifest.artifacts[item.item].sha256
+        fail_msg: >-
+          {{ item.item }} in the published image is missing, not a plain file,
+          has the wrong owner/mode, or does not match the manifest sha256/size;
+          repair the directory or publish a new image id
+        quiet: true
+      loop: "{{ bbraft_node_image_published_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Read the published image manifest entry
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_image_dest }}/manifest.json"
+        get_checksum: false
+        follow: false
+      register: bbraft_node_image_published_manifest_stat
+
+    - name: The published manifest is a read-only regular file
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_image_published_manifest_stat.stat.isreg
+          - not bbraft_node_image_published_manifest_stat.stat.islnk
+          - bbraft_node_image_published_manifest_stat.stat.mode == bbraft_node_image_file_mode
+          - bbraft_node_image_published_manifest_stat.stat.pw_name == bbraft_node_image_owner
+          - bbraft_node_image_published_manifest_stat.stat.gr_name == bbraft_node_image_group
+        fail_msg: >-
+          {{ bbraft_node_image_dest }}/manifest.json must match
+          {{ bbraft_node_image_file_mode }} and
+          {{ bbraft_node_image_owner }}:{{ bbraft_node_image_group }}
+        quiet: true
+
+    - name: The published image directory is read-only
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_image_dest }}"
+        get_checksum: false
+        follow: false
+      register: bbraft_node_image_published_dir
+
+    - name: Check the published image directory mode and ownership
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_image_published_dir.stat.isdir
+          - not bbraft_node_image_published_dir.stat.islnk
+          - bbraft_node_image_published_dir.stat.mode == bbraft_node_image_mode
+          - bbraft_node_image_published_dir.stat.pw_name == bbraft_node_image_owner
+          - bbraft_node_image_published_dir.stat.gr_name == bbraft_node_image_group
+        fail_msg: >-
+          {{ bbraft_node_image_dest }} must match
+          {{ bbraft_node_image_mode }} and
+          {{ bbraft_node_image_owner }}:{{ bbraft_node_image_group }}
+        quiet: true
+
+    - name: Keep the published image untouched
+      ansible.builtin.debug:
+        msg: "{{ bbraft_node_image.manifest.id }} is already published; not replacing or deleting it"
+
+- name: Preview a first image install
+  ansible.builtin.debug:
+    msg: "{{ bbraft_node_image.manifest.id }} would be published from {{ bbraft_node_image.src }}"
+  when:
+    - not bbraft_node_image_published.stat.exists
+    - ansible_check_mode
+
+- name: Publish a new image version
+  when:
+    - not bbraft_node_image_published.stat.exists
+    - not ansible_check_mode
+  block:
+    - name: Verify the controller artifacts against the supplied manifest
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_image.src }}/{{ item }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      loop: "{{ bbraft_node_image_files }}"
+      register: bbraft_node_image_source_stats
+
+    - name: The controller artifacts match the manifest hashes and sizes
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - item.stat.size == bbraft_node_image.manifest.artifacts[item.item].size
+          - item.stat.checksum == bbraft_node_image.manifest.artifacts[item.item].sha256
+        fail_msg: >-
+          {{ bbraft_node_image.src }}/{{ item.item }} does not match its
+          manifest; nothing was published
+        quiet: true
+      loop: "{{ bbraft_node_image_source_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Create a unique image staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ bbraft_node_image_dir }}"
+        prefix: ".staging-"
+      register: bbraft_node_image_staging_dir
+
+    - name: Name the unique image staging directory
+      ansible.builtin.set_fact:
+        bbraft_node_image_staging: "{{ bbraft_node_image_staging_dir.path }}"
+
+    - name: Make the staging directory writable for the copy
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_staging }}"
+        state: directory
+        owner: "{{ bbraft_node_image_owner }}"
+        group: "{{ bbraft_node_image_group }}"
+        mode: "0755"
+
+    - name: Copy the verified artifacts and manifest into staging
+      ansible.builtin.copy:
+        src: "{{ bbraft_node_image.src }}/{{ item }}"
+        dest: "{{ bbraft_node_image_staging }}/{{ item }}"
+        owner: "{{ bbraft_node_image_owner }}"
+        group: "{{ bbraft_node_image_group }}"
+        mode: "{{ bbraft_node_image_file_mode }}"
+      loop: "{{ bbraft_node_image_entries }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Make the staged version read-only
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_staging }}"
+        state: directory
+        owner: "{{ bbraft_node_image_owner }}"
+        group: "{{ bbraft_node_image_group }}"
+        mode: "{{ bbraft_node_image_mode }}"
+
+    - name: Verify the staged image on the target before publishing
+      ansible.builtin.include_tasks: image-verify-staging.yml
+
+    - name: Publish the image version without clobbering a concurrent winner
+      ansible.builtin.include_tasks: image-publish.yml
+  always:
+    - name: Remove this apply's image staging directory
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_staging | default('') }}"
+        state: absent
+      when: bbraft_node_image_staging is defined

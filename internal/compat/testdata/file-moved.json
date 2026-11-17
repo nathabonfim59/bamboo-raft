@@ -1,0 +1,7 @@
+{
+  "ok": true,
+  "type": "file.moved",
+  "success": true,
+  "path": "/home/user/a.txt",
+  "destination": "/home/user/b.txt"
+}

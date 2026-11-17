@@ -1,0 +1,2 @@
+# A boolean is not a ratio: YAML true must be rejected, not treated as 1.
+bbraft_node_cpu_overcommit: true

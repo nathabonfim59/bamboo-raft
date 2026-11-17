@@ -1,0 +1,10 @@
+# Renders the single drop-in. Imported by main.yml after the cluster checks and
+# directly by the role-local render test, which has no cluster to restart.
+- name: Add the bbraft drop-in
+  ansible.builtin.template:
+    src: bbraft.conf.j2
+    dest: "{{ postgres_dropin }}"
+    owner: "{{ postgres_file_owner }}"
+    group: "{{ postgres_file_group }}"
+    mode: "{{ postgres_file_mode }}"
+  notify: Restart the PostgreSQL cluster

@@ -1,0 +1,92 @@
+- name: Skip when the node has no bulk disk
+  ansible.builtin.meta: end_role
+  when: not bulk_disk_device
+
+- name: Bulk disk must be given by id
+  ansible.builtin.assert:
+    that: bulk_disk_device is match('^/dev/disk/by-id/')
+    fail_msg: "bulk_disk_device must be a /dev/disk/by-id/ path, got {{ bulk_disk_device }}"
+    quiet: true
+
+- name: Install XFS and partitioning tools
+  ansible.builtin.apt:
+    name: [xfsprogs, parted]
+    state: present
+
+- name: Resolve the bulk disk
+  ansible.builtin.stat:
+    path: "{{ bulk_disk_device }}"
+  register: bulk_disk_stat
+
+- name: Bulk disk must exist
+  ansible.builtin.assert:
+    that: bulk_disk_stat.stat.exists
+    fail_msg: "{{ bulk_disk_device }} not found"
+    quiet: true
+
+# Safety: only a disk with no signatures at all, or one that already holds
+# our labelled partition, may be touched. Anything else stops the run.
+- name: Read existing signatures on the disk and its partitions
+  ansible.builtin.command: lsblk --noheadings --raw -o NAME,FSTYPE,LABEL,PARTLABEL {{ bulk_disk_device }}
+  register: bulk_disk_lsblk
+  changed_when: false
+  check_mode: false   # read-only probe; must run in --check too
+
+- name: Read signatures on the whole disk
+  ansible.builtin.command: wipefs --noheadings --parsable {{ bulk_disk_device }}
+  register: bulk_disk_wipefs
+  changed_when: false
+  check_mode: false   # read-only probe; must run in --check too
+
+- name: Refuse a disk that holds something else
+  ansible.builtin.assert:
+    that: >-
+      (bulk_disk_lsblk.stdout_lines | length == 1 and bulk_disk_wipefs.stdout | trim == '')
+      or (bulk_disk_label in bulk_disk_lsblk.stdout)
+    fail_msg: >-
+      {{ bulk_disk_device }} already holds data that is not ours
+      ({{ bulk_disk_lsblk.stdout | trim }}). Not touching it.
+    quiet: true
+
+- name: Create a GPT with one partition over the whole disk
+  community.general.parted:
+    device: "{{ bulk_disk_device }}"
+    label: gpt
+    number: 1
+    name: "{{ bulk_disk_label }}"
+    part_start: 0%
+    part_end: 100%
+    state: present
+  register: bulk_disk_parted
+
+- name: Wait for the partition device
+  ansible.builtin.command: udevadm settle
+  when: bulk_disk_parted.changed
+  changed_when: false
+  check_mode: false   # read-only probe; must run in --check too
+
+- name: Make the XFS filesystem
+  community.general.filesystem:
+    dev: "{{ bulk_disk_device }}-part1"
+    fstype: xfs
+    opts: "-L {{ bulk_disk_label }} -m reflink=1"
+  # In --check the partition is not really created, so there is nothing to format yet.
+  when: not (ansible_check_mode and bulk_disk_parted.changed)
+
+- name: Mount it at {{ bulk_disk_mountpoint }}
+  ansible.posix.mount:
+    path: "{{ bulk_disk_mountpoint }}"
+    src: "LABEL={{ bulk_disk_label }}"
+    fstype: xfs
+    opts: "{{ bulk_disk_mount_opts }}"
+    state: mounted
+  # Same reason: in --check there is no filesystem to mount yet.
+  when: not (ansible_check_mode and bulk_disk_parted.changed)
+
+- name: Mount point permissions
+  ansible.builtin.file:
+    path: "{{ bulk_disk_mountpoint }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"

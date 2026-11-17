@@ -1,0 +1,92 @@
+# Renders the drop-in into a temporary directory and asserts the exact
+# settings, ownership mode and escaped values. No PostgreSQL is touched.
+- name: PostgreSQL role render checks
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars.yml
+  vars:
+    postgres_manage_service: false
+  tasks:
+    - name: Temporary root
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: bbraft-postgres-test
+      register: postgres_test_root
+
+    - name: Point the role at the temporary cluster config
+      ansible.builtin.set_fact:
+        postgres_config_dir: "{{ postgres_test_root.path }}/etc postgres % $ \"x\""
+        postgres_file_owner: "{{ ansible_facts['user_id'] }}"
+        postgres_file_group: "{{ ansible_facts['user_gid'] }}"
+
+    - name: Point the drop-in inside that directory
+      ansible.builtin.set_fact:
+        postgres_dropin: "{{ postgres_config_dir }}/conf.d/bbraft.conf"
+
+    - name: Create the simulated conf.d directory
+      ansible.builtin.file:
+        path: "{{ postgres_config_dir }}/conf.d"
+        state: directory
+        mode: "0755"
+
+    - name: Render the drop-in
+      ansible.builtin.include_role:
+        name: postgres
+        tasks_from: config
+
+    - name: Read the rendered file
+      ansible.builtin.slurp:
+        src: "{{ postgres_dropin }}"
+      register: postgres_rendered
+
+    - name: Read the rendered mode
+      ansible.builtin.stat:
+        path: "{{ postgres_dropin }}"
+      register: postgres_rendered_stat
+
+    - name: The drop-in has the exact loopback defaults
+      ansible.builtin.assert:
+        that:
+          - postgres_rendered_content is search("listen_addresses = '127.0.0.1'")
+          - postgres_rendered_content is search("port = 5432")
+          - postgres_rendered_content is search("password_encryption = 'scram-sha-256'")
+          - postgres_rendered_content is not search("include_dir")
+          - postgres_rendered_stat.stat.mode == "0640"
+        fail_msg: "rendered drop-in does not match the documented loopback settings"
+        quiet: true
+      vars:
+        postgres_rendered_content: "{{ postgres_rendered.content | b64decode }}"
+
+    - name: Point the next render at a custom file
+      ansible.builtin.set_fact:
+        postgres_dropin: "{{ postgres_test_root.path }}/custom.conf"
+
+    - name: A custom loopback pair renders literally
+      ansible.builtin.include_role:
+        name: postgres
+        tasks_from: config
+      vars:
+        postgres_listen_addresses: "127.0.0.1,::1"
+        postgres_port: 55432
+
+    - name: Read the custom render
+      ansible.builtin.slurp:
+        src: "{{ postgres_test_root.path }}/custom.conf"
+      register: postgres_custom
+
+    - name: The custom values are rendered without modification
+      ansible.builtin.assert:
+        that:
+          - postgres_custom_content is search("listen_addresses = '127.0.0.1,::1'")
+          - postgres_custom_content is search("port = 55432")
+        fail_msg: "custom listen_addresses/port were not rendered literally"
+        quiet: true
+      vars:
+        postgres_custom_content: "{{ postgres_custom.content | b64decode }}"
+
+    - name: Remove the temporary root
+      ansible.builtin.file:
+        path: "{{ postgres_test_root.path }}"
+        state: absent

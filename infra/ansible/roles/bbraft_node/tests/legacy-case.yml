@@ -1,0 +1,100 @@
+# One legacy/foreign data-dir case (included by legacy-data.yml). The tree is
+# built in a fresh temporary parent; the role's read-only check and its
+# creation step run; a refusal must leave the whole parent byte-, inode- and
+# ownership-identical.
+- name: "{{ lc.name }}: fresh temporary parent"
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: bbraft-legacy
+  register: lc_parent
+
+- name: "{{ lc.name }}: name the data dir"
+  ansible.builtin.set_fact:
+    lc_data: "{{ lc_parent.path }}/data"
+    lc_result: unknown
+    lc_msg: ""
+
+- name: "{{ lc.name }}: build the starting tree"
+  ansible.builtin.shell: "{{ lc.setup }}"
+  args:
+    executable: /bin/sh
+  environment:
+    D: "{{ lc_data }}"
+    M: "{{ lc_marker_name }}"
+  when: lc.setup | length > 0
+  changed_when: false
+
+- name: "{{ lc.name }}: snapshot before"
+  ansible.builtin.command:
+    argv: [python3, "{{ playbook_dir }}/tree_snapshot.py", "{{ lc_parent.path }}"]
+  register: lc_before
+  changed_when: false
+
+- name: "{{ lc.name }}: run the data-dir recognition and creation"
+  block:
+    - name: "{{ lc.name }}: recognition"
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: data-dir-check
+      vars:
+        bbraft_node_data_dir: "{{ lc_data }}"
+        bbraft_node_data_owner: "{{ lc.owner | default(lc_user) }}"
+        bbraft_node_data_group: "{{ lc.group | default(lc_group) }}"
+    - name: "{{ lc.name }}: creation"
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: data-dir-create
+      vars:
+        bbraft_node_data_dir: "{{ lc_data }}"
+        bbraft_node_data_owner: "{{ lc.owner | default(lc_user) }}"
+        bbraft_node_data_group: "{{ lc.group | default(lc_group) }}"
+    - name: "{{ lc.name }}: accepted"
+      ansible.builtin.set_fact:
+        lc_result: accepted
+  rescue:
+    - name: "{{ lc.name }}: refused"
+      ansible.builtin.set_fact:
+        lc_result: refused
+        lc_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "{{ lc.name }}: snapshot after"
+  ansible.builtin.command:
+    argv: [python3, "{{ playbook_dir }}/tree_snapshot.py", "{{ lc_parent.path }}"]
+  register: lc_after
+  changed_when: false
+
+- name: "{{ lc.name }}: read the data dir and marker"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop:
+    - "{{ lc_data }}"
+    - "{{ lc_data }}/{{ lc_marker_name }}"
+  register: lc_stats
+  # The marker path cannot be stat'ed when the data dir is a file; that case
+  # only needs the refusal and the unchanged snapshot.
+  failed_when: false
+
+- name: "{{ lc.name }}: judge the outcome"
+  ansible.builtin.set_fact:
+    lc_ok: >-
+      {%- set d = lc_stats.results[0].stat -%}
+      {%- set m = lc_stats.results[1].stat | default({}) -%}
+      {%- if lc.expect == 'refuse' -%}
+      {{ lc_result == 'refused' and lc.message in lc_msg and lc_before.stdout == lc_after.stdout }}
+      {%- else -%}
+      {{ lc_result == 'accepted'
+         and (d.exists | default(false)) and (d.isdir | default(false)) and not (d.islnk | default(true))
+         and d.mode | default('') == '0700' and d.pw_name | default('') == lc_user
+         and (m.exists | default(false)) and (m.isreg | default(false)) and not (m.islnk | default(true))
+         and m.mode | default('') == '0600' and m.nlink | default(0) == 1 and m.pw_name | default('') == lc_user
+         and m.checksum | default('') == lc_marker_sha256
+         and (lc.expect != 'unchanged' or lc_before.stdout == lc_after.stdout) }}
+      {%- endif -%}
+
+- name: "{{ lc.name }}: record a failing case"
+  ansible.builtin.set_fact:
+    lc_failures: "{{ lc_failures + [lc.name ~ ': expected ' ~ lc.expect ~ ', got ' ~ lc_result ~ ' (' ~ lc_msg ~ '); tree changed: ' ~ (lc_before.stdout != lc_after.stdout)] }}"
+  when: not (lc_ok | bool)

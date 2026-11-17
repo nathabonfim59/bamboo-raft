@@ -1,0 +1,108 @@
+#!/bin/bash
+# mkosi post-install script: guest identity, boot configuration and first-boot
+# state. Runs inside the image as root, after packages and mkosi.extra.
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# The unprivileged sandbox user. uid/gid 1000 matches the node
+# and guest agent contract; HOME is /home/user. Create the group explicitly so
+# a pre-existing group name cannot shift the gid.
+if ! getent group 1000 >/dev/null 2>&1; then
+	groupadd --gid 1000 user
+fi
+if ! id -u user >/dev/null 2>&1; then
+	useradd --create-home --uid 1000 --gid 1000 --shell /bin/bash \
+		--comment "bamboo-raft sandbox user" user
+fi
+install -d -m 0755 -o user -g user /home/user
+# authorized_keys lives on the sandbox disk and survives stop/start. The node
+# installs the one key through AddSSHKey; nothing is baked into the image.
+install -d -m 0700 -o user -g user /home/user/.ssh
+if getent group sudo >/dev/null 2>&1; then
+	usermod -aG sudo user
+fi
+
+install -d -m 0755 /etc/sudoers.d
+printf '%s\n' 'user ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/90-bbraft-user
+chmod 0440 /etc/sudoers.d/90-bbraft-user
+visudo -cf /etc/sudoers
+
+# Rootless Podman needs subordinate uid/gid ranges even without a login
+# session. useradd may not add them in a chroot.
+if ! grep -q '^user:' /etc/subuid 2>/dev/null; then
+	printf '%s\n' 'user:100000:65536' >>/etc/subuid
+fi
+if ! grep -q '^user:' /etc/subgid 2>/dev/null; then
+	printf '%s\n' 'user:100000:65536' >>/etc/subgid
+fi
+
+# Network: systemd-networkd DHCP on the QEMU/passt NIC; resolved owns
+# /etc/resolv.conf. Enabling the units offline works in a chroot.
+ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+systemctl enable systemd-networkd.service systemd-resolved.service systemd-timesyncd.service
+# TAP mode passes a static ip= on the kernel command line; our unit turns it
+# into /run/systemd/network/10-bbraft-static.network before networkd starts,
+# and systemd-networkd.service requires it (drop-in) so a real generator
+# failure gates networkd instead of falling back to DHCP. The stock generator
+# would also parse ip=: mask it so exactly one component owns the kernel
+# command line and address, gateway and DNS stay deterministic. Masking a unit
+# name is offline-safe; a failure here must fail the build rather than leave
+# two components racing over ip=. With no ip= (the QEMU user-mode dev
+# fallback) both do nothing and the shipped DHCP configuration applies.
+systemctl enable bbraft-network-config.service
+systemctl mask systemd-network-generator.service
+# The guest unit orders after network-online.target; make sure DHCP/static
+# configuration actually completes (bounded by the unit's default timeout)
+# before it starts.
+systemctl enable systemd-networkd-wait-online.service
+
+# Timezone and locale: deterministic and small.
+ln -sfn /usr/share/zoneinfo/UTC /etc/localtime
+printf '%s\n' UTC >/etc/timezone
+
+# Guest agent and root growth. The binary is installed by build.sh; the unit
+# intentionally runs as root because Freeze/Thaw need CAP_SYS_ADMIN.
+systemctl enable bbraft-guest.service bbraft-grow-root.service
+
+# SSH host identity is generated per boot by bbraft-ssh-host-key.service into
+# /run/ssh; no host key may exist in the image. Drop anything openssh-server's
+# postinst generated and refuse to continue if a key survived.
+rm -f /etc/ssh/ssh_host_* /run/ssh/ssh_host_* /run/sshd.pid
+if compgen -G '/etc/ssh/ssh_host_*' >/dev/null; then
+	echo "postinst: SSH host keys must not be baked into the image" >&2
+	exit 1
+fi
+systemctl enable bbraft-ssh-host-key.service ssh.service
+# Socket activation would start ssh@.service instances without our key unit in
+# the same transaction; the image uses ssh.service after the key unit instead.
+systemctl disable ssh.socket 2>/dev/null || true
+install -d -m 0755 /run/sshd /run/ssh
+chown root:root /etc/ssh/sshd_config
+chmod 0644 /etc/ssh/sshd_config
+# Validate the config against the exact runtime key path with a throwaway key,
+# then remove it: the image must contain no host key.
+ssh-keygen -q -t ed25519 -N '' -f /run/ssh/ssh_host_ed25519_key
+/usr/sbin/sshd -t -f /etc/ssh/sshd_config
+rm -f /run/ssh/ssh_host_ed25519_key /run/ssh/ssh_host_ed25519_key.pub
+
+# First boot must generate a fresh machine identity and random seed.
+: >/etc/machine-id
+chmod 0644 /etc/machine-id
+rm -f /var/lib/dbus/machine-id /var/lib/systemd/random-seed
+ln -sfn /etc/machine-id /var/lib/dbus/machine-id
+rm -f /var/lib/systemd/credential.secret
+
+# Explicitly (re)generate initramfs for every installed kernel with the
+# bbraft.conf MODULES=most setting, so virtio_blk/virtio_pci are guaranteed.
+# build.sh verifies the result before extracting kernel and initrd.
+for kver in /usr/lib/modules/*; do
+	[ -d "$kver" ] || continue
+	update-initramfs -c -k "$(basename "$kver")"
+done
+
+# No package caches or docs in the sandbox image.
+apt-get clean
+rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
+
+chown -R user:user /home/user

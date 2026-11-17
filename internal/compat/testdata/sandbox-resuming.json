@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "type": "sandbox.resuming",
+  "id": "bx_23456789",
+  "status": "resuming",
+  "sandbox": {
+    "id": "bx_23456789",
+    "name": "Sandbox 2026-11-11 10:00",
+    "state": "provisioning",
+    "subdomain": "acme-staging",
+    "archiveAfter": null,
+    "ttlSeconds": null,
+    "stoppedAt": null,
+    "desktopAvailable": false,
+    "snapshotAvailable": false
+  }
+}

@@ -1,0 +1,2 @@
+# Invalid input: a non-decimal string must not become an argv value.
+bbraft_server_retry_seconds: "5x"

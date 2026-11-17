@@ -1,0 +1,8 @@
+# Placeholders only: no real password, host or account id.
+postgres_version: "17"
+postgres_cluster: main
+postgres_listen_addresses: "127.0.0.1"
+postgres_port: 5432
+postgres_password: "placeholder-password-not-real"
+postgres_user: bbraft
+postgres_database: bbraft

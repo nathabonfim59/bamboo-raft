@@ -1,0 +1,7 @@
+# Collections the roles use. Install into ./.collections (gitignored):
+#   ansible-galaxy collection install -r requirements.yml
+collections:
+  - name: ansible.posix       # mount
+    version: ">=1.6.0"
+  - name: community.general   # parted, filesystem
+    version: ">=9.0.0"

@@ -1,0 +1,18 @@
+# Renders the hardening role's real nftables template (no copy of it in the
+# tests) for ip-forward.sh's real-nft proof. Local, unprivileged, one file.
+#
+#   ansible-playbook ip-forward-render.yml -e out=/tmp/x.nft -e '{"bridges": ["bbraft0"]}'
+- name: Render the hardening nftables template
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    hardening_trusted_interfaces: [tailscale0]
+    hardening_open_udp_ports: [41641]
+    hardening_vm_bridge_interfaces: "{{ bridges }}"
+  tasks:
+    - name: Render the template
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../hardening/templates/nftables.conf.j2"
+        dest: "{{ out }}"
+        mode: "0600"

@@ -1,0 +1,2 @@
+# Invalid input: intervals are integers, not floats; 1.5 must not truncate.
+bbraft_server_stream_max_seconds: 1.5

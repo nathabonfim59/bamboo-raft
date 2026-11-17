@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 502,
+  "code": "sandbox_direct_failed",
+  "message": "The command may already be running",
+  "error": {
+    "code": "sandbox_direct_failed",
+    "message": "The command may already be running",
+    "status": 502,
+    "details": {"retryable": false}
+  },
+  "requestId": "req_01HXEXAMPLE"
+}

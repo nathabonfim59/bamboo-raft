@@ -1,0 +1,78 @@
+#!/bin/sh
+# Grow the root filesystem to fill its block device on every boot.
+#
+# root.qcow2 is a whole-disk ext4 image (no partition table), so the node only
+# resizes the per-VM overlay and this script resizes the filesystem. A
+# partitioned root is handled too: growpart extends the last partition first,
+# then resize2fs fills it. Both steps run before bbraft-guest.service
+# (Requires/After), so guest readiness never precedes growth.
+#
+# A repeat on an already-full filesystem is a no-op: growpart reports
+# NOCHANGE (exit 1) and resize2fs succeeds without changes.
+set -eu
+
+source=$(findmnt -n -o SOURCE /)
+if [ -z "$source" ]; then
+	echo "bbraft-grow-root: cannot determine the root device" >&2
+	exit 1
+fi
+case "$source" in
+/dev/*) ;;
+*)
+	echo "bbraft-grow-root: root source '$source' is not a block device; skipping" >&2
+	exit 0
+	;;
+esac
+if [ ! -b "$source" ]; then
+	# The fast shell test substitutes block devices; production never sets
+	# this knob.
+	if [ "${BBRAFT_GROW_ROOT_TEST_ALLOW_NON_BLOCK:-0}" = "1" ]; then
+		printf 'bbraft-grow-root: test mode: treating %s as a block device\n' "$source" >&2
+	else
+		echo "bbraft-grow-root: root source '$source' is not a block device; skipping" >&2
+		exit 0
+	fi
+fi
+
+# If the root device is a partition, grow the partition to the disk size
+# first. growpart exits 0 when it changed the table and 1 when there was
+# nothing to do; any other status is a failure and must not be hidden by a
+# later filesystem resize. A whole-disk root has no parent, so this is a
+# no-op there.
+grow_partition() {
+	command -v growpart >/dev/null 2>&1 || return 0
+	command -v lsblk >/dev/null 2>&1 || return 0
+
+	parent=$(lsblk -n -o PKNAME "$source" 2>/dev/null | head -n 1 || true)
+	partnum=$(lsblk -n -o PARTN "$source" 2>/dev/null | head -n 1 || true)
+	[ -n "$parent" ] && [ -n "$partnum" ] || return 0
+
+	status=0
+	out=$(growpart "/dev/$parent" "$partnum" 2>&1) || status=$?
+	case "$status" in
+	0)
+		printf 'bbraft-grow-root: grew partition %s of /dev/%s\n' "$partnum" "$parent"
+		[ -z "$out" ] || printf '%s\n' "$out" >&2
+		;;
+	1)
+		# NOCHANGE: the partition already fills the disk.
+		;;
+	*)
+		printf 'bbraft-grow-root: growpart /dev/%s %s failed (%s)\n%s\n' \
+			"$parent" "$partnum" "$status" "$out" >&2
+		exit 1
+		;;
+	esac
+	return 0
+}
+
+grow_partition
+
+# resize2fs is an online grow for ext4 and succeeds without changes when the
+# filesystem already fills the device.
+if ! resize2fs "$source"; then
+	echo "bbraft-grow-root: resize2fs $source failed" >&2
+	exit 1
+fi
+
+echo "bbraft-grow-root: $source now $(findmnt -n -o SIZE /) ($(blockdev --getsize64 "$source") bytes)"

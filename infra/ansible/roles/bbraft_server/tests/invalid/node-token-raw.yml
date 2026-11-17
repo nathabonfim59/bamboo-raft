@@ -1,0 +1,4 @@
+# Invalid input: a raw node token must never be stored; only its SHA-256.
+bbraft_server_node_tokens:
+  - id: node-example
+    token: raw-token-placeholder

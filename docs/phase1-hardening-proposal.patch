@@ -1,0 +1,19 @@
+diff --git a/infra/ansible/roles/hardening/templates/nftables.conf.j2 b/infra/ansible/roles/hardening/templates/nftables.conf.j2
+--- a/infra/ansible/roles/hardening/templates/nftables.conf.j2
++++ b/infra/ansible/roles/hardening/templates/nftables.conf.j2
+@@ -44,8 +44,13 @@ table inet bbraft_filter {
+ 	}
+ 
+ 	chain forward {
+-		# The host routes nothing: VMs use user-mode networking and the host
+-		# is not a Tailscale subnet router or exit node.
++		# Forward only through explicitly configured VM bridges. The node's
++		# own nftables tables enforce VM isolation and allowed ingress/egress.
++		# An empty list preserves a host that routes nothing.
+ 		type filter hook forward priority filter; policy drop;
++{% for iface in hardening_vm_bridge_interfaces | default([]) %}
++		meta nfproto ipv4 iifname "{{ iface }}" accept
++		meta nfproto ipv4 oifname "{{ iface }}" accept
++{% endfor %}
+ 	}
+ }

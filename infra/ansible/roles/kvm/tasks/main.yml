@@ -1,0 +1,25 @@
+# Nested virtualization is required (sandboxes get /dev/kvm).
+# It is usually already on; this pins it so a kernel default change can't
+# turn it off.
+- name: Persist nested virtualization for {{ kvm_module }}
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/bbraft-kvm.conf
+    content: |
+      # Managed by bamboo-raft infra/ansible (role kvm).
+      options {{ kvm_module }} nested=1
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Read the nested parameter
+  ansible.builtin.slurp:
+    src: "/sys/module/{{ kvm_module }}/parameters/nested"
+  register: kvm_nested
+
+- name: Nested virtualization must be on
+  ansible.builtin.assert:
+    that: (kvm_nested.content | b64decode | trim) in ['Y', '1']
+    fail_msg: >-
+      {{ kvm_module }} nested is off. The modprobe option is in place; reload
+      the module with no VMs running, or reboot.
+    quiet: true

@@ -1,0 +1,13 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 500,
+  "code": "http_500",
+  "message": "Internal server error",
+  "error": {
+    "code": "http_500",
+    "message": "Internal server error",
+    "status": 500
+  },
+  "requestId": "req_01HXEXAMPLE"
+}

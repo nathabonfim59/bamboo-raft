@@ -1,0 +1,4 @@
+# Reboot when a newer kernel is installed than the one running. Turn off on
+# nodes that host sandboxes: a reboot stops every VM on them.
+kernel_reboot_allowed: true
+kernel_reboot_timeout: 900

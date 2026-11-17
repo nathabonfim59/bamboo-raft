@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "type": "file.written",
+  "success": true,
+  "path": "/home/user/notes.txt",
+  "encoding": "base64",
+  "size": 3
+}

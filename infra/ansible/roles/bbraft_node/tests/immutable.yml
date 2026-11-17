@@ -1,0 +1,430 @@
+# Source/checksum failures must not replace a working binary, and an existing
+# image id must never be replaced by a different artifact map. Local connection
+# and a temporary tree only; no user, systemd unit or service is touched.
+- name: Prove failed sources and image collisions leave existing files intact
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars.yml
+  vars:
+    bbraft_node_binary_src: "{{ playbook_dir }}/fixtures/bbraft-node"
+    bbraft_node_manage_service: false
+    bbraft_node_binary_mode: "0755"
+    bbraft_node_image_file_mode: "0444"
+    bbraft_node_image_mode: "0555"
+  tasks:
+    - name: Temporary root
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: bbraft-node-immutable-test
+      register: bbraft_node_immutable_root
+
+    - name: Use temporary paths
+      ansible.builtin.set_fact:
+        bbraft_node_config_dir: "{{ bbraft_node_immutable_root.path }}/etc"
+        bbraft_node_data_dir: "{{ bbraft_node_immutable_root.path }}/var"
+        bbraft_node_image_dir: "{{ bbraft_node_immutable_root.path }}/var/images"
+        bbraft_node_binary_path: "{{ bbraft_node_immutable_root.path }}/bin/bbraft-node"
+        bbraft_node_unit_path: "{{ bbraft_node_immutable_root.path }}/bbraft-node.service"
+        bbraft_node_udev_rule_path: "{{ bbraft_node_immutable_root.path }}/60-bbraft-kvm.rules"
+        bbraft_node_modules_load_path: "{{ bbraft_node_immutable_root.path }}/bbraft-vhost-vsock.conf"
+        bbraft_node_token_file: "{{ bbraft_node_immutable_root.path }}/etc/node.token"
+        bbraft_node_data_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_data_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_config_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_config_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_token_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_token_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_binary_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_binary_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_unit_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_unit_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_udev_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_udev_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_modules_load_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_modules_load_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_image_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_image_group: "{{ ansible_facts['user_id'] }}"
+
+    - name: Create the simulated directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ bbraft_node_config_dir }}", mode: "0750" }
+        - { path: "{{ bbraft_node_data_dir }}", mode: "0700" }
+        - { path: "{{ bbraft_node_image_dir }}", mode: "0755" }
+        - { path: "{{ bbraft_node_binary_path | dirname }}", mode: "0755" }
+
+    - name: Install a good binary and image once
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate
+
+    - name: Render the initial tree
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: files
+
+    - name: Record the installed binary and image checksums
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop:
+        - "{{ bbraft_node_binary_path }}"
+        - "{{ bbraft_node_image_dir }}/image-fixture/manifest.json"
+        - "{{ bbraft_node_image_dir }}/image-fixture/root.qcow2"
+      register: bbraft_node_before
+
+    - name: A wrong binary checksum is rejected
+      block:
+        - name: Validate with a deliberately wrong binary checksum
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: validate
+          vars:
+            bbraft_node_binary_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      rescue:
+        - name: Note the expected rejection
+          ansible.builtin.set_fact:
+            bbraft_node_bad_checksum_rejected: true
+            bbraft_node_bad_checksum_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The wrong checksum was rejected at the source check
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_bad_checksum_rejected | default(false) | bool
+          - "'does not match bbraft_node_binary_sha256' in bbraft_node_bad_checksum_reason"
+        fail_msg: "a wrong binary checksum was accepted or failed at the wrong stage"
+        quiet: true
+
+    - name: Stat the installed binary after the rejection
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_binary_path }}"
+        checksum_algorithm: sha256
+      register: bbraft_node_binary_after_failure
+
+    - name: The installed binary was not replaced
+      ansible.builtin.assert:
+        that: bbraft_node_binary_after_failure.stat.checksum == bbraft_node_before.results[0].stat.checksum
+        fail_msg: "a rejected binary source changed the installed binary"
+        quiet: true
+
+    - name: Give the already-matching binary the wrong mode
+      ansible.builtin.file:
+        path: "{{ bbraft_node_binary_path }}"
+        state: file
+        mode: "0640"
+
+    - name: Render with a matching checksum but a wrong installed mode
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: files
+
+    - name: Stat the binary after the mode-only repair
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_binary_path }}"
+        checksum_algorithm: sha256
+      register: bbraft_node_binary_mode_repaired
+
+    - name: A matching binary still gets the configured owner and mode
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_binary_mode_repaired.stat.checksum == bbraft_node_before.results[0].stat.checksum
+          - bbraft_node_binary_mode_repaired.stat.mode == bbraft_node_binary_mode
+          - bbraft_node_binary_mode_repaired.stat.pw_name == bbraft_node_binary_owner
+          - bbraft_node_binary_mode_repaired.stat.gr_name == bbraft_node_binary_group
+        fail_msg: "a matching installed binary kept a wrong owner or mode"
+        quiet: true
+
+    - name: Create a controller source directory
+      ansible.builtin.file:
+        path: "{{ bbraft_node_immutable_root.path }}/controller"
+        state: directory
+        mode: "0755"
+
+    - name: Make a controller source copy and corrupt the installed binary
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/fixtures/bbraft-node"
+        dest: "{{ bbraft_node_immutable_root.path }}/controller/bbraft-node"
+        mode: "0644"
+
+    - name: Corrupt the installed binary so replacement is attempted
+      ansible.builtin.copy:
+        content: "different installed binary\n"
+        dest: "{{ bbraft_node_binary_path }}"
+        mode: "{{ bbraft_node_binary_mode }}"
+
+    - name: Record the corrupted installed checksum
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_binary_path }}"
+        checksum_algorithm: sha256
+      register: bbraft_node_binary_corrupted
+
+    - name: Validate the original controller copy
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate
+      vars:
+        bbraft_node_binary_src: "{{ bbraft_node_immutable_root.path }}/controller/bbraft-node"
+
+    - name: Swap the controller source after validation
+      ansible.builtin.copy:
+        content: "swapped controller source\n"
+        dest: "{{ bbraft_node_immutable_root.path }}/controller/bbraft-node"
+        mode: "0644"
+
+    - name: A source swapped after validation fails at the staged hash check
+      block:
+        - name: Render the swapped source
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: files
+          vars:
+            bbraft_node_binary_src: "{{ bbraft_node_immutable_root.path }}/controller/bbraft-node"
+      rescue:
+        - name: Record the expected staged-binary rejection
+          ansible.builtin.set_fact:
+            bbraft_node_source_swap_rejected: true
+            bbraft_node_source_swap_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The source swap was rejected at the staged binary check
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_source_swap_rejected | default(false) | bool
+          - "'staged binary' in bbraft_node_source_swap_reason"
+        fail_msg: "a source swapped after validation was not rejected at the staged binary check"
+        quiet: true
+
+    - name: Stat the failed apply's unique binary staging path
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_binary_staging_path }}"
+        get_checksum: false
+      register: bbraft_node_binary_staging_after
+      when: bbraft_node_binary_staging_path is defined
+
+    - name: The failed apply removed its unique binary staging file
+      ansible.builtin.assert:
+        that: not bbraft_node_binary_staging_after.stat.exists
+        fail_msg: "a failed binary staging operation left its unique staging file behind"
+        quiet: true
+      when: bbraft_node_binary_staging_path is defined
+
+    - name: Stat the installed binary after the source swap
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_binary_path }}"
+        checksum_algorithm: sha256
+      register: bbraft_node_binary_after_swap
+
+    - name: The installed binary was preserved through the source swap
+      ansible.builtin.assert:
+        that: bbraft_node_binary_after_swap.stat.checksum == bbraft_node_binary_corrupted.stat.checksum
+        fail_msg: "a rejected source swap replaced the installed executable"
+        quiet: true
+
+    - name: Restore the good binary from the fixture
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: files
+      vars:
+        bbraft_node_binary_src: "{{ playbook_dir }}/fixtures/bbraft-node"
+
+    - name: Point the role at a source whose artifact does not match its manifest
+      ansible.builtin.set_fact:
+        bbraft_node_images:
+          - "{{ playbook_dir }}/fixtures/image-bad-hash"
+
+    - name: Validate the bad-hash source
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate
+
+    - name: A source artifact that fails its manifest is not published
+      block:
+        - name: Render the bad-hash source
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: files
+      rescue:
+        - name: Note the expected source rejection
+          ansible.builtin.set_fact:
+            bbraft_node_bad_source_rejected: true
+            bbraft_node_bad_source_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The bad source was rejected at the controller artifact check
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_bad_source_rejected | default(false) | bool
+          - "'does not match its manifest' in bbraft_node_bad_source_reason"
+        fail_msg: "an image artifact that did not match its manifest was not rejected at the source check"
+        quiet: true
+
+    - name: List the image root after the rejected source
+      ansible.builtin.find:
+        paths: "{{ bbraft_node_image_dir }}"
+        recurse: false
+        hidden: true
+        file_type: any
+      register: bbraft_node_image_root_after_source
+
+    - name: The rejected source published nothing and kept the existing image
+      ansible.builtin.assert:
+        that:
+          - (bbraft_node_image_root_after_source.files | map(attribute='path') | map('basename') | sort | list) == ['image-fixture']
+        fail_msg: "a rejected image source created a version directory or removed the existing one"
+        quiet: true
+
+    - name: Create a colliding source with the same id but different artifacts
+      ansible.builtin.file:
+        path: "{{ bbraft_node_immutable_root.path }}/collision/image-fixture"
+        state: directory
+        mode: "0755"
+
+    - name: Write the colliding manifest
+      ansible.builtin.copy:
+        dest: "{{ bbraft_node_immutable_root.path }}/collision/image-fixture/manifest.json"
+        mode: "0644"
+        content: |
+          {
+            "schemaVersion": 1,
+            "id": "image-fixture",
+            "root": {
+              "filesystem": "ext4",
+              "format": "qcow2",
+              "diskGiB": 10,
+              "virtualSizeBytes": 10737418240
+            },
+            "artifacts": {
+              "kernel": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size": 1},
+              "initrd": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size": 1},
+              "root.qcow2": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size": 1},
+              "packages.json": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size": 1}
+            }
+          }
+
+    - name: Point the role at the colliding source
+      ansible.builtin.set_fact:
+        bbraft_node_images:
+          - "{{ bbraft_node_immutable_root.path }}/collision/image-fixture"
+
+    - name: Validate the colliding source
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate
+
+    - name: A different artifact map for a published id is refused
+      block:
+        - name: Render the colliding source
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: files
+      rescue:
+        - name: Note the expected immutable-image rejection
+          ansible.builtin.set_fact:
+            bbraft_node_collision_rejected: true
+            bbraft_node_collision_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The collision was rejected at the published-manifest check
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_collision_rejected | default(false) | bool
+          - "'already published with different' in bbraft_node_collision_reason"
+        fail_msg: "a published image version was replaced or failed at the wrong stage"
+        quiet: true
+
+    - name: Stat the published image after the rejected collision
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop:
+        - "{{ bbraft_node_image_dir }}/image-fixture/manifest.json"
+        - "{{ bbraft_node_image_dir }}/image-fixture/root.qcow2"
+      register: bbraft_node_image_after_failure
+
+    - name: The published image version was not touched
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_image_after_failure.results[0].stat.checksum == bbraft_node_before.results[1].stat.checksum
+          - bbraft_node_image_after_failure.results[1].stat.checksum == bbraft_node_before.results[2].stat.checksum
+        fail_msg: "a rejected image collision changed the published version"
+        quiet: true
+
+    - name: Point the role back at the published image source
+      ansible.builtin.set_fact:
+        bbraft_node_images:
+          - "{{ playbook_dir }}/fixtures/image-fixture"
+
+    - name: Open the published version for the same-size corruption fixture
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_dir }}/image-fixture"
+        state: directory
+        mode: "0755"
+
+    - name: Corrupt a published artifact without changing its size
+      ansible.builtin.copy:
+        content: "corruptxxxx qcow2\n"
+        dest: "{{ bbraft_node_image_dir }}/image-fixture/root.qcow2"
+        mode: "{{ bbraft_node_image_file_mode }}"
+
+    - name: Record the corrupted published artifact checksum
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_image_dir }}/image-fixture/root.qcow2"
+        checksum_algorithm: sha256
+      register: bbraft_node_published_corrupted
+
+    - name: Make the corrupted published version read-only
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_dir }}/image-fixture"
+        state: directory
+        mode: "{{ bbraft_node_image_mode }}"
+
+    - name: Validate the good source again
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate
+
+    - name: A same-size published corruption is rejected without rewriting
+      block:
+        - name: Render against the corrupted published image
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: files
+      rescue:
+        - name: Record the expected published-artifact rejection
+          ansible.builtin.set_fact:
+            bbraft_node_published_corruption_rejected: true
+            bbraft_node_published_corruption_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The published corruption was rejected at the artifact hash check
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_published_corruption_rejected | default(false) | bool
+          - "'root.qcow2 in the published image' in bbraft_node_published_corruption_reason"
+        fail_msg: "a same-size published corruption was accepted or failed at the wrong stage"
+        quiet: true
+
+    - name: Stat the published artifact after the rejected corruption
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_image_dir }}/image-fixture/root.qcow2"
+        checksum_algorithm: sha256
+      register: bbraft_node_published_after_corruption
+
+    - name: The corrupted published image was not rewritten
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_published_after_corruption.stat.checksum == bbraft_node_published_corrupted.stat.checksum
+        fail_msg: "the role rewrote a corrupted published image instead of refusing it"
+        quiet: true
+
+    - name: Make the temporary image version writable for cleanup
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_dir }}/image-fixture"
+        state: directory
+        mode: "0755"
+
+    - name: Remove the temporary root
+      ansible.builtin.file:
+        path: "{{ bbraft_node_immutable_root.path }}"
+        state: absent

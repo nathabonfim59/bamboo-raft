@@ -1,0 +1,27 @@
+# Drives tasks/ip-forward.yml against fake `nft` and `sysctl` programs found
+# through PATH (tests/ip-forward.sh builds them) and a temporary conf file, so
+# no real sysctl, firewall or /etc file is touched. Unprivileged: become is off
+# and the conf owner/group are the invoking user.
+#
+# bbraft_node_ip_forward_conf/_owner/_group are the role's private test seam
+# (vars/main.yml); set_fact outranks role vars. Everything else is the role's
+# own defaults plus tests/vars.yml (hardening_vm_bridge_interfaces: [bbraft0]).
+- name: Run the ip-forward tasks against fake nft and sysctl
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: Point the role at the temporary conf
+      ansible.builtin.set_fact:
+        bbraft_node_ip_forward_conf: "{{ ipf_conf }}"
+        bbraft_node_ip_forward_owner: "{{ ipf_owner }}"
+        bbraft_node_ip_forward_group: "{{ ipf_group }}"
+        hardening_vm_bridge_interfaces: "{{ ipf_bridges | default(['bbraft0']) }}"
+
+    - name: Guard, persist and apply IPv4 forwarding
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: ip-forward

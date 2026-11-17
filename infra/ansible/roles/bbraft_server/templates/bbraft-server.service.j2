@@ -1,0 +1,87 @@
+# Managed by bamboo-raft infra/ansible (role bbraft_server).
+#
+# ExecStart names only flags and file paths. Credentials (database URL,
+# gateway token, master key, API keys) are read by the binary from the files
+# below; no secret value appears in this unit. ExecStart values are quoted by
+# bbraft_systemd_exec_quote, which escapes spaces, %, $, " and \ and rejects
+# line breaks. ReadWritePaths uses bbraft_systemd_unit_quote, which keeps a
+# literal $ (no environment expansion outside ExecStart) and escapes %.
+[Unit]
+Description=bbraft control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ bbraft_server_user }}
+Group={{ bbraft_server_group }}
+UMask=0027
+ExecStart={{ bbraft_server_binary_path | bbraft_systemd_exec_quote }} \
+    -roles {{ bbraft_server_roles | bbraft_systemd_exec_quote }} \
+    -server.listen {{ bbraft_server_listen | bbraft_systemd_exec_quote }} \
+{% if bbraft_server_tls_cert_file | length > 0 %}
+    -server.tls-cert-file {{ bbraft_server_tls_cert_file | bbraft_systemd_exec_quote }} \
+    -server.tls-key-file {{ bbraft_server_tls_key_file | bbraft_systemd_exec_quote }} \
+{% endif %}
+{% if bbraft_server_public_url | length > 0 %}
+    -server.public-url {{ bbraft_server_public_url | bbraft_systemd_exec_quote }} \
+{% endif %}
+    -node.listen {{ bbraft_server_node_listen | bbraft_systemd_exec_quote }} \
+{% if bbraft_server_node_tls_cert_file | length > 0 %}
+    -node.tls-cert-file {{ bbraft_server_node_tls_cert_file | bbraft_systemd_exec_quote }} \
+    -node.tls-key-file {{ bbraft_server_node_tls_key_file | bbraft_systemd_exec_quote }} \
+{% endif %}
+{% if bbraft_server_node_tokens | length > 0 %}
+    -node.tokens-file {{ bbraft_server_node_tokens_file | bbraft_systemd_exec_quote }} \
+{% endif %}
+    -node.gateway-listen {{ bbraft_server_gateway_listen | bbraft_systemd_exec_quote }} \
+{% if bbraft_server_gateway_tls_cert_file | length > 0 %}
+    -node.gateway-tls-cert-file {{ bbraft_server_gateway_tls_cert_file | bbraft_systemd_exec_quote }} \
+    -node.gateway-tls-key-file {{ bbraft_server_gateway_tls_key_file | bbraft_systemd_exec_quote }} \
+{% endif %}
+{% if bbraft_server_gateway_dial | length > 0 %}
+    -node.gateway-dial {{ bbraft_server_gateway_dial | bbraft_systemd_exec_quote }} \
+{% endif %}
+{% if bbraft_server_gateway_ca_file | length > 0 %}
+    -node.gateway-ca-file {{ bbraft_server_gateway_ca_file | bbraft_systemd_exec_quote }} \
+{% endif %}
+{% if bbraft_server_gateway_server_name | length > 0 %}
+    -node.gateway-server-name {{ bbraft_server_gateway_server_name | bbraft_systemd_exec_quote }} \
+{% endif %}
+    -node.gateway-token-file {{ bbraft_server_gateway_token_file | bbraft_systemd_exec_quote }} \
+    -database.url-file {{ bbraft_server_database_url_file | bbraft_systemd_exec_quote }} \
+{% if bbraft_server_api_keys | length > 0 %}
+    -auth.keys-file {{ bbraft_server_api_keys_file | bbraft_systemd_exec_quote }} \
+{% endif %}
+    -auth.key-prefix {{ bbraft_server_key_prefix | bbraft_systemd_exec_quote }} \
+    -secrets.master-key-file {{ bbraft_server_master_key_file | bbraft_systemd_exec_quote }} \
+    -commands.stream-max-seconds {{ bbraft_server_stream_max_seconds_int | string | bbraft_systemd_exec_quote }} \
+    -lifecycle.retry-seconds {{ bbraft_server_retry_seconds_int | string | bbraft_systemd_exec_quote }} \
+    -lifecycle.reaper-seconds {{ bbraft_server_reaper_seconds_int | string | bbraft_systemd_exec_quote }} \
+    -lifecycle.job-poll-seconds {{ bbraft_server_job_poll_seconds_int | string | bbraft_systemd_exec_quote }}
+
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths={{ bbraft_server_state_dir | bbraft_systemd_unit_quote }}
+
+[Install]
+WantedBy=multi-user.target

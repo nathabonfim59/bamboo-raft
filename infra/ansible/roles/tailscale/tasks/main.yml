@@ -1,0 +1,241 @@
+# Install Tailscale from its signed apt repository at a pinned version, join
+# the tailnet once with a single-use auth key, and optionally publish one
+# loopback HTTP service over tailnet HTTPS.
+
+- name: Check the vendored keyring checksum
+  ansible.builtin.stat:
+    path: "{{ role_path }}/files/tailscale-archive-keyring.gpg"
+    checksum_algorithm: sha256
+  register: tailscale_keyring_local
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: The vendored keyring matches the pinned checksum
+  ansible.builtin.assert:
+    that:
+      - tailscale_keyring_local.stat.checksum == tailscale_keyring_sha256
+    fail_msg: files/tailscale-archive-keyring.gpg does not match tailscale_keyring_sha256
+    quiet: true
+  run_once: true
+
+- name: Install the Tailscale package signing key
+  ansible.builtin.copy:
+    src: tailscale-archive-keyring.gpg
+    dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Add the Tailscale apt repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/tailscale.list
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by bamboo-raft infra/ansible (role tailscale).
+      deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian {{ ansible_facts.distribution_release }} main
+  register: tailscale_repo
+
+- name: Is Tailscale installed already?
+  ansible.builtin.stat:
+    path: /usr/sbin/tailscaled
+  register: tailscale_installed
+
+# --check adds no repository, so a first install cannot be previewed further.
+- name: First install previews only up to here
+  ansible.builtin.debug:
+    msg: >-
+      Tailscale is not installed yet; --check stops here. A real run installs
+      tailscale={{ tailscale_version }}, joins the tailnet as
+      {{ tailscale_hostname | default('the OS hostname', true) }} with tags
+      {{ tailscale_tags | join(',') }}{{ ' and publishes ' ~ tailscale_serve_target ~ ' on tailnet HTTPS' if tailscale_serve_target else '' }}.
+  when: ansible_check_mode and not tailscale_installed.stat.exists
+
+- name: End the preview of a first install
+  ansible.builtin.meta: end_role
+  when: ansible_check_mode and not tailscale_installed.stat.exists
+
+- name: Install the pinned Tailscale version
+  ansible.builtin.apt:
+    name: "tailscale={{ tailscale_version }}"
+    state: present
+    update_cache: "{{ tailscale_repo is changed }}"
+    cache_valid_time: 3600
+
+- name: Hold Tailscale at the pinned version
+  ansible.builtin.dpkg_selections:
+    name: tailscale
+    selection: hold
+
+- name: Run tailscaled
+  ansible.builtin.systemd_service:
+    name: tailscaled
+    enabled: true
+    state: started
+
+# --check installs nothing, so the join and serve steps cannot be previewed
+# on a host without tailscaled.
+- name: Read the tailnet state
+  ansible.builtin.command:
+    argv: [tailscale, status, --json, --peers=false]
+  register: tailscale_status_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Parse the tailnet state
+  ansible.builtin.set_fact:
+    tailscale_backend_state: >-
+      {{ (tailscale_status_raw.stdout | from_json).BackendState
+         if tailscale_status_raw.rc == 0 and tailscale_status_raw.stdout | length > 0
+         else 'Unavailable' }}
+
+- name: Join the tailnet
+  when: tailscale_backend_state != 'Running'
+  block:
+    - name: An auth key file is configured
+      ansible.builtin.assert:
+        that:
+          - tailscale_authkey_file | length > 0
+        fail_msg: the host is not on the tailnet; set tailscale_authkey_file to a controller file with a tskey-auth key
+        quiet: true
+
+    - name: The auth key file is private and holds one auth key
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.file', tailscale_authkey_file | expanduser) is match('^tskey-auth-[A-Za-z0-9-]+$')
+        fail_msg: "{{ tailscale_authkey_file }} must hold exactly one tskey-auth-... line"
+        quiet: true
+      no_log: true
+
+    - name: Copy the auth key to a root-only temporary file
+      ansible.builtin.copy:
+        content: "{{ lookup('ansible.builtin.file', tailscale_authkey_file | expanduser) }}"
+        dest: /root/.tailscale-authkey
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      when: not ansible_check_mode
+
+    - name: Bring the host onto the tailnet
+      ansible.builtin.command:
+        argv: >-
+          {{ ['tailscale', 'up',
+              '--auth-key=file:/root/.tailscale-authkey',
+              '--advertise-tags=' ~ (tailscale_tags | join(',')),
+              '--ssh=' ~ (tailscale_ssh | bool | string | lower)]
+             + (['--hostname=' ~ tailscale_hostname] if tailscale_hostname | length > 0 else []) }}
+      no_log: true
+      when: not ansible_check_mode
+      changed_when: true
+
+  always:
+    - name: Delete the temporary auth key file
+      ansible.builtin.file:
+        path: /root/.tailscale-authkey
+        state: absent
+
+- name: Read the tailnet name and address
+  ansible.builtin.command:
+    argv: [tailscale, status, --json, --peers=false]
+  register: tailscale_status_final
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode or tailscale_backend_state == 'Running'
+
+- name: Remember the tailnet identity
+  ansible.builtin.set_fact:
+    tailscale_dns_name: "{{ (tailscale_status_final.stdout | from_json).Self.DNSName | regex_replace('\\.$', '') }}"
+    tailscale_ipv4: "{{ (tailscale_status_final.stdout | from_json).Self.TailscaleIPs | reject('search', ':') | first }}"
+  when: tailscale_status_final is not skipped
+
+- name: Show how to reach the host
+  ansible.builtin.debug:
+    msg: "tailnet name {{ tailscale_dns_name }}"
+  when: tailscale_dns_name is defined
+
+- name: The serve scheme is https or http
+  ansible.builtin.assert:
+    that:
+      - tailscale_serve_scheme in ['https', 'http']
+    fail_msg: "tailscale_serve_scheme must be https or http, not {{ tailscale_serve_scheme }}"
+    quiet: true
+  when: tailscale_serve_target | length > 0
+
+- name: Choose the serve listener
+  ansible.builtin.set_fact:
+    tailscale_serve_port: "{{ 443 if tailscale_serve_scheme == 'https' else 80 }}"
+    tailscale_serve_other_scheme: "{{ 'http' if tailscale_serve_scheme == 'https' else 'https' }}"
+    tailscale_serve_other_port: "{{ 80 if tailscale_serve_scheme == 'https' else 443 }}"
+  when: tailscale_serve_target | length > 0
+
+# Without HTTPS certificates `tailscale serve --https` does not fail: it waits
+# for someone to enable them in the admin console, and the play hangs.
+- name: The tailnet issues HTTPS certificates
+  ansible.builtin.assert:
+    that:
+      - ((tailscale_status_final.stdout | from_json).CertDomains | default([], true)) | length > 0
+    fail_msg: >-
+      HTTPS certificates are off for this tailnet, so `tailscale serve --https`
+      would wait forever. Enable them (admin console, DNS, HTTPS Certificates;
+      MagicDNS on), or set tailscale_serve_scheme: http (infra/README.md,
+      "API access: HTTPS or HTTP").
+    quiet: true
+  when:
+    - tailscale_serve_target | length > 0
+    - tailscale_serve_scheme == 'https'
+    - tailscale_status_final is not skipped
+
+- name: Read the published services
+  ansible.builtin.command:
+    argv: [tailscale, serve, status, --json]
+  register: tailscale_serve_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when:
+    - tailscale_serve_target | length > 0
+    - tailscale_dns_name is defined
+
+# `serve status --json` keys web listeners by "<name>:<port>".
+- name: Parse the published services
+  ansible.builtin.set_fact:
+    tailscale_serve_web: >-
+      {{ (((tailscale_serve_raw.stdout | default('', true)) or '{}') | from_json).Web | default({}, true) }}
+  when:
+    - tailscale_serve_target | length > 0
+    - tailscale_dns_name is defined
+
+- name: Publish the service over tailnet {{ tailscale_serve_scheme | upper }}
+  ansible.builtin.command:
+    argv:
+      - tailscale
+      - serve
+      - --bg
+      - "--{{ tailscale_serve_scheme }}={{ tailscale_serve_port }}"
+      - "{{ tailscale_serve_target }}"
+  when:
+    - tailscale_serve_target | length > 0
+    - tailscale_dns_name is defined
+    - tailscale_serve_target not in (tailscale_serve_web[tailscale_dns_name ~ ':' ~ tailscale_serve_port] | default({}) | to_json)
+  changed_when: true
+
+- name: Stop publishing on the other scheme
+  ansible.builtin.command:
+    argv:
+      - tailscale
+      - serve
+      - "--{{ tailscale_serve_other_scheme }}={{ tailscale_serve_other_port }}"
+      - "off"
+  when:
+    - tailscale_serve_target | length > 0
+    - tailscale_dns_name is defined
+    - (tailscale_dns_name ~ ':' ~ tailscale_serve_other_port) in tailscale_serve_web
+  changed_when: true
+
+- name: Tailscale as the primary resolver
+  ansible.builtin.import_tasks: dns.yml
+  tags: [tailscale_dns]

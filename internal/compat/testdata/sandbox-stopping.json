@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "type": "sandbox.stopping",
+  "id": "bx_23456789",
+  "status": "archiving",
+  "sandbox": {
+    "id": "bx_23456789",
+    "name": "Sandbox 2026-11-11 10:00",
+    "state": "archiving",
+    "subdomain": null,
+    "stoppedAt": null,
+    "desktopAvailable": false,
+    "snapshotAvailable": false
+  },
+  "forced": false,
+  "operation": {
+    "id": "stop_0123456789abcdef",
+    "status": "pending",
+    "requestedAt": "2026-11-11T10:00:00Z",
+    "lastAttemptAt": null,
+    "error": null,
+    "endedAt": null
+  },
+  "statusUrl": "/api/v1/sandboxes/bx_23456789/stops/stop_0123456789abcdef"
+}

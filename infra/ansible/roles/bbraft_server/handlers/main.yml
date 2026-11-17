@@ -1,0 +1,10 @@
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: bbraft_server_manage_service | bool
+
+- name: Restart bbraft-server
+  ansible.builtin.systemd_service:
+    name: "{{ bbraft_server_service }}"
+    state: restarted
+  when: bbraft_server_manage_service | bool

@@ -1,0 +1,16 @@
+- name: Read swap entries from fstab
+  ansible.builtin.command: awk '$1 !~ /^#/ && $3 == "swap" {print $1, $4}' /etc/fstab
+  register: swap_entries
+  changed_when: false
+  check_mode: false   # read-only probe; must run in --check too
+
+# Each entry keeps its other options; any earlier pri= is replaced. Running
+# again with the same priority changes nothing.
+- name: Set pri={{ swap_priority }} on each swap entry
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^({{ item.split()[0] | regex_escape }}\s+\S+\s+swap\s+)\S+'
+    replace: >-
+      \g<1>{{ (item.split()[1].split(',') | reject('match', '^pri=') | join(',')) or 'defaults' }},pri={{ swap_priority }}
+  loop: "{{ swap_entries.stdout_lines }}"
+  notify: Reactivate swap

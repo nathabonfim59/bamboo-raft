@@ -1,0 +1,114 @@
+# bbraft-server: the control plane (internal/server/config).
+#
+# The role installs a caller-built binary, creates a service user and
+# directories, writes the credential files as root:bbraft 0640, and renders a
+# hardened systemd unit whose ExecStart contains only file paths, never
+# secrets. Every flag name and default below is the contract in
+# internal/server/config.
+
+# --- Required caller inputs (empty means "must be supplied") ---------------
+
+# Path on the controller to the built bbraft-server binary.
+bbraft_server_binary_src: ""
+
+# postgres:// or postgresql:// URL for bbraft-server. Supply it from a vault or
+# the private inventory; the role writes it to bbraft_server_database_url_file.
+bbraft_server_database_url: ""
+
+# Shared credential for the internal node gateway (bearer token, single line).
+bbraft_server_gateway_token: ""
+
+# Raw 32-byte secrets master key. The file is copied byte-for-byte from the
+# controller; never generated here and never trimmed.
+bbraft_server_master_key_source: ""
+bbraft_server_master_key_remote_src: false
+
+# Raw API keys, auth.LoadKeysFile shape:
+#   - {id: main, owner: acct_..., key: bmb_...}
+# Required when the api role runs (and for the default roles: all).
+bbraft_server_api_keys: []
+
+# Node token digests, auth.LoadNodeTokensFile shape:
+#   - {id: node-example, tokenSha256: <64 lowercase hex>}
+# Raw node tokens are rejected; only digests belong here. Required when the
+# nodehub role runs (and for the default roles: all).
+bbraft_server_node_tokens: []
+
+# --- Identity, paths and ownership -----------------------------------------
+
+bbraft_server_user: bbraft-server
+bbraft_server_group: bbraft-server
+bbraft_server_service: bbraft-server
+bbraft_server_binary_path: /usr/local/bin/bbraft-server
+bbraft_server_unit_path: /etc/systemd/system/bbraft-server.service
+bbraft_server_config_dir: /etc/bbraft-server
+bbraft_server_state_dir: /var/lib/bbraft-server
+
+bbraft_server_database_url_file: "{{ bbraft_server_config_dir }}/database-url"
+bbraft_server_gateway_token_file: "{{ bbraft_server_config_dir }}/gateway-token"
+bbraft_server_api_keys_file: "{{ bbraft_server_config_dir }}/api-keys.json"
+bbraft_server_node_tokens_file: "{{ bbraft_server_config_dir }}/node-tokens.json"
+bbraft_server_master_key_file: "{{ bbraft_server_config_dir }}/secrets-master-key"
+
+bbraft_server_file_owner: root
+bbraft_server_file_group: "{{ bbraft_server_group }}"
+bbraft_server_binary_owner: root
+bbraft_server_binary_group: root
+bbraft_server_unit_owner: root
+bbraft_server_unit_group: root
+bbraft_server_config_mode: "0750"
+bbraft_server_secret_mode: "0640"
+bbraft_server_binary_mode: "0755"
+bbraft_server_state_mode: "0750"
+bbraft_server_unit_mode: "0644"
+
+# Set false only in role-local render tests, which must not touch systemd.
+bbraft_server_manage_service: true
+
+# --- Exact server flags (internal/server/config defaults) ------------------
+
+# all, or a comma-separated subset of api,lifecycle,nodehub.
+bbraft_server_roles: all
+bbraft_server_listen: 127.0.0.1:7700
+bbraft_server_node_listen: 127.0.0.1:7701
+bbraft_server_gateway_listen: 127.0.0.1:7702
+
+# Trusted absolute base URL clients use to reach the API (-server.public-url).
+# Empty keeps the binary's default: http(s)://<listen>, with the scheme taken
+# from the server TLS pair. A wildcard bind has no trusted host, so the api
+# role then requires an explicit value. Absolute http(s) only, with a host and
+# no userinfo, query or fragment; a base path is allowed.
+bbraft_server_public_url: ""
+
+# Client dial target for the internal gateway (-node.gateway-dial). Empty keeps
+# the binary's default: the gateway listen address with a wildcard bind mapped
+# to 127.0.0.1. A plaintext gateway is limited to loopback/localhost targets.
+bbraft_server_gateway_dial: ""
+
+# Optional PEM CA bundle path on the target for verifying the gateway
+# certificate (-node.gateway-ca-file). Needs the gateway TLS pair; without it
+# the system roots are used. The caller provisions the file, like the other
+# TLS material.
+bbraft_server_gateway_ca_file: ""
+
+# Optional verified certificate name for the gateway (-node.gateway-server-name).
+# Needs the gateway TLS pair. Empty verifies the dial host. No whitespace or
+# NUL.
+bbraft_server_gateway_server_name: ""
+
+# Optional TLS pair for each listener. Cert and key are set together or not at
+# all. Without the node pair, a plaintext node listener is allowed only on
+# loopback/private addresses; without the gateway pair the gateway must stay on
+# loopback. The binary enforces the same rules.
+bbraft_server_tls_cert_file: ""
+bbraft_server_tls_key_file: ""
+bbraft_server_node_tls_cert_file: ""
+bbraft_server_node_tls_key_file: ""
+bbraft_server_gateway_tls_cert_file: ""
+bbraft_server_gateway_tls_key_file: ""
+
+bbraft_server_key_prefix: bmb_
+bbraft_server_stream_max_seconds: 7200
+bbraft_server_retry_seconds: 5
+bbraft_server_reaper_seconds: 60
+bbraft_server_job_poll_seconds: 15

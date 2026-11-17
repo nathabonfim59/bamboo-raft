@@ -1,0 +1,15 @@
+# swapoff moves swapped pages back to RAM, so it only runs when RAM can hold
+# them. On a node full of VMs, leave it to the next reboot instead.
+- name: Reactivate swap
+  ansible.builtin.shell: |
+    set -eu
+    used_kb=$(awk 'NR > 1 {s += $4} END {print s + 0}' /proc/swaps)
+    avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    if [ "$used_kb" -gt $((avail_kb / 2)) ]; then
+      echo "swap in use ($used_kb kB): new priorities apply at next boot"
+      exit 0
+    fi
+    swapoff -a
+    swapon -a
+  args:
+    executable: /bin/bash

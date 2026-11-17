@@ -1,0 +1,447 @@
+#!/bin/sh
+# In-guest acceptance check for the bamboo-raft image. Run as uid 1000, for
+# example over the guest agent:
+#
+#   bash -lc /usr/local/bin/bbraft-toolchain-check
+#
+# It prints PASS/FAIL lines and exits nonzero on the first set of failures.
+# It prints versions and paths only: never the caller's environment or any
+# credential, because sandboxes hold none and diagnostics go into serial logs.
+set -u
+
+failures=0
+
+pass() { printf 'PASS %s\n' "$*"; }
+fail() {
+	printf 'FAIL %s\n' "$*" >&2
+	failures=$((failures + 1))
+}
+
+check_command() {
+	if command -v "$1" >/dev/null 2>&1; then
+		pass "command $1: $(command -v "$1")"
+	else
+		fail "command $1 is missing"
+	fi
+}
+
+# Identity and HOME are part of the sandbox contract.
+if [ "$(id -u)" = "1000" ]; then
+	pass "uid 1000"
+else
+	fail "uid is $(id -u), want 1000"
+fi
+if [ "$(id -g)" = "1000" ]; then
+	pass "gid 1000"
+else
+	fail "gid is $(id -g), want 1000"
+fi
+if [ "${HOME:-}" = "/home/user" ]; then
+	pass "HOME=/home/user"
+else
+	fail "HOME is '${HOME:-<unset>}', want /home/user"
+fi
+if sudo -n -u root true 2>/dev/null; then
+	pass "passwordless sudo"
+else
+	fail "passwordless sudo for user is not working"
+fi
+
+for command in apt-get go node npm gcc make git curl jq podman; do
+	check_command "$command"
+done
+
+go_version=$(go version 2>/dev/null || true)
+case "$go_version" in
+"go version go1.27.3 "*) pass "$go_version" ;;
+*) fail "unexpected Go version: '${go_version:-<missing>}'" ;;
+esac
+
+node_version=$(node --version 2>/dev/null || true)
+if [ "$node_version" = "v24.22.2" ]; then
+	pass "node $node_version"
+else
+	fail "unexpected Node version: '${node_version:-<missing>}'"
+fi
+
+gcc_version=$(gcc --version 2>/dev/null | head -n 1 || true)
+if [ -n "$gcc_version" ]; then
+	pass "$gcc_version"
+else
+	fail "gcc --version produced no output"
+fi
+make_version=$(make --version 2>/dev/null | head -n 1 || true)
+if [ -n "$make_version" ]; then
+	pass "$make_version"
+else
+	fail "make --version produced no output"
+fi
+git_version=$(git --version 2>/dev/null || true)
+if [ -n "$git_version" ]; then
+	pass "$git_version"
+else
+	fail "git --version produced no output"
+fi
+curl_version=$(curl --version 2>/dev/null | head -n 1 || true)
+if [ -n "$curl_version" ]; then
+	pass "$curl_version"
+else
+	fail "curl --version produced no output"
+fi
+jq_version=$(jq --version 2>/dev/null || true)
+if [ -n "$jq_version" ]; then
+	pass "$jq_version"
+else
+	fail "jq --version produced no output"
+fi
+apt_version=$(apt-get --version 2>/dev/null | head -n 1 || true)
+if [ -n "$apt_version" ]; then
+	pass "$apt_version"
+else
+	fail "apt-get --version produced no output"
+fi
+
+# Kernel devices needed by the node's QEMU configuration must be present.
+for module in virtio_blk virtio_pci virtio_net vsock vmw_vsock_virtio_transport; do
+	if [ -d "/sys/module/$module" ]; then
+		pass "module $module loaded"
+	else
+		fail "module $module is not loaded"
+	fi
+done
+
+# The smoke CPU policy may expose vmx (Intel), svm (AMD) or no nested feature.
+# The caller passes BBRAFT_EXPECT_NESTED=vmx|svm|none; never hard-require vmx.
+observed=""
+if grep -qw vmx /proc/cpuinfo; then
+	observed=vmx
+fi
+if grep -qw svm /proc/cpuinfo; then
+	if [ -n "$observed" ]; then observed="$observed,svm"; else observed=svm; fi
+fi
+case "${BBRAFT_EXPECT_NESTED:-none}" in
+vmx)
+	if grep -qw vmx /proc/cpuinfo; then
+		pass "cpu exposes expected vmx"
+	else
+		fail "cpu does not expose expected vmx; nested feature was filtered"
+	fi
+	;;
+svm)
+	if grep -qw svm /proc/cpuinfo; then
+		pass "cpu exposes expected svm"
+	else
+		fail "cpu does not expose expected svm; nested feature was filtered"
+	fi
+	;;
+none | "")
+	pass "cpu nested features observed: ${observed:-none} (not required)"
+	;;
+*)
+	fail "invalid BBRAFT_EXPECT_NESTED='${BBRAFT_EXPECT_NESTED}'"
+	;;
+esac
+
+# DHCP over QEMU user networking (or passt) must have produced an address,
+# and resolved DNS must answer. Both are bounded retries: the guest unit is
+# ordered after network-online.target but a first-boot DHCP lease can still
+# land a moment later.
+wait_seconds=60
+elapsed=0
+have_ipv4=0
+while [ "$elapsed" -lt "$wait_seconds" ]; do
+	if ip -4 -o addr show scope global 2>/dev/null | grep -q 'inet '; then
+		have_ipv4=1
+		break
+	fi
+	sleep 2
+	elapsed=$((elapsed + 2))
+done
+if [ "$have_ipv4" -eq 1 ]; then
+	pass "outbound network address: $(ip -4 -o addr show scope global | awk '{print $2, $4}' | paste -sd ' ' -)"
+	elapsed=0
+	have_dns=0
+	while [ "$elapsed" -lt 36 ]; do
+		if timeout 10 getent ahostsv4 archive.ubuntu.com >/dev/null 2>&1; then
+			have_dns=1
+			break
+		fi
+		sleep 2
+		elapsed=$((elapsed + 2))
+	done
+	if [ "$have_dns" -eq 1 ]; then
+		pass "DNS resolves archive.ubuntu.com"
+	else
+		fail "DNS did not resolve archive.ubuntu.com within 36s"
+	fi
+else
+	fail "no global IPv4 address within ${wait_seconds}s; DHCP did not complete"
+fi
+
+# Root growth: the filesystem must fill almost all of the block device. Use
+# statfs for the filesystem and sysfs for the device so this runs as uid 1000
+# without needing root-only block devices or dumpe2fs opens.
+root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+# findmnt appends [/subvol] for btrfs; the guest is ext4, but strip it anyway.
+root_source=${root_source%%\[*}
+root_device=$(readlink -f "$root_source" 2>/dev/null || true)
+if [ -n "$root_device" ] && [ -b "$root_device" ]; then
+	statfs_output=$(stat -f -c '%b %S' / 2>/dev/null || true)
+	fs_blocks=${statfs_output%% *}
+	fs_block_size=${statfs_output##* }
+	device_sectors=$(cat "/sys/class/block/$(basename "$root_device")/size" 2>/dev/null || echo 0)
+	case "$fs_blocks:$fs_block_size:$device_sectors" in
+	*[!0-9:]* | :* | *::* | *:) device_bytes=0 ;;
+	*) device_bytes=$((device_sectors * 512)) ;;
+	esac
+	if [ "$device_bytes" -gt 0 ]; then
+		filesystem_bytes=$((fs_blocks * fs_block_size))
+		# Allow up to 5% for ext4 inode tables and group metadata; a
+		# filesystem that did not grow is ~18% smaller on the smoke disk.
+		if [ "$filesystem_bytes" -ge $((device_bytes - device_bytes / 20)) ]; then
+			pass "root grown: $root_device filesystem=$((filesystem_bytes / 1024 / 1024))MiB device=$((device_bytes / 1024 / 1024))MiB"
+		else
+			fail "root not grown: $root_device filesystem=$((filesystem_bytes / 1024 / 1024))MiB device=$((device_bytes / 1024 / 1024))MiB"
+		fi
+		# The two-boot smoke grows the stopped overlay and requires the next
+		# boot's device to have the new size.
+		case "${BBRAFT_EXPECT_ROOT_GIB:-}" in
+		"" | 0* | *[!0-9]*) ;;
+		*)
+			want_bytes=$((BBRAFT_EXPECT_ROOT_GIB * 1024 * 1024 * 1024))
+			if [ "$device_bytes" -ge "$want_bytes" ]; then
+				pass "root device is at least ${BBRAFT_EXPECT_ROOT_GIB}GiB after resume growth"
+			else
+				fail "root device is $((device_bytes / 1024 / 1024))MiB, want at least ${BBRAFT_EXPECT_ROOT_GIB}GiB"
+			fi
+			;;
+		esac
+	else
+		fail "cannot read filesystem/device geometry for $root_device"
+	fi
+else
+	fail "root device '${root_source:-<unset>}' is not a block device"
+fi
+
+# SSH: sshd must be installed, enabled and listening with a valid ed25519 host
+# key generated for this boot in /run (never in /etc or the image). The node
+# publishes the key after AddSSHKey; a restart of sshd within the same boot
+# must keep it. The smoke harness compares the printed fingerprint across two
+# boots to prove per-boot rotation.
+ssh_key=/run/ssh/ssh_host_ed25519_key
+fingerprint=""
+if sudo -n test -f "$ssh_key" && sudo -n test -f "$ssh_key.pub"; then
+	mode_owner=$(sudo -n stat -c '%a %U' "$ssh_key" 2>/dev/null || true)
+	if [ "$mode_owner" = "600 root" ]; then
+		pass "sshd host key mode/owner: $mode_owner"
+	else
+		fail "sshd host key mode/owner is '${mode_owner:-unknown}', want '600 root'"
+	fi
+	if [ "$(cut -d' ' -f1 "$ssh_key.pub" 2>/dev/null)" = "ssh-ed25519" ]; then
+		pass "sshd host key is ed25519"
+	else
+		fail "sshd host key is not ed25519"
+	fi
+	if sudo -n test ! -e /etc/ssh/ssh_host_ed25519_key; then
+		pass "no host key in /etc/ssh"
+	else
+		fail "a host key was baked into /etc/ssh"
+	fi
+	fingerprint=$(ssh-keygen -lf "$ssh_key.pub" 2>/dev/null | awk '{print $2}' || true)
+	case "$fingerprint" in
+	SHA256:*) ;;
+	*) fail "cannot read a SHA256 fingerprint from $ssh_key.pub" ;;
+	esac
+else
+	fail "sshd host key $ssh_key is missing"
+fi
+
+sshd_version=$(sudo -n /usr/sbin/sshd -V 2>&1 | head -n 1 || true)
+case "$sshd_version" in
+OpenSSH_*) pass "sshd $sshd_version" ;;
+*) fail "sshd -V produced '${sshd_version:-<no output>}'" ;;
+esac
+if [ -x /usr/lib/openssh/sftp-server ]; then
+	pass "sftp-server present"
+else
+	fail "sftp-server is missing (SFTP/SCP need openssh-sftp-server)"
+fi
+for unit in ssh.service bbraft-ssh-host-key.service; do
+	if sudo -n systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+		pass "$unit enabled"
+	else
+		fail "$unit is not enabled"
+	fi
+done
+if sudo -n systemctl is-active --quiet ssh.service; then
+	pass "ssh.service active"
+else
+	fail "ssh.service is not active"
+fi
+if sudo -n systemctl is-active --quiet bbraft-ssh-host-key.service; then
+	pass "bbraft-ssh-host-key.service active this boot"
+else
+	fail "bbraft-ssh-host-key.service is not active this boot"
+fi
+# Ask the running systemd for the ordering/dependency graph, not the unit file:
+# the key unit must run before sshd and the guest agent, and the guest agent
+# must require growth.
+guest_requires=$(sudo -n systemctl show -p Requires --value bbraft-guest.service 2>/dev/null || true)
+guest_after=$(sudo -n systemctl show -p After --value bbraft-guest.service 2>/dev/null || true)
+key_before=$(sudo -n systemctl show -p Before --value bbraft-ssh-host-key.service 2>/dev/null || true)
+case " $guest_requires " in
+*" bbraft-grow-root.service "*) pass "guest agent Requires growth" ;;
+*) fail "guest agent does not require growth: '$guest_requires'" ;;
+esac
+case " $guest_after " in
+*" bbraft-ssh-host-key.service "*) pass "guest agent ordered after the host key" ;;
+*) fail "guest agent is not ordered after the host key: '$guest_after'" ;;
+esac
+for want in ssh.service bbraft-guest.service; do
+	case " $key_before " in
+	*" $want "*) pass "host key unit ordered before $want" ;;
+	*) fail "host key unit is not ordered before $want: '$key_before'" ;;
+	esac
+done
+ssh_config=$(sudo -n /usr/sbin/sshd -T -f /etc/ssh/sshd_config 2>/dev/null || true)
+for want in \
+	"hostkey /run/ssh/ssh_host_ed25519_key" \
+	"hostkeyalgorithms ssh-ed25519" \
+	"passwordauthentication no" \
+	"permitrootlogin no" \
+	"pubkeyauthentication yes" \
+	"authorizedkeysfile .ssh/authorized_keys" \
+	"allowusers user" \
+	"usepam yes"; do
+	if printf '%s\n' "$ssh_config" | grep -qxF -- "$want"; then
+		pass "sshd config: $want"
+	else
+		fail "sshd effective config is missing '$want'"
+	fi
+done
+if [ -d "$HOME/.ssh" ] && [ "$(stat -c %a "$HOME/.ssh" 2>/dev/null || echo)" = "700" ]; then
+	pass "authorized_keys directory $HOME/.ssh (0700)"
+else
+	fail "$HOME/.ssh is missing or not mode 0700"
+fi
+
+# Two-boot smoke persistence check (opt-in through the harness): the node
+# writes the sandbox user's authorized_keys on boot 1 and it must survive the
+# next boot unchanged, with the user's ownership and mode. Normal runs never
+# write a key; boot 2 removes this test key again.
+test_authorized_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINejGpMoTjn0MaUXYyDWT1MHPasinqWNTCjYl9kvsEWK bbraft-smoke-persist'
+case "${BBRAFT_SMOKE_BOOT:-}" in
+1)
+	printf '%s\n' "$test_authorized_key" >"$HOME/.ssh/authorized_keys"
+	chmod 0600 "$HOME/.ssh/authorized_keys"
+	if [ "$(cat "$HOME/.ssh/authorized_keys")" = "$test_authorized_key" ]; then
+		pass "seeded authorized_keys for the boot persistence check"
+	else
+		fail "cannot seed authorized_keys for the boot persistence check"
+	fi
+	;;
+2)
+	persisted=$(cat "$HOME/.ssh/authorized_keys" 2>/dev/null || true)
+	owner_mode=$(stat -c '%U %a' "$HOME/.ssh/authorized_keys" 2>/dev/null || true)
+	if [ "$persisted" = "$test_authorized_key" ] && [ "$owner_mode" = "user 600" ]; then
+		pass "authorized_keys persisted across boot ($owner_mode)"
+	else
+		fail "authorized_keys did not persist: owner/mode '${owner_mode:-missing}'"
+	fi
+	rm -f "$HOME/.ssh/authorized_keys"
+	;;
+*) ;;
+esac
+# Listening proof: the daemon answers on 22 with exactly the boot key. No
+# authorized key is installed in the image, so this must not authenticate.
+scanned_fingerprint=""
+elapsed=0
+while [ "$elapsed" -lt 20 ]; do
+	scanned=$(ssh-keyscan -t ed25519 -p 22 127.0.0.1 2>/dev/null | grep -v '^#' || true)
+	if [ -n "$scanned" ]; then
+		scanned_fingerprint=$(printf '%s\n' "$scanned" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)
+		[ -n "$scanned_fingerprint" ] && break
+	fi
+	sleep 1
+	elapsed=$((elapsed + 1))
+done
+if [ -n "$fingerprint" ] && [ "$scanned_fingerprint" = "$fingerprint" ]; then
+	pass "sshd listening on 22 with the boot key"
+else
+	fail "sshd on 22 advertised '${scanned_fingerprint:-nothing}', want $fingerprint"
+fi
+# A restart inside one boot keeps the key: the unit's condition sees it.
+if sudo -n systemctl restart ssh.service 2>/dev/null; then
+	elapsed=0
+	after_restart=""
+	while [ "$elapsed" -lt 20 ]; do
+		scanned=$(ssh-keyscan -t ed25519 -p 22 127.0.0.1 2>/dev/null | grep -v '^#' || true)
+		if [ -n "$scanned" ]; then
+			after_restart=$(printf '%s\n' "$scanned" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)
+			[ -n "$after_restart" ] && break
+		fi
+		sleep 1
+		elapsed=$((elapsed + 1))
+	done
+	if [ -n "$fingerprint" ] && [ "$after_restart" = "$fingerprint" ]; then
+		pass "sshd restart keeps the boot host key"
+	else
+		fail "sshd restart changed the host key to '${after_restart:-nothing}'"
+	fi
+else
+	fail "systemctl restart ssh.service failed"
+fi
+if command -v growpart >/dev/null 2>&1; then
+	pass "growpart present"
+else
+	fail "growpart is missing (cloud-guest-utils): partitioned roots cannot grow"
+fi
+if [ -n "${fingerprint:-}" ]; then
+	printf 'PASS sshd host key ED25519 %s\n' "$fingerprint"
+fi
+
+# Rootless Podman, fully offline: import a tiny rootfs built from the image's
+# static busybox, then run it with no network. This exercises user namespaces,
+# /etc/subuid, containers/storage and crun without a registry.
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if mkdir -p "$runtime_dir" 2>/dev/null; then
+	rootless=$(XDG_RUNTIME_DIR="$runtime_dir" podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)
+	if [ "$rootless" = "true" ]; then
+		pass "podman rootless"
+	else
+		fail "podman is not rootless: '${rootless:-<no output>}'"
+	fi
+	podman_tmp=$(mktemp -d)
+	if mkdir -p "$podman_tmp/rootfs/bin" &&
+		cp /bin/busybox "$podman_tmp/rootfs/bin/busybox" &&
+		ln -s busybox "$podman_tmp/rootfs/bin/true" &&
+		tar -C "$podman_tmp/rootfs" -cf "$podman_tmp/rootfs.tar" .; then
+		import_out=$(XDG_RUNTIME_DIR="$runtime_dir" podman import "$podman_tmp/rootfs.tar" localhost/bbraft-smoke:test 2>&1) || {
+			printf '%s\n' "$import_out" | tail -n 20 >&2
+			fail "podman import failed"
+			import_out=""
+		}
+		if [ -n "${import_out:-}" ]; then
+			run_out=$(XDG_RUNTIME_DIR="$runtime_dir" podman run --rm --network=none localhost/bbraft-smoke:test /bin/true 2>&1) || {
+				printf '%s\n' "$run_out" | tail -n 20 >&2
+				fail "podman run failed"
+				run_out=""
+			}
+			if [ -n "${run_out:-}" ]; then
+				pass "podman rootless run"
+			fi
+			XDG_RUNTIME_DIR="$runtime_dir" podman rmi --force localhost/bbraft-smoke:test >/dev/null 2>&1 || true
+		fi
+	else
+		fail "could not create the offline Podman test rootfs"
+	fi
+	rm -rf "$podman_tmp"
+else
+	fail "cannot create runtime directory $runtime_dir"
+fi
+
+if [ "$failures" -ne 0 ]; then
+	printf 'bbraft-toolchain-check: %d failure(s)\n' "$failures" >&2
+	exit 1
+fi
+printf 'bbraft-toolchain-check: all checks passed\n'

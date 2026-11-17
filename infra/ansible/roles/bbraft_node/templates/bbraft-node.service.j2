@@ -1,0 +1,137 @@
+# Managed by bamboo-raft infra/ansible (role bbraft_node).
+#
+# ExecStart contains only the exact typed flags in cmd/bbraft-node/config.go.
+# The network mode is the literal quoted "tap": the role never renders the
+# node's dev/test user-mode fallback, and validate.yml refuses any override.
+# Every other argv element is quoted by bbraft_node_systemd_exec_quote, which
+# escapes spaces, %, $, " and \ and rejects line breaks. ReadWritePaths uses
+# bbraft_node_systemd_unit_quote, which keeps a literal $ and escapes %.
+# The token is a file path here; no secret value appears in this unit.
+#
+# bbraft-node is the root jail supervisor (A10): it runs as root with only the
+# capabilities below, and every QEMU and qemu-img attempt it starts runs jailed
+# on its own uid from -node.jail-uid-range with zero groups and capabilities,
+# NoNewPrivileges, namespaces, a chroot and cgroup limits under the delegated
+# <service cgroup>/vms. The node process itself lives in <service>/supervisor.
+[Unit]
+Description=bbraft node agent
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor={{ bbraft_node_data_dir | bbraft_node_systemd_unit_quote }} {{ bbraft_node_image_dir | bbraft_node_systemd_unit_quote }}
+
+[Service]
+Type=simple
+UMask=0077
+ExecStart={{ bbraft_node_binary_path | bbraft_node_systemd_exec_quote }} \
+    -server.addr {{ bbraft_node_server_addr | bbraft_node_systemd_exec_quote }} \
+{% if bbraft_node_id | length > 0 %}
+    -node.id {{ bbraft_node_id | bbraft_node_systemd_exec_quote }} \
+{% endif %}
+    -node.token-file {{ bbraft_node_token_file | bbraft_node_systemd_exec_quote }} \
+    -node.data-dir {{ bbraft_node_data_dir | bbraft_node_systemd_exec_quote }} \
+    -node.image-dir {{ bbraft_node_image_dir | bbraft_node_systemd_exec_quote }} \
+{% if bbraft_node_default_image | length > 0 %}
+    -node.default-image {{ bbraft_node_default_image | bbraft_node_systemd_exec_quote }} \
+{% endif %}
+    -node.cpu-model {{ bbraft_node_cpu_model | bbraft_node_systemd_exec_quote }} \
+    -node.cpu-nested {{ bbraft_node_cpu_nested | bbraft_node_systemd_exec_quote }} \
+{% if bbraft_node_cpu_features | length > 0 %}
+    -node.cpu-features {{ bbraft_node_cpu_features | join(',') | bbraft_node_systemd_exec_quote }} \
+{% endif %}
+    -node.boot-timeout {{ bbraft_node_boot_timeout | bbraft_node_systemd_exec_quote }} \
+    -node.capacity-vcpus {{ bbraft_node_capacity_vcpus_int | string | bbraft_node_systemd_exec_quote }} \
+    -node.capacity-memory-mib {{ bbraft_node_capacity_memory_mib_int | string | bbraft_node_systemd_exec_quote }} \
+    -node.capacity-disk-gib {{ bbraft_node_capacity_disk_gib_int | string | bbraft_node_systemd_exec_quote }} \
+    -node.cpu-overcommit {{ bbraft_node_cpu_overcommit_ratio | string | bbraft_node_systemd_exec_quote }} \
+    -node.memory-overcommit {{ bbraft_node_memory_overcommit_ratio | string | bbraft_node_systemd_exec_quote }} \
+    -node.disk-overcommit {{ bbraft_node_disk_overcommit_ratio | string | bbraft_node_systemd_exec_quote }} \
+    -node.reserve-vcpus {{ bbraft_node_reserve_vcpus_int | string | bbraft_node_systemd_exec_quote }} \
+    -node.reserve-memory-mib {{ bbraft_node_reserve_memory_mib_int | string | bbraft_node_systemd_exec_quote }} \
+    -node.reserve-disk-gib {{ bbraft_node_reserve_disk_gib_int | string | bbraft_node_systemd_exec_quote }} \
+    -node.network-mode "tap" \
+    -node.network-bridge {{ bbraft_node_network_bridge | bbraft_node_systemd_exec_quote }} \
+    -node.network-prefix {{ bbraft_node_network_prefix | bbraft_node_systemd_exec_quote }} \
+    -node.network-gateway {{ bbraft_node_network_gateway | bbraft_node_systemd_exec_quote }} \
+    -node.network-resolvers {{ bbraft_node_network_resolvers | join(',') | bbraft_node_systemd_exec_quote }} \
+{% if bbraft_node_network_management | length > 0 %}
+    -node.network-management {{ bbraft_node_network_management | join(',') | bbraft_node_systemd_exec_quote }} \
+{% endif %}
+    -node.ssh-ingress-addr {{ bbraft_node_ssh_ingress_addr | bbraft_node_systemd_exec_quote }} \
+    -node.ssh-ingress-iface {{ bbraft_node_ssh_ingress_iface | bbraft_node_systemd_exec_quote }} \
+    -node.ssh-port-range {{ bbraft_node_ssh_port_range | bbraft_node_systemd_exec_quote }} \
+    -node.jail-uid-range {{ bbraft_node_jail_uid_range | bbraft_node_systemd_exec_quote }} \
+    -node.jail-cgroup {{ ('/sys/fs/cgroup/system.slice/' ~ bbraft_node_service ~ '.service/vms') | bbraft_node_systemd_exec_quote }} \
+    -node.jail-qemu-binary {{ bbraft_node_jail_qemu_binary | bbraft_node_systemd_exec_quote }} \
+    -node.jail-tool-binary {{ bbraft_node_jail_tool_binary | bbraft_node_systemd_exec_quote }} \
+    -node.jail-firmware {{ bbraft_node_jail_firmware | join(',') | bbraft_node_systemd_exec_quote }} \
+{% if bbraft_node_jail_library_dirs | length > 0 %}
+    -node.jail-library-dirs {{ bbraft_node_jail_library_dirs | join(',') | bbraft_node_systemd_exec_quote }} \
+{% endif %}
+{% for name, value in [('read-bps', bbraft_node_jail_io_rates_int.read_bps), ('write-bps', bbraft_node_jail_io_rates_int.write_bps), ('read-iops', bbraft_node_jail_io_rates_int.read_iops), ('write-iops', bbraft_node_jail_io_rates_int.write_iops)] if (value | int) > 0 %}
+    -node.jail-io-{{ name }} {{ value | string | bbraft_node_systemd_exec_quote }} \
+{% endfor %}
+    -node.jail-io-device {{ bbraft_node_jail_io_device | bbraft_node_systemd_exec_quote }}
+
+Restart=on-failure
+RestartSec=5
+# QEMU VMs are children of this process. KillMode=process signals only the
+# node, whose own bounded shutdown (20 s) stops workers and releases the lock;
+# the QEMU children survive and the next node process adopts them.
+KillMode=process
+TimeoutStopSec=30
+LimitNOFILE=65536
+TasksMax=infinity
+LimitCORE=0
+
+# Each capability is tied to jail code (docs/node.md): SYS_ADMIN clone3 and
+# namespaces and detached mounts; SYS_CHROOT the jail chroot; MKNOD the
+# private /dev nodes; SETUID/SETGID/SETPCAP the per-attempt credential and
+# bounding-set drop; CHOWN/FOWNER/DAC_OVERRIDE per-attempt ownership of
+# disks, the control dir and the QMP socket; KILL and SYS_PTRACE signalling
+# and proving a different-uid QEMU; NET_ADMIN bridge, TAP and nftables.
+# QEMU inherits none of them (the jail drops all five sets).
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_KILL CAP_SYS_PTRACE CAP_NET_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=true
+SystemCallArchitectures=native
+# The node proves a systemd-delegated cgroup at startup: it lives in
+# <service>/supervisor and owns <service>/vms (systemd >= 254).
+Delegate=yes
+DelegateSubgroup=supervisor
+# The device policy sits on the service cgroup, so it also bounds every jail.
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rwm
+DeviceAllow=/dev/vhost-vsock rw
+DeviceAllow=/dev/vhost-net rw
+DeviceAllow=/dev/net/tun rw
+DeviceAllow=/dev/null rwm
+DeviceAllow=/dev/urandom rwm
+# Read-only: the supervisor's one startup VM_SOCKETS_GET_LOCAL_CID ioctl on an
+# O_RDONLY /dev/vsock fd, which keeps the host's own CID out of guest CIDs. No
+# jail's private /dev holds /dev/vsock, and a jail cannot create device nodes.
+DeviceAllow=/dev/vsock r
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# /dev/kvm and /dev/vhost-vsock must stay visible: do not use PrivateDevices.
+PrivateDevices=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+# The delegated service subtree is the only writable cgroup path.
+ProtectControlGroups=false
+ReadOnlyPaths=/sys/fs/cgroup
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# QEMU needs vsock (guest agent), AF_UNIX (QMP), and store-and-forward
+# user-mode networking. No request is served over host TCP.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_VSOCK
+# Deliberately unset: systemd's namespace restriction (its seccomp filter
+# answers clone3 with ENOSYS, which breaks CLONE_INTO_CGROUP, so startup
+# admission would fail) and a system-call filter (QEMU would inherit it on
+# top of its own -sandbox).
+ReadWritePaths={{ bbraft_node_data_dir | bbraft_node_systemd_unit_quote }} /sys/fs/cgroup/system.slice/{{ bbraft_node_service }}.service
+
+[Install]
+WantedBy=multi-user.target

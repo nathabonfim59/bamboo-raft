@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 503,
+  "code": "no_ready_machine",
+  "message": "No machine has capacity",
+  "error": {
+    "code": "no_ready_machine",
+    "message": "No machine has capacity",
+    "status": 503,
+    "details": {"retryable": true}
+  },
+  "requestId": "req_01HXEXAMPLE"
+}

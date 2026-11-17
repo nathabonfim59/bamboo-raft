@@ -1,0 +1,374 @@
+# Renders the unit and credential files into a temporary tree and asserts the
+# exact flags, formats, modes and quoting. No user, systemd unit or service is
+# touched (bbraft_server_manage_service is false).
+- name: Render and assert the bbraft_server role
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars.yml
+  vars:
+    bbraft_server_binary_src: "{{ playbook_dir }}/fixtures/bbraft-server"
+    bbraft_server_master_key_source: "{{ playbook_dir }}/fixtures/master-key"
+    bbraft_server_manage_service: false
+    # The lint/test run requires systemd-analyze. Set false only in a
+    # documented non-systemd test container.
+    bbraft_server_verify_unit: true
+  tasks:
+    - name: Temporary root
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: bbraft-server-test
+      register: bbraft_server_test_root
+
+    - name: Use a temporary tree with spaces, percent and dollar in its path
+      ansible.builtin.set_fact:
+        bbraft_server_config_dir: "{{ bbraft_server_test_root.path }}/etc bbraft % $ \"x\""
+        bbraft_server_state_dir: "{{ bbraft_server_test_root.path }}/state dir % $ \"x\""
+        bbraft_server_binary_path: "{{ bbraft_server_test_root.path }}/bin/bbraft-server"
+        bbraft_server_unit_path: "{{ bbraft_server_test_root.path }}/bbraft-server.service"
+        bbraft_server_file_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_server_file_group: "{{ ansible_facts['user_gid'] }}"
+        bbraft_server_binary_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_server_binary_group: "{{ ansible_facts['user_gid'] }}"
+        bbraft_server_unit_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_server_unit_group: "{{ ansible_facts['user_gid'] }}"
+
+    - name: Put the credential paths under the temporary config directory
+      ansible.builtin.set_fact:
+        bbraft_server_database_url_file: "{{ bbraft_server_config_dir }}/database-url"
+        bbraft_server_gateway_token_file: "{{ bbraft_server_config_dir }}/gateway-token"
+        bbraft_server_api_keys_file: "{{ bbraft_server_config_dir }}/api-keys.json"
+        bbraft_server_node_tokens_file: "{{ bbraft_server_config_dir }}/node-tokens.json"
+        bbraft_server_master_key_file: "{{ bbraft_server_config_dir }}/secrets-master-key"
+
+    - name: Create the simulated service directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ bbraft_server_config_dir }}", mode: "0750" }
+        - { path: "{{ bbraft_server_state_dir }}", mode: "0750" }
+        - { path: "{{ bbraft_server_binary_path | dirname }}", mode: "0755" }
+
+    - name: Validate the inputs before rendering
+      ansible.builtin.include_role:
+        name: bbraft_server
+        tasks_from: validate
+
+    - name: Render the binary, credentials and unit
+      ansible.builtin.include_role:
+        name: bbraft_server
+        tasks_from: files
+
+    - name: Stat every rendered file
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        get_checksum: false
+      loop:
+        - { path: "{{ bbraft_server_binary_path }}", mode: "0755" }
+        - { path: "{{ bbraft_server_database_url_file }}", mode: "0640" }
+        - { path: "{{ bbraft_server_gateway_token_file }}", mode: "0640" }
+        - { path: "{{ bbraft_server_master_key_file }}", mode: "0640" }
+        - { path: "{{ bbraft_server_api_keys_file }}", mode: "0640" }
+        - { path: "{{ bbraft_server_node_tokens_file }}", mode: "0640" }
+        - { path: "{{ bbraft_server_unit_path }}", mode: "0644" }
+      register: bbraft_server_stats
+
+    - name: Every file exists with its documented mode
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.mode == item.item.mode
+        fail_msg: "{{ item.item.path }} is missing or has mode {{ item.stat.mode | default('missing') }}, want {{ item.item.mode }}"
+        quiet: true
+      loop: "{{ bbraft_server_stats.results }}"
+
+    - name: Read the unit
+      ansible.builtin.slurp:
+        src: "{{ bbraft_server_unit_path }}"
+      register: bbraft_server_unit_slurped
+
+    - name: Decode the unit
+      ansible.builtin.set_fact:
+        bbraft_server_unit_content: "{{ bbraft_server_unit_slurped.content | b64decode }}"
+
+    # These files hold credentials even in the placeholder test data. no_log
+    # keeps their contents out of Ansible's result output.
+    - name: Read the credential files
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ bbraft_server_database_url_file }}"
+        - "{{ bbraft_server_gateway_token_file }}"
+        - "{{ bbraft_server_api_keys_file }}"
+        - "{{ bbraft_server_node_tokens_file }}"
+      register: bbraft_server_secrets_slurped
+      no_log: true
+
+    - name: Decode the credential files
+      ansible.builtin.set_fact:
+        bbraft_server_database_url_content: "{{ bbraft_server_secrets_slurped.results[0].content | b64decode }}"
+        bbraft_server_gateway_token_content: "{{ bbraft_server_secrets_slurped.results[1].content | b64decode }}"
+        bbraft_server_api_keys_json: "{{ bbraft_server_secrets_slurped.results[2].content | b64decode | from_json }}"
+        bbraft_server_node_tokens_json: "{{ bbraft_server_secrets_slurped.results[3].content | b64decode | from_json }}"
+      no_log: true
+
+    - name: The unit carries the exact flag names and defaults
+      ansible.builtin.assert:
+        that:
+          - "'-roles \"all\"' in bbraft_server_unit_content"
+          - "'-server.listen \"127.0.0.1:7700\"' in bbraft_server_unit_content"
+          - "'-node.listen \"127.0.0.1:7701\"' in bbraft_server_unit_content"
+          - "'-node.gateway-listen \"127.0.0.1:7702\"' in bbraft_server_unit_content"
+          - "'-commands.stream-max-seconds \"7200\"' in bbraft_server_unit_content"
+          - "'-lifecycle.retry-seconds \"5\"' in bbraft_server_unit_content"
+          - "'-lifecycle.reaper-seconds \"60\"' in bbraft_server_unit_content"
+          - "'-lifecycle.job-poll-seconds \"15\"' in bbraft_server_unit_content"
+          - "'-auth.key-prefix \"bmb_\"' in bbraft_server_unit_content"
+          - "'-database.url-file' in bbraft_server_unit_content"
+          - "'-node.gateway-token-file' in bbraft_server_unit_content"
+          - "'-node.tokens-file' in bbraft_server_unit_content"
+          - "'-auth.keys-file' in bbraft_server_unit_content"
+          - "'-secrets.master-key-file' in bbraft_server_unit_content"
+        fail_msg: "the unit does not carry the exact internal/server/config flag names and defaults"
+        quiet: true
+
+    - name: Optional public URL and gateway client flags stay omitted by default
+      ansible.builtin.assert:
+        that:
+          - "'-server.public-url' not in bbraft_server_unit_content"
+          - "'-node.gateway-dial' not in bbraft_server_unit_content"
+          - "'-node.gateway-ca-file' not in bbraft_server_unit_content"
+          - "'-node.gateway-server-name' not in bbraft_server_unit_content"
+        fail_msg: >-
+          an unset public URL or gateway client setting was rendered; the
+          binary must keep its own defaults
+        quiet: true
+
+    - name: The unit never carries a secret or ephemeral mode
+      ansible.builtin.assert:
+        that:
+          - "'-secrets.allow-ephemeral' not in bbraft_server_unit_content"
+          - "'placeholder-gateway-token-not-real' not in bbraft_server_unit_content"
+          - "'placeholder-password' not in bbraft_server_unit_content"
+          - "'bmb_placeholder_key_not_real' not in bbraft_server_unit_content"
+          - "'postgresql://' not in bbraft_server_unit_content"
+        fail_msg: "a secret or -secrets.allow-ephemeral leaked into ExecStart"
+        quiet: true
+      no_log: true
+
+    - name: The unit is hardened and can read its configuration
+      ansible.builtin.assert:
+        that:
+          - "'NoNewPrivileges=true' in bbraft_server_unit_content"
+          - "'ProtectSystem=strict' in bbraft_server_unit_content"
+          - "'ProtectHome=true' in bbraft_server_unit_content"
+          - "'PrivateTmp=true' in bbraft_server_unit_content"
+          - "'ReadWritePaths=' in bbraft_server_unit_content"
+        fail_msg: "the systemd hardening directives are missing"
+        quiet: true
+
+    - name: Spaces, percent and dollar in paths are quoted for systemd
+      ansible.builtin.assert:
+        that:
+          - "'%%' in bbraft_server_unit_content"
+          - "'$$' in bbraft_server_unit_content"
+          - "'etc bbraft' in bbraft_server_unit_content"
+          - "'state dir %% $' in bbraft_server_unit_content"
+          - "'state dir %% $$' not in bbraft_server_unit_content"
+        fail_msg: "the systemd quoting filters did not escape the temporary paths correctly"
+        quiet: true
+
+    - name: Secret file contents have the documented formats
+      ansible.builtin.assert:
+        that:
+          - bbraft_server_database_url_content | trim == bbraft_server_database_url
+          - bbraft_server_gateway_token_content | trim == bbraft_server_gateway_token
+          - bbraft_server_master_key_size == 32
+          - bbraft_server_api_keys_json['keys'] | length == 1
+          - bbraft_server_api_keys_json['keys'][0].id == 'main'
+          - bbraft_server_api_keys_json['keys'][0].owner == 'acct_placeholder'
+          - bbraft_server_api_keys_json['keys'][0].key == 'bmb_placeholder_key_not_real'
+          - bbraft_server_node_tokens_json['nodes'] | length == 1
+          - bbraft_server_node_tokens_json['nodes'][0].id == 'node-example'
+          - bbraft_server_node_tokens_json['nodes'][0].tokenSha256 == '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+          - "'token' not in bbraft_server_node_tokens_json['nodes'][0]"
+        fail_msg: "a credential file does not match the loader's format"
+        quiet: true
+      no_log: true
+      vars:
+        bbraft_server_master_key_size: "{{ bbraft_server_stats.results[3].stat.size }}"
+
+    # roles=lifecycle does not need API keys and does not write their files;
+    # the unit must omit both flags rather than point at missing files.
+    - name: Render for the lifecycle-only role
+      ansible.builtin.set_fact:
+        bbraft_server_saved_api_keys: "{{ bbraft_server_api_keys }}"
+        bbraft_server_saved_node_tokens: "{{ bbraft_server_node_tokens }}"
+        bbraft_server_roles: lifecycle
+        bbraft_server_api_keys: []
+        bbraft_server_node_tokens: []
+      no_log: true
+
+    - name: Render a lifecycle-only unit
+      ansible.builtin.include_role:
+        name: bbraft_server
+        tasks_from: files
+
+    - name: Read the lifecycle-only unit
+      ansible.builtin.slurp:
+        src: "{{ bbraft_server_unit_path }}"
+      register: bbraft_server_lifecycle_unit
+
+    - name: A lifecycle-only unit omits the key and token flags
+      ansible.builtin.assert:
+        that:
+          - "'-roles \"lifecycle\"' in bbraft_server_lifecycle_content"
+          - "'-auth.keys-file' not in bbraft_server_lifecycle_content"
+          - "'-node.tokens-file' not in bbraft_server_lifecycle_content"
+        fail_msg: "the unit points at credential files the lifecycle role did not write"
+        quiet: true
+      vars:
+        bbraft_server_lifecycle_content: "{{ bbraft_server_lifecycle_unit.content | b64decode }}"
+
+    # TLS pairs are optional; when set, every pair becomes two flags.
+    - name: Render with all three TLS pairs
+      ansible.builtin.set_fact:
+        bbraft_server_roles: all
+        bbraft_server_api_keys: "{{ bbraft_server_saved_api_keys }}"
+        bbraft_server_node_tokens: "{{ bbraft_server_saved_node_tokens }}"
+        bbraft_server_tls_cert_file: /etc/ssl/bbraft/server.crt
+        bbraft_server_tls_key_file: /etc/ssl/bbraft/server.key
+        bbraft_server_node_tls_cert_file: /etc/ssl/bbraft/node.crt
+        bbraft_server_node_tls_key_file: /etc/ssl/bbraft/node.key
+        bbraft_server_gateway_tls_cert_file: /etc/ssl/bbraft/gateway.crt
+        bbraft_server_gateway_tls_key_file: /etc/ssl/bbraft/gateway.key
+      no_log: true
+
+    - name: Render the TLS unit
+      ansible.builtin.include_role:
+        name: bbraft_server
+        tasks_from: files
+
+    - name: Read the TLS unit
+      ansible.builtin.slurp:
+        src: "{{ bbraft_server_unit_path }}"
+      register: bbraft_server_tls_unit
+
+    - name: Every TLS pair is passed as two flags
+      ansible.builtin.assert:
+        that:
+          - "'-server.tls-cert-file' in bbraft_server_tls_content"
+          - "'-server.tls-key-file' in bbraft_server_tls_content"
+          - "'-node.tls-cert-file' in bbraft_server_tls_content"
+          - "'-node.tls-key-file' in bbraft_server_tls_content"
+          - "'-node.gateway-tls-cert-file' in bbraft_server_tls_content"
+          - "'-node.gateway-tls-key-file' in bbraft_server_tls_content"
+        fail_msg: "a configured TLS pair did not reach the unit"
+        quiet: true
+      vars:
+        bbraft_server_tls_content: "{{ bbraft_server_tls_unit.content | b64decode }}"
+
+    # A wildcard API bind has no trusted host, so the role passes the caller's
+    # explicit public URL whenever it is set. A separate TLS gateway target
+    # carries its own CA bundle and certificate name; all paths stay quoted.
+    - name: Render a wildcard API listener with gateway trust settings
+      ansible.builtin.set_fact:
+        bbraft_server_listen: 0.0.0.0:7700
+        bbraft_server_public_url: https://bbraft.example.test/base
+        bbraft_server_gateway_dial: gateway.internal:9702
+        bbraft_server_gateway_ca_file: "{{ bbraft_server_config_dir }}/gateway ca % $.pem"
+        bbraft_server_gateway_server_name: gateway.internal
+
+    - name: Render the wildcard and gateway trust unit
+      ansible.builtin.include_role:
+        name: bbraft_server
+        tasks_from: files
+
+    - name: Read the wildcard and gateway trust unit
+      ansible.builtin.slurp:
+        src: "{{ bbraft_server_unit_path }}"
+      register: bbraft_server_wildcard_unit
+
+    - name: The public URL and gateway trust settings reach the unit
+      ansible.builtin.assert:
+        that:
+          - "'-server.listen \"0.0.0.0:7700\"' in bbraft_server_wildcard_content"
+          - "'-server.public-url \"https://bbraft.example.test/base\"' in bbraft_server_wildcard_content"
+          - "'-node.gateway-dial \"gateway.internal:9702\"' in bbraft_server_wildcard_content"
+          - "'-node.gateway-ca-file' in bbraft_server_wildcard_content"
+          - "'gateway ca %% $$' in bbraft_server_wildcard_content"
+          - "'-node.gateway-server-name \"gateway.internal\"' in bbraft_server_wildcard_content"
+        fail_msg: "a public URL or gateway trust setting did not reach the unit"
+        quiet: true
+      vars:
+        bbraft_server_wildcard_content: "{{ bbraft_server_wildcard_unit.content | b64decode }}"
+
+    # Only the api role needs a public URL, so a nodehub-only server may bind
+    # a wildcard listener with Go's derived defaults.
+    - name: Render a nodehub-only wildcard listener without a public URL
+      ansible.builtin.set_fact:
+        bbraft_server_roles: nodehub
+        bbraft_server_public_url: ""
+        bbraft_server_gateway_dial: ""
+        bbraft_server_gateway_ca_file: ""
+        bbraft_server_gateway_server_name: ""
+
+    - name: Render the nodehub-only wildcard unit
+      ansible.builtin.include_role:
+        name: bbraft_server
+        tasks_from: files
+
+    - name: Read the nodehub-only wildcard unit
+      ansible.builtin.slurp:
+        src: "{{ bbraft_server_unit_path }}"
+      register: bbraft_server_nodehub_unit
+
+    - name: A nodehub-only wildcard listener omits optional endpoint flags
+      ansible.builtin.assert:
+        that:
+          - "'-roles \"nodehub\"' in bbraft_server_nodehub_content"
+          - "'-server.listen \"0.0.0.0:7700\"' in bbraft_server_nodehub_content"
+          - "'-server.public-url' not in bbraft_server_nodehub_content"
+          - "'-node.gateway-dial' not in bbraft_server_nodehub_content"
+          - "'-node.gateway-ca-file' not in bbraft_server_nodehub_content"
+          - "'-node.gateway-server-name' not in bbraft_server_nodehub_content"
+        fail_msg: "a nodehub-only wildcard server rendered an endpoint flag it did not need"
+        quiet: true
+      vars:
+        bbraft_server_nodehub_content: "{{ bbraft_server_nodehub_unit.content | b64decode }}"
+
+    - name: Look for systemd-analyze
+      ansible.builtin.command:
+        argv: [systemd-analyze, --version]
+      register: bbraft_server_systemd_analyze
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Systemd-analyze must be available for this test
+      ansible.builtin.assert:
+        that: bbraft_server_systemd_analyze.rc == 0
+        fail_msg: >-
+          systemd-analyze is required for the bbraft_server render test. Set bbraft_server_verify_unit=false only in a
+          documented non-systemd test container.
+        quiet: true
+      when: bbraft_server_verify_unit | bool
+
+    - name: Verify the rendered unit with systemd-analyze
+      ansible.builtin.command:
+        argv: [systemd-analyze, verify, "{{ bbraft_server_unit_path }}"]
+      changed_when: false
+      when: bbraft_server_verify_unit | bool
+
+    - name: Note the skipped unit verification
+      ansible.builtin.debug:
+        msg: "systemd-analyze verify skipped because bbraft_server_verify_unit=false"
+      when: not (bbraft_server_verify_unit | bool)
+
+    - name: Remove the temporary root
+      ansible.builtin.file:
+        path: "{{ bbraft_server_test_root.path }}"
+        state: absent

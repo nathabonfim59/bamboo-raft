@@ -1,0 +1,115 @@
+# Regression for no-clobber image publication: a destination that appears
+# while staging must never be replaced, and a clean destination must publish.
+- name: Publish images without clobbering a concurrent winner
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    bbraft_node_manage_service: false
+  tasks:
+    - name: Temporary root
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: bbraft-node-publish-test
+      register: bbraft_node_publish_root
+
+    - name: Create the publish paths
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ bbraft_node_publish_root.path }}/staging"
+        - "{{ bbraft_node_publish_root.path }}/dest"
+
+    - name: Put a manifest in the staging directory
+      ansible.builtin.copy:
+        content: "{\"schemaVersion\": 1, \"id\": \"image-publish-test\"}\n"
+        dest: "{{ bbraft_node_publish_root.path }}/staging/manifest.json"
+        mode: "0444"
+
+    - name: Publish into an empty destination
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: image-publish
+      vars:
+        bbraft_node_image_staging: "{{ bbraft_node_publish_root.path }}/staging"
+        bbraft_node_image_dest: "{{ bbraft_node_publish_root.path }}/dest/image-publish-test"
+
+    - name: Stat the clean publish result
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ bbraft_node_publish_root.path }}/staging"
+        - "{{ bbraft_node_publish_root.path }}/dest/image-publish-test/manifest.json"
+      register: bbraft_node_publish_result
+
+    - name: The verified staging directory moved into place
+      ansible.builtin.assert:
+        that:
+          - not bbraft_node_publish_result.results[0].stat.exists
+          - bbraft_node_publish_result.results[1].stat.exists
+        fail_msg: "the clean publish did not atomically move the staging directory"
+        quiet: true
+
+    - name: Create a new staging directory and a concurrent winner
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ bbraft_node_publish_root.path }}/staging2"
+        - "{{ bbraft_node_publish_root.path }}/dest/image-publish-test"
+
+    - name: Write the staging and winning manifests
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ item.dest }}"
+        mode: "0444"
+      loop:
+        - { content: "{\"id\": \"loser\"}\n", dest: "{{ bbraft_node_publish_root.path }}/staging2/manifest.json" }
+        - { content: "{\"id\": \"winner\"}\n", dest: "{{ bbraft_node_publish_root.path }}/dest/image-publish-test/manifest.json" }
+
+    - name: A destination that appeared while staging is refused
+      block:
+        - name: Publish over the concurrent winner
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: image-publish
+          vars:
+            bbraft_node_image_staging: "{{ bbraft_node_publish_root.path }}/staging2"
+            bbraft_node_image_dest: "{{ bbraft_node_publish_root.path }}/dest/image-publish-test"
+      rescue:
+        - name: Record the expected no-clobber rejection
+          ansible.builtin.set_fact:
+            bbraft_node_publish_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The collision was rejected at the destination check
+      ansible.builtin.assert:
+        that:
+          - "'appeared while this apply was staging' in bbraft_node_publish_reason"
+        fail_msg: "a concurrent destination was not rejected at the no-clobber check"
+        quiet: true
+
+    - name: Read the winner's manifest and the loser's staging directory
+      ansible.builtin.slurp:
+        src: "{{ bbraft_node_publish_root.path }}/dest/image-publish-test/manifest.json"
+      register: bbraft_node_publish_winner
+
+    - name: Stat the losing staging directory
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_publish_root.path }}/staging2"
+      register: bbraft_node_publish_loser
+
+    - name: The winner was not replaced and the loser stayed in staging
+      ansible.builtin.assert:
+        that:
+          - (bbraft_node_publish_winner.content | b64decode | from_json).id == 'winner'
+          - bbraft_node_publish_loser.stat.exists
+        fail_msg: "a concurrent publication replaced the winner"
+        quiet: true
+
+    - name: Remove the temporary root
+      ansible.builtin.file:
+        path: "{{ bbraft_node_publish_root.path }}"
+        state: absent

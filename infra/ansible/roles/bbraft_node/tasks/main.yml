@@ -1,0 +1,147 @@
+# bbraft-node on one Debian 13 KVM host. The caller supplies the binary and
+# the raw token; the role installs packages, the root-owned directories of a
+# fresh v1 data root, immutable verified images and a hardened unit for the
+# root jail supervisor.
+- name: Validate the bbraft-node inputs
+  ansible.builtin.import_tasks: validate.yml
+
+# Before any host change: an existing data dir must already be a v1 root (or
+# empty). A Phase 0.5 or foreign data dir is refused unchanged.
+- name: Recognize the data root read-only
+  ansible.builtin.import_tasks: data-dir-check.yml
+
+- name: The role targets Debian 13
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == 'Debian'
+      - ansible_facts.distribution_major_version == '13'
+    fail_msg: >-
+      this role is written for Debian 13 (trixie), the reference node OS;
+      override bbraft_node_require_debian only in a documented test host
+    quiet: true
+  when: bbraft_node_require_debian | bool
+
+- name: Install the QEMU, qemu-img and passt packages
+  ansible.builtin.apt:
+    name: "{{ bbraft_node_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create the kvm group if the packages did not
+  ansible.builtin.group:
+    name: "{{ bbraft_node_kvm_group }}"
+    system: true
+
+- name: Check the host for the root jail supervisor
+  ansible.builtin.import_tasks: host-checks.yml
+  when: bbraft_node_manage_service | bool
+
+# The config directory, token and data root belong to the root supervisor.
+# Published image versions are root-owned and read-only even though they live
+# under the data root.
+- name: Create the configuration directory
+  ansible.builtin.file:
+    path: "{{ bbraft_node_config_dir }}"
+    state: directory
+    owner: "{{ bbraft_node_config_owner }}"
+    group: "{{ bbraft_node_config_group }}"
+    mode: "{{ bbraft_node_config_mode }}"
+
+- name: Create or mark the fresh v1 data root
+  ansible.builtin.import_tasks: data-dir-create.yml
+
+- name: Create the read-only image root
+  ansible.builtin.file:
+    path: "{{ bbraft_node_image_dir }}"
+    state: directory
+    owner: "{{ bbraft_node_image_owner }}"
+    group: "{{ bbraft_node_image_group }}"
+    mode: "{{ bbraft_node_image_mode }}"
+
+- name: Install the binary, token, images and systemd/udev files
+  ansible.builtin.import_tasks: files.yml
+
+# udevadm and modprobe run before the service starts so a freshly written rule
+# has already applied the kvm group and 0660 mode to both device nodes. They
+# are probes with changed_when=false: every apply is safe and reports no change.
+- name: Reload udev rules
+  ansible.builtin.command:
+    argv: [udevadm, control, --reload-rules]
+  when:
+    - not ansible_check_mode
+    - bbraft_node_manage_service | bool
+  changed_when: false
+
+- name: Load the required kernel modules for this boot
+  ansible.builtin.command:
+    argv: [modprobe, "{{ item }}"]
+  loop: "{{ bbraft_node_kernel_modules }}"
+  when:
+    - not ansible_check_mode
+    - bbraft_node_manage_service | bool
+  changed_when: false
+
+- name: Read the loaded kernel modules
+  ansible.builtin.stat:
+    path: "/sys/module/{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ bbraft_node_kernel_modules }}"
+  register: bbraft_node_module_stats
+  when:
+    - not ansible_check_mode
+    - bbraft_node_manage_service | bool
+
+- name: Read the built-in kernel module list
+  ansible.builtin.slurp:
+    src: "/lib/modules/{{ ansible_facts['kernel'] }}/modules.builtin"
+  register: bbraft_node_modules_builtin
+  failed_when: false
+  when:
+    - not ansible_check_mode
+    - bbraft_node_manage_service | bool
+
+- name: The required kernel modules are loaded or built in
+  ansible.builtin.assert:
+    that: >-
+      item.stat.exists or
+      ((bbraft_node_modules_builtin.content | default('') | b64decode).splitlines()
+       | select('search', '/' ~ item.item ~ '\\.ko$') | list | length > 0)
+    fail_msg: "kernel module {{ item.item }} is neither loaded nor built in; bbraft-node needs it before it starts"
+    quiet: true
+  loop: "{{ bbraft_node_module_stats.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - not ansible_check_mode
+    - bbraft_node_manage_service | bool
+
+- name: Apply the kvm and vhost-vsock device rule
+  ansible.builtin.command:
+    argv: [udevadm, trigger, "--name-match={{ item }}"]
+  loop: [/dev/kvm, /dev/vhost-vsock]
+  when:
+    - not ansible_check_mode
+    - bbraft_node_manage_service | bool
+  changed_when: false
+
+- name: Check the KVM and vsock device permissions
+  ansible.builtin.import_tasks: devices.yml
+
+- name: Prove the data root is still the acquired one
+  ansible.builtin.import_tasks: data-dir-verify.yml
+
+# IPv4 forwarding is persisted and applied only after the live hardening
+# forward filter is proven (tasks/ip-forward.yml).
+- name: Guard, persist and apply IPv4 forwarding
+  ansible.builtin.import_tasks: ip-forward.yml
+  when: bbraft_node_manage_service | bool
+
+- name: Run bbraft-node
+  ansible.builtin.systemd_service:
+    name: "{{ bbraft_node_service }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: bbraft_node_manage_service | bool

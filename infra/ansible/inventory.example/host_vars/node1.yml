@@ -1,0 +1,65 @@
+# Per-node settings. File name = the host name in hosts.yml.
+
+# Bulk HDD for Garage, backups and parkana data. Use the /dev/disk/by-id path
+# (`ls -l /dev/disk/by-id/`), never /dev/sdX. Leave empty for no bulk disk.
+bulk_disk_device: /dev/disk/by-id/ata-VENDOR_MODEL_SERIAL
+
+# kvm_intel or kvm_amd.
+kvm_module: kvm_intel
+
+# Only with `--tags garage` (optional local S3). Defaults in
+# roles/garage/defaults/main.yml; override per node here, e.g.:
+# garage_capacity: 3T
+# garage_data_dir: /srv/bulk/garage/data
+
+# --- Tailnet access (--tags tailscale, then --tags hardening) --------------
+# After the first tailscale run, set ansible_host in hosts.yml to the tailnet
+# name it prints (node1.<tailnet>.ts.net).
+tailscale_authkey_file: ~/.config/bamboo-raft/tailscale-authkey
+tailscale_hostname: node1
+tailscale_serve_target: http://127.0.0.1:7700
+# https (default; needs HTTPS certificates, puts the name in the public CT
+# logs) or http (no certificate). infra/README.md, "API access: HTTPS or HTTP".
+tailscale_serve_scheme: https
+
+# --- bamboo-raft (--tags bbraft) ---------------------------------------------
+# Secrets are mode-600 files in inventory/secrets/ (gitignored): see
+# infra/README.md, "Deploying bamboo-raft".
+bbraft_secrets: "{{ inventory_dir }}/secrets"
+bbraft_deploy_dir: "{{ lookup('env', 'HOME') }}/.cache/bamboo-raft/deploy"
+postgres_password: "{{ lookup('file', bbraft_secrets + '/postgres-password') }}"
+bbraft_server_binary_src: "{{ bbraft_deploy_dir }}/bin/bbraft-server"
+bbraft_server_database_url: "postgresql://bbraft:{{ postgres_password }}@127.0.0.1:5432/bbraft?sslmode=disable"
+bbraft_server_gateway_token: "{{ lookup('file', bbraft_secrets + '/gateway-token') }}"
+bbraft_server_master_key_source: "{{ bbraft_secrets }}/master-key"
+bbraft_server_api_keys:
+  - { id: main, owner: main, key: "{{ lookup('file', bbraft_secrets + '/api-key') }}" }
+bbraft_server_node_tokens:
+  - { id: node1, tokenSha256: "{{ lookup('file', bbraft_secrets + '/node-token') | hash('sha256') }}" }
+bbraft_server_public_url: https://node1.example-tailnet.ts.net
+bbraft_node_binary_src: "{{ bbraft_deploy_dir }}/bin/bbraft-node"
+bbraft_node_binary_sha256: "{{ lookup('pipe', 'sha256sum ' + (bbraft_node_binary_src | quote)).split()[0] }}"
+bbraft_node_token_src: "{{ bbraft_secrets }}/node-token"
+bbraft_node_id: node1
+bbraft_node_images:
+  - "{{ bbraft_deploy_dir }}/images/ubuntu-24.04-v1"
+bbraft_node_default_image: ubuntu-24.04-v1
+bbraft_node_cpu_overcommit: 2.0
+bbraft_node_memory_overcommit: 2.0
+bbraft_node_disk_overcommit: 4.0
+
+# --- VM networking (bbraft_node) and the hardening forward allowance ---------
+# The hardening play runs before the node play, so the bridge pairing must be
+# inventory-level: hardening forwards only through the bridge bbraft-node owns.
+bbraft_node_network_bridge: bbraft0
+hardening_vm_bridge_interfaces: ["{{ bbraft_node_network_bridge }}"]
+bbraft_node_network_prefix: 10.42.0.0/16        # placeholder private range
+bbraft_node_network_gateway: 10.42.0.1
+bbraft_node_ssh_ingress_addr: 203.0.113.10      # documentation address
+bbraft_node_ssh_ingress_iface: example0         # public iface, never the bridge
+bbraft_node_ssh_port_range: 22000-22999
+
+# --- Jailed QEMU (bbraft_node) -----------------------------------------------
+bbraft_node_jail_uid_range: 900000-900999       # must not overlap host accounts
+bbraft_node_jail_io_device: "MAJ:MIN"           # whole disk under data and image dirs
+bbraft_node_jail_io_write_bps: 104857600        # at least one positive per-VM io.max rate

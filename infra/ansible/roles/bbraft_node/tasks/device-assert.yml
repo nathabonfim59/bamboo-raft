@@ -1,0 +1,27 @@
+# Device policy for the nodes bbraft-node/QEMU must open. The stat results are
+# in bbraft_node_devices.results (from devices.yml, or synthetic fixtures in
+# the role-local tests). Every required device must be a character device;
+# /dev/kvm and /dev/vhost-vsock also keep Debian's kvm-group 0660 (the udev
+# rule). The root supervisor needs no group policy for vhost-net and tun.
+- name: Every checked device is a character node
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.ischr
+      - not item.stat.islnk
+      - item.item not in ['/dev/kvm', '/dev/vhost-vsock'] or (item.stat.gr_name == bbraft_node_kvm_group and item.stat.mode == '0660')
+    fail_msg: >-
+      {{ item.item }} is missing, not a character device, or (for /dev/kvm and
+      /dev/vhost-vsock) not group-owned by {{ bbraft_node_kvm_group }} at mode
+      0660; the host must load kvm, tun, vhost_net and vhost_vsock and the udev
+      rule must apply
+    quiet: true
+  loop: "{{ bbraft_node_devices.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Every required device was checked
+  ansible.builtin.assert:
+    that: (bbraft_node_devices.results | map(attribute='item') | sort | list) == (bbraft_node_required_devices | sort | list)
+    fail_msg: "the device check must cover exactly bbraft_node_required_devices: {{ bbraft_node_required_devices | join(', ') }}"
+    quiet: true

@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "type": "folder.created",
+  "success": true,
+  "name": "notes",
+  "path": "/home/user/notes",
+  "isDir": true,
+  "isSymlink": false,
+  "size": 4096,
+  "mode": "0755",
+  "modifiedAt": "2026-11-08T12:00:00Z"
+}

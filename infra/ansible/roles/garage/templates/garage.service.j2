@@ -1,0 +1,31 @@
+# Managed by bamboo-raft infra/ansible (role garage).
+[Unit]
+Description=Garage S3 object store
+After=network-online.target local-fs.target
+Wants=network-online.target
+RequiresMountsFor={{ garage_data_dir }} {{ garage_meta_dir }}
+
+[Service]
+Type=simple
+User={{ garage_user }}
+Group={{ garage_user }}
+Environment=RUST_LOG=garage=info
+ExecStart=/usr/local/bin/garage -c {{ garage_config }} server
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths={{ garage_meta_dir }} {{ garage_data_dir }}
+
+[Install]
+WantedBy=multi-user.target

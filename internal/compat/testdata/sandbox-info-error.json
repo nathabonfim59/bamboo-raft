@@ -1,0 +1,38 @@
+{
+  "ok": true,
+  "type": "sandbox.info",
+  "sandbox": {
+    "id": "bx_23456789",
+    "name": "Sandbox 2026-11-11 10:00",
+    "state": "error",
+    "error": "vm_missing",
+    "labels": {},
+    "type": "default",
+    "vcpu": 4,
+    "memoryGB": 8,
+    "billingMultiplier": 1,
+    "url": null,
+    "ip": null,
+    "subdomain": null,
+    "createdAt": "2026-11-11T09:00:00Z",
+    "updatedAt": "2026-11-11T10:00:05Z",
+    "archiveAfter": "2026-11-11T11:00:00Z",
+    "ttlSeconds": 3600,
+    "desktopAvailable": false,
+    "desktopUrl": null,
+    "snapshots": true,
+    "monitoring": true,
+    "snapshotAvailable": false,
+    "snapshotCompletedAt": null,
+    "stoppedAt": "2026-11-11T10:00:05Z",
+    "stop": {
+      "id": "stop_0123456789abcdef",
+      "status": "failing",
+      "requestedAt": "2026-11-11T10:00:00Z",
+      "lastAttemptAt": "2026-11-11T10:00:05Z",
+      "error": "vm_missing",
+      "endedAt": null,
+      "forced": false
+    }
+  }
+}

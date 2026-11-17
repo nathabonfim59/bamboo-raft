@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "type": "file.list",
+  "success": true,
+  "path": "/home/user",
+  "files": [
+    {
+      "name": "notes.txt",
+      "path": "/home/user/notes.txt",
+      "isDir": false,
+      "isSymlink": false,
+      "size": 12,
+      "mode": "0644",
+      "modifiedAt": "2026-11-08T12:00:00Z"
+    }
+  ],
+  "truncated": false
+}

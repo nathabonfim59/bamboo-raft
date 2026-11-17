@@ -1,0 +1,130 @@
+# A10 role fix A: the data root is acquired exclusively. A tree that changes
+# between the read-only recognition and the acquisition (or verification) is
+# refused unchanged, never chmod'ed, marked or skipped; after the change is
+# undone a fresh run succeeds. Local connection, temporary trees only.
+- name: Stale-state data-root transitions
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    lt_user: "{{ ansible_facts['user_id'] }}"
+    lt_valid: >-
+      printf 'bbraft-node data root v1\n' >"$D/$M" && chmod 0600 "$D/$M"
+    lt_cases:
+      - name: absent then a foreign 0755 directory with a sentinel
+        setup: ""
+        plant: 'mkdir "$D" && chmod 0755 "$D" && printf sentinel >"$D/sentinel"'
+        undo: 'rm -rf -- "$D"'
+      - name: absent then a foreign empty 0755 directory
+        setup: ""
+        plant: 'mkdir "$D" && chmod 0755 "$D"'
+        undo: 'rmdir -- "$D"'
+      - name: empty then a planted legacy file
+        setup: 'mkdir -m 0700 "$D"'
+        plant: 'printf legacy >"$D/node.lock"'
+        undo: 'rm -f -- "$D/node.lock"'
+      - name: empty then a wrong marker
+        setup: 'mkdir -m 0700 "$D"'
+        plant: 'printf "bbraft-node data root v0\n" >"$D/$M" && chmod 0600 "$D/$M"'
+        undo: 'rm -f -- "$D/$M"'
+      - name: current then the root inode replaced
+        setup: 'mkdir -m 0700 "$D" && {{ lt_valid }}'
+        plant: 'mv "$D" "$D.old" && mkdir -m 0700 "$D" && {{ lt_valid }}'
+        undo: 'rm -rf -- "$D.old"'
+      # The old marker is renamed to a sibling outside the root and kept
+      # (never unlinked): ext4 hands a just-freed inode number straight to
+      # the next create, which would leave the asserted identity unchanged.
+      # The plant itself proves the replacement has a new identity and the
+      # old inode is still held.
+      - name: current then the marker inode replaced
+        setup: 'mkdir -m 0700 "$D" && {{ lt_valid }}'
+        plant: >-
+          old=$(stat -c %d:%i -- "$D/$M") && mv -- "$D/$M" "$D.marker-old" && {{ lt_valid }} &&
+          [ "$(stat -c %d:%i -- "$D/$M")" != "$old" ] && [ "$(stat -c %d:%i -- "$D.marker-old")" = "$old" ]
+        undo: ':'
+      # Control: a plant that fails is rescued like a refusal, so it must be
+      # recognized by its missing plant witness, never counted as the
+      # expected refusal. The tree is unchanged, so the retry still succeeds.
+      - name: control a failed plant is never an expected refusal
+        setup: 'mkdir -m 0700 "$D" && {{ lt_valid }}'
+        plant: 'false'
+        undo: ':'
+        unwitnessed: true
+  tasks:
+    - name: The test user's primary group
+      ansible.builtin.command:
+        argv: [id, -gn]
+      register: lt_id_group
+      changed_when: false
+
+    - name: Start with no failures
+      ansible.builtin.set_fact:
+        lt_group: "{{ lt_id_group.stdout }}"
+        lt_failures: []
+
+    - name: Every transition
+      ansible.builtin.include_tasks: legacy-transition-case.yml
+      loop: "{{ lt_cases }}"
+      loop_control:
+        loop_var: lt
+        label: "{{ lt.name }}"
+
+    - name: Every transition behaved
+      ansible.builtin.assert:
+        that: lt_failures | length == 0
+        fail_msg: "{{ lt_failures | length }} transition(s) failed: {{ lt_failures | join(' | ') }}"
+        quiet: true
+
+- name: Verification refuses a replaced acquired root
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  tasks:
+    - name: Fresh parent
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: bbraft-verify
+      register: lv_parent
+
+    - name: Names
+      ansible.builtin.command:
+        argv: [id, -gn]
+      register: lv_group
+      changed_when: false
+
+    - name: Acquire a fresh root
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: "{{ item }}"
+      loop: [data-dir-check, data-dir-create]
+      vars: &lv_vars
+        bbraft_node_data_dir: "{{ lv_parent.path }}/data"
+        bbraft_node_data_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_data_group: "{{ lv_group.stdout }}"
+
+    - name: Replace the acquired root by an identical-looking one
+      ansible.builtin.shell: >-
+        old=$(stat -c %d:%i -- "$D") && mv "$D" "$D.old" && mkdir -m 0700 "$D" &&
+        printf 'bbraft-node data root v1\n' >"$D/.bbraft-node-data-v1" && chmod 0600 "$D/.bbraft-node-data-v1" &&
+        [ "$(stat -c %d:%i -- "$D")" != "$old" ] && [ "$(stat -c %d:%i -- "$D.old")" = "$old" ]
+      args: {executable: /bin/sh}
+      environment:
+        D: "{{ lv_parent.path }}/data"
+      changed_when: false
+
+    - name: Verify the acquired root
+      block:
+        - name: Verification
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: data-dir-verify
+          vars: *lv_vars
+        - name: The replaced root was accepted
+          ansible.builtin.fail:
+            msg: "verification accepted a replaced data root"
+      rescue:
+        - name: The replacement was refused for the right reason
+          ansible.builtin.assert:
+            that: "'not a bbraft-node v1 data root' in (ansible_failed_result.msg | default(''))"
+            fail_msg: "verification failed for another reason: {{ ansible_failed_result.msg | default('') }}"
+            quiet: true

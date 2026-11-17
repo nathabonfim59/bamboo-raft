@@ -1,0 +1,49 @@
+# The data root's mount must allow device nodes, setuid and executables
+# (A10 fix C): the jailer stages device nodes and the QEMU runtime under it.
+# The probed path is the mount that actually holds the root: the data dir
+# itself when it exists (it may be its own mount), else its configured
+# parent, which must already exist.
+- name: Read the data root for the mount check
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_data_dir }}"
+    follow: false
+    get_checksum: false
+  register: bbraft_node_mount_data
+
+- name: Read the configured parent for the mount check
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_data_dir | dirname }}"
+    follow: false
+    get_checksum: false
+  register: bbraft_node_mount_parent
+  when: not bbraft_node_mount_data.stat.exists
+
+- name: An absent data root has an existing configured parent
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_mount_parent.stat.exists
+      - bbraft_node_mount_parent.stat.isdir
+    fail_msg: "the data root's configured parent {{ bbraft_node_data_dir | dirname }} does not exist (it is never created here)"
+    quiet: true
+  when: not bbraft_node_mount_data.stat.exists
+
+- name: Read the mount options of the data root
+  ansible.builtin.command:
+    argv: "{{ bbraft_node_findmnt + ['--noheadings', '--output', 'OPTIONS', '--target', bbraft_node_mount_target] }}"
+  vars:
+    bbraft_node_mount_target: "{{ bbraft_node_data_dir if bbraft_node_mount_data.stat.exists else (bbraft_node_data_dir | dirname) }}"
+  register: bbraft_node_data_mount
+  changed_when: false
+  check_mode: false
+
+- name: The data root may hold device nodes and executables
+  ansible.builtin.assert:
+    that:
+      - "'nodev' not in (bbraft_node_data_mount.stdout | trim).split(',')"
+      - "'nosuid' not in (bbraft_node_data_mount.stdout | trim).split(',')"
+      - "'noexec' not in (bbraft_node_data_mount.stdout | trim).split(',')"
+    fail_msg: >-
+      the mount holding {{ bbraft_node_data_dir }} is {{ bbraft_node_data_mount.stdout | trim }};
+      the jailer stages device nodes and the QEMU runtime under the data root,
+      so it must not be nodev, nosuid or noexec
+    quiet: true

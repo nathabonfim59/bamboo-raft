@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 409,
+  "code": "sandbox_starting",
+  "message": "Sandbox is still starting",
+  "error": {
+    "code": "sandbox_starting",
+    "message": "Sandbox is still starting",
+    "status": 409,
+    "details": {"retryable": true}
+  },
+  "requestId": "req_01HXEXAMPLE"
+}

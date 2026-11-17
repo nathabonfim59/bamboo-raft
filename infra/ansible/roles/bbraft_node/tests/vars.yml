@@ -1,0 +1,28 @@
+# Placeholders only: no real host, token or image. The binary hash is the
+# fixture file's real sha256 so the checksum path is exercised.
+bbraft_node_binary_sha256: 6d650051b74a1726236a6a043c2dadc0253f7916f232d3d1d390d7ed8cb870e5
+bbraft_node_token: placeholder-node-token-not-real
+bbraft_node_images:
+  - "{{ playbook_dir }}/fixtures/image-fixture"
+
+# VM networking placeholders: 10.42.0.0/16 is a private documentation range
+# and 203.0.113.10 is TEST-NET-3. The private inventory supplies real values.
+bbraft_node_network_prefix: 10.42.0.0/16
+bbraft_node_network_gateway: 10.42.0.1
+bbraft_node_network_resolvers:
+  - 1.1.1.1
+  - 9.9.9.9
+bbraft_node_network_management: []
+bbraft_node_ssh_ingress_addr: 203.0.113.10
+bbraft_node_ssh_ingress_iface: example0
+bbraft_node_ssh_port_range: 22000-22999
+
+# Jailed QEMU placeholders (cmd/bbraft-node jail flags). 900000-900999 must
+# not overlap host accounts on a real node; 8:0 is a placeholder whole disk.
+bbraft_node_jail_uid_range: 900000-900999
+bbraft_node_jail_io_device: "8:0"
+bbraft_node_jail_io_write_bps: 104857600
+
+# The hardening role's forward allowance names exactly the bbraft bridge.
+hardening_vm_bridge_interfaces:
+  - bbraft0

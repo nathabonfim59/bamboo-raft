@@ -1,0 +1,6 @@
+# Build products and pinned tool caches. Never commit these.
+out/
+.cache/
+# Test-only unpinned build output and its isolated cache (VM-only, disposable).
+out-unpinned-test/
+.cache-unpinned-test/

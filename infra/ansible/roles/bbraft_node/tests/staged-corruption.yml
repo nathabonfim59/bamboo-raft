@@ -1,0 +1,171 @@
+# Regression for the target-side staged-image verification: a same-size
+# corruption introduced after the controller copy must fail before publish,
+# and the untouched staged version must pass. Local temporary tree only.
+- name: Reject a corrupted staged image and accept the intact one
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars.yml
+  vars:
+    bbraft_node_binary_src: "{{ playbook_dir }}/fixtures/bbraft-node"
+    bbraft_node_manage_service: false
+    bbraft_node_image_files:
+      - initrd
+      - kernel
+      - packages.json
+      - root.qcow2
+    bbraft_node_image_entries:
+      - initrd
+      - kernel
+      - manifest.json
+      - packages.json
+      - root.qcow2
+    bbraft_node_image_file_mode: "0444"
+    bbraft_node_image_mode: "0555"
+  tasks:
+    - name: Temporary root
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: bbraft-node-staged-test
+      register: bbraft_node_staged_root
+
+    - name: Use temporary paths and the local user as the image owner
+      ansible.builtin.set_fact:
+        bbraft_node_config_dir: "{{ bbraft_node_staged_root.path }}/etc"
+        bbraft_node_data_dir: "{{ bbraft_node_staged_root.path }}/var"
+        bbraft_node_image_dir: "{{ bbraft_node_staged_root.path }}/var/images"
+        bbraft_node_binary_path: "{{ bbraft_node_staged_root.path }}/bin/bbraft-node"
+        bbraft_node_unit_path: "{{ bbraft_node_staged_root.path }}/bbraft-node.service"
+        bbraft_node_udev_rule_path: "{{ bbraft_node_staged_root.path }}/60-bbraft-kvm.rules"
+        bbraft_node_modules_load_path: "{{ bbraft_node_staged_root.path }}/bbraft-vhost-vsock.conf"
+        bbraft_node_token_file: "{{ bbraft_node_staged_root.path }}/etc/node.token"
+        bbraft_node_data_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_data_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_config_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_config_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_token_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_token_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_binary_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_binary_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_unit_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_unit_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_udev_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_udev_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_modules_load_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_modules_load_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_image_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_image_group: "{{ ansible_facts['user_id'] }}"
+
+    - name: Create the simulated directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ bbraft_node_config_dir }}", mode: "0750" }
+        - { path: "{{ bbraft_node_data_dir }}", mode: "0700" }
+        - { path: "{{ bbraft_node_image_dir }}", mode: "0755" }
+        - { path: "{{ bbraft_node_binary_path | dirname }}", mode: "0755" }
+
+    - name: Load the role defaults and the image spec
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate
+
+    - name: Point the verifier at a temporary staging directory
+      ansible.builtin.set_fact:
+        bbraft_node_image: "{{ bbraft_node_image_specs | first }}"
+        bbraft_node_image_staging: "{{ bbraft_node_image_dir }}/.staging-image-fixture"
+
+    - name: Create the staging directory
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_staging }}"
+        state: directory
+        owner: "{{ bbraft_node_image_owner }}"
+        group: "{{ bbraft_node_image_group }}"
+        mode: "0755"
+
+    - name: Copy the five fixture files into staging
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/fixtures/image-fixture/{{ item }}"
+        dest: "{{ bbraft_node_image_staging }}/{{ item }}"
+        owner: "{{ bbraft_node_image_owner }}"
+        group: "{{ bbraft_node_image_group }}"
+        mode: "{{ bbraft_node_image_file_mode }}"
+      loop: "{{ bbraft_node_image_entries }}"
+
+    - name: Corrupt a staged artifact without changing its size
+      ansible.builtin.copy:
+        content: "corruptxxxx qcow2\n"
+        dest: "{{ bbraft_node_image_staging }}/root.qcow2"
+        owner: "{{ bbraft_node_image_owner }}"
+        group: "{{ bbraft_node_image_group }}"
+        mode: "{{ bbraft_node_image_file_mode }}"
+
+    - name: Make the corrupted staging directory read-only
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_staging }}"
+        state: directory
+        owner: "{{ bbraft_node_image_owner }}"
+        group: "{{ bbraft_node_image_group }}"
+        mode: "{{ bbraft_node_image_mode }}"
+
+    - name: A same-size staged corruption is rejected before publish
+      block:
+        - name: Verify the corrupted staged image
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: image-verify-staging
+      rescue:
+        - name: Record the expected staged-verification rejection
+          ansible.builtin.set_fact:
+            bbraft_node_staged_rejection: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The rejection names the staged artifact
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_staged_rejection is defined
+          - "'staged root.qcow2' in bbraft_node_staged_rejection"
+        fail_msg: "the corruption did not fail at the staged-artifact hash check"
+        quiet: true
+
+    - name: Make the staging directory writable again
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_staging }}"
+        state: directory
+        owner: "{{ bbraft_node_image_owner }}"
+        group: "{{ bbraft_node_image_group }}"
+        mode: "0755"
+
+    - name: Restore the intact artifact
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/fixtures/image-fixture/root.qcow2"
+        dest: "{{ bbraft_node_image_staging }}/root.qcow2"
+        owner: "{{ bbraft_node_image_owner }}"
+        group: "{{ bbraft_node_image_group }}"
+        mode: "{{ bbraft_node_image_file_mode }}"
+
+    - name: Make the restored staging directory read-only
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_staging }}"
+        state: directory
+        owner: "{{ bbraft_node_image_owner }}"
+        group: "{{ bbraft_node_image_group }}"
+        mode: "{{ bbraft_node_image_mode }}"
+
+    - name: The intact staged image passes
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: image-verify-staging
+
+    - name: Make the staging directory writable for cleanup
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_staging }}"
+        state: directory
+        mode: "0755"
+
+    - name: Remove the temporary root
+      ansible.builtin.file:
+        path: "{{ bbraft_node_staged_root.path }}"
+        state: absent

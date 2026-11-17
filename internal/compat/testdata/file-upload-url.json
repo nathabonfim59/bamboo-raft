@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "type": "file.upload_url",
+  "url": "https://api.example.test/api/v1/uploads/secret-token",
+  "method": "PUT",
+  "path": "/tmp/archive.tar",
+  "expiresAt": "2026-11-08T12:15:00Z"
+}

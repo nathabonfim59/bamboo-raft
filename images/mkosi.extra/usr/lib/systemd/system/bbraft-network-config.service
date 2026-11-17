@@ -1,0 +1,26 @@
+# Managed by bamboo-raft infra (images/mkosi.extra).
+#
+# Translates the kernel ip= parameter into /run/systemd/network so a TAP-mode
+# guest gets a static address, gateway and DNS. It runs before networkd, like
+# systemd-network-generator.service, and does nothing at all for the QEMU
+# user-mode dev fallback (no ip= on the command line), which keeps the image's
+# DHCP configuration unchanged.
+#
+# The generator writes no secrets: the unit contains only the guest address,
+# gateway and public resolvers the node passes on the kernel command line.
+[Unit]
+Description=bamboo-raft guest static network from the kernel command line
+Documentation=man:systemd-network-generator.service(8)
+DefaultDependencies=no
+Before=network-pre.target systemd-networkd.service systemd-udevd.service
+Wants=network-pre.target
+Conflicts=shutdown.target initrd-switch-root.target
+Before=shutdown.target initrd-switch-root.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/bbraft-network-config
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,28 @@
+# Internal role constants. A published image version contains exactly the four
+# manifest artifacts plus manifest.json, in sorted order. The node rejects any
+# extra entry inside a version directory, so staging and verification markers
+# stay outside it.
+bbraft_node_image_files:
+  - initrd
+  - kernel
+  - packages.json
+  - root.qcow2
+bbraft_node_image_entries:
+  - initrd
+  - kernel
+  - manifest.json
+  - packages.json
+  - root.qcow2
+
+# The v1 data-root marker (D-b). The role writes it only into a data dir it
+# created or found empty; any other existing data dir without exactly these
+# bytes is refused before any file task (tasks/data-dir-check.yml).
+bbraft_node_data_marker_name: .bbraft-node-data-v1
+bbraft_node_data_marker_content: "bbraft-node data root v1\n"
+
+# net.ipv4.ip_forward persistence (tasks/ip-forward.yml). Fixed production
+# values, not supported settings: the role-local tests (tests/ip-forward.yml)
+# override them with set_fact to use a temporary file and the invoking user.
+bbraft_node_ip_forward_conf: /etc/sysctl.d/60-bbraft-node.conf
+bbraft_node_ip_forward_owner: root
+bbraft_node_ip_forward_group: root

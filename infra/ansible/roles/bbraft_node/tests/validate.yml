@@ -1,0 +1,15 @@
+# Validation only, local connection: no user, directory, binary or systemd
+# unit is touched. run.sh uses this play for the rejection cases too.
+- name: Validate the bbraft_node role
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars.yml
+  vars:
+    bbraft_node_binary_src: "{{ playbook_dir }}/fixtures/bbraft-node"
+  tasks:
+    - name: Validate the inputs
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate

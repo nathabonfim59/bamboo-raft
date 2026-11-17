@@ -1,0 +1,10 @@
+# Placeholders only: no real host, account id, password or key.
+bbraft_server_database_url: "postgresql://bbraft:placeholder-password@127.0.0.1:5432/bbraft?sslmode=disable"
+bbraft_server_gateway_token: "placeholder-gateway-token-not-real"
+bbraft_server_api_keys:
+  - id: main
+    owner: acct_placeholder
+    key: bmb_placeholder_key_not_real
+bbraft_server_node_tokens:
+  - id: node-example
+    tokenSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

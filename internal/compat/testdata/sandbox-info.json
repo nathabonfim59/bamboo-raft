@@ -1,0 +1,27 @@
+{
+  "ok": true,
+  "type": "sandbox.info",
+  "sandbox": {
+    "id": "bx_23456789",
+    "name": "Sandbox 2026-11-08 12:00",
+    "state": "idle",
+    "error": null,
+    "labels": {},
+    "type": "default",
+    "vcpu": 4,
+    "memoryGB": 8,
+    "billingMultiplier": 1,
+    "url": "https://machine.example.test",
+    "ip": "203.0.113.10",
+    "createdAt": "2026-11-08T12:00:00Z",
+    "updatedAt": "2026-11-08T12:05:00Z",
+    "archiveAfter": "2026-11-08T13:00:00Z",
+    "ttlSeconds": 3600,
+    "desktopAvailable": false,
+    "desktopUrl": null,
+    "snapshots": true,
+    "monitoring": true,
+    "snapshotAvailable": false,
+    "snapshotCompletedAt": null
+  }
+}

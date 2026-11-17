@@ -1,0 +1,95 @@
+# Installs the caller-built binary, writes every credential file and renders
+# the unit. Imported by main.yml after the user/directories exist, and directly
+# by the role-local render test, which points the paths at a temporary tree.
+
+- name: Install the caller-built bbraft-server binary
+  ansible.builtin.copy:
+    src: "{{ bbraft_server_binary_src }}"
+    dest: "{{ bbraft_server_binary_path }}"
+    owner: "{{ bbraft_server_binary_owner }}"
+    group: "{{ bbraft_server_binary_group }}"
+    mode: "{{ bbraft_server_binary_mode }}"
+  notify: Restart bbraft-server
+
+- name: Write the database URL file
+  ansible.builtin.copy:
+    dest: "{{ bbraft_server_database_url_file }}"
+    content: "{{ bbraft_server_database_url }}\n"
+    owner: "{{ bbraft_server_file_owner }}"
+    group: "{{ bbraft_server_file_group }}"
+    mode: "{{ bbraft_server_secret_mode }}"
+  no_log: true
+  notify: Restart bbraft-server
+
+- name: Write the internal gateway credential file
+  ansible.builtin.copy:
+    dest: "{{ bbraft_server_gateway_token_file }}"
+    content: "{{ bbraft_server_gateway_token }}\n"
+    owner: "{{ bbraft_server_file_owner }}"
+    group: "{{ bbraft_server_file_group }}"
+    mode: "{{ bbraft_server_secret_mode }}"
+  no_log: true
+  notify: Restart bbraft-server
+
+- name: Write the raw 32-byte secrets master key
+  ansible.builtin.copy:
+    src: "{{ bbraft_server_master_key_source }}"
+    dest: "{{ bbraft_server_master_key_file }}"
+    remote_src: "{{ bbraft_server_master_key_remote_src | bool }}"
+    owner: "{{ bbraft_server_file_owner }}"
+    group: "{{ bbraft_server_file_group }}"
+    mode: "{{ bbraft_server_secret_mode }}"
+  no_log: true
+  notify: Restart bbraft-server
+
+- name: Read the installed master key size
+  ansible.builtin.stat:
+    path: "{{ bbraft_server_master_key_file }}"
+    get_checksum: false
+  register: bbraft_server_master_key
+  when: not ansible_check_mode
+
+# The server refuses anything but exactly 32 raw bytes. Check the copied file,
+# not the source, so a partial copy cannot slip through.
+- name: The master key file is exactly 32 bytes
+  ansible.builtin.assert:
+    that: bbraft_server_master_key.stat.size == 32
+    fail_msg: >-
+      {{ bbraft_server_master_key_file }} is
+      {{ bbraft_server_master_key.stat.size }} bytes; the secrets master key
+      must be exactly 32 raw bytes
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Write the configured raw API keys
+  ansible.builtin.copy:
+    dest: "{{ bbraft_server_api_keys_file }}"
+    content: "{{ {'keys': bbraft_server_api_keys} | to_nice_json }}\n"
+    owner: "{{ bbraft_server_file_owner }}"
+    group: "{{ bbraft_server_file_group }}"
+    mode: "{{ bbraft_server_secret_mode }}"
+  no_log: true
+  notify: Restart bbraft-server
+  when: bbraft_server_api_keys | length > 0
+
+- name: Write the node token digests
+  ansible.builtin.copy:
+    dest: "{{ bbraft_server_node_tokens_file }}"
+    content: "{{ {'nodes': bbraft_server_node_tokens} | to_nice_json }}\n"
+    owner: "{{ bbraft_server_file_owner }}"
+    group: "{{ bbraft_server_file_group }}"
+    mode: "{{ bbraft_server_secret_mode }}"
+  no_log: true
+  notify: Restart bbraft-server
+  when: bbraft_server_node_tokens | length > 0
+
+- name: Write the hardened systemd unit
+  ansible.builtin.template:
+    src: bbraft-server.service.j2
+    dest: "{{ bbraft_server_unit_path }}"
+    owner: "{{ bbraft_server_unit_owner }}"
+    group: "{{ bbraft_server_unit_group }}"
+    mode: "{{ bbraft_server_unit_mode }}"
+  notify:
+    - Reload systemd
+    - Restart bbraft-server

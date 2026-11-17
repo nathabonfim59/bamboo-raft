@@ -1,0 +1,2 @@
+# Rejected because a quote would escape the PostgreSQL setting.
+postgres_listen_addresses: "127.0.0.1'x"

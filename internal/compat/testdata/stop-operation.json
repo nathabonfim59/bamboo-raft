@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "type": "stop.status",
+  "id": "bx_23456789",
+  "stop": {
+    "id": "stop_0123456789abcdef",
+    "status": "completed",
+    "requestedAt": "2026-11-11T10:00:00Z",
+    "lastAttemptAt": "2026-11-11T10:00:05Z",
+    "error": null,
+    "endedAt": "2026-11-11T10:00:05Z",
+    "forced": false
+  }
+}

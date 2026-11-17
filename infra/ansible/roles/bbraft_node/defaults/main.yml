@@ -1,0 +1,244 @@
+# bbraft-node: the agent on one Debian 13 KVM host.
+#
+# The role installs a caller-built binary (or a checksum-pinned download),
+# the root-owned directories of a fresh v1 data root, immutable verified guest
+# images, the node token and a hardened systemd unit for the root jail
+# supervisor: every QEMU and qemu-img runs jailed on its own uid (A10). Every flag name and default below is the contract in
+# cmd/bbraft-node/config.go; the environment fallback is the same name with
+# dots and dashes replaced by underscores, upper-cased and prefixed BBRAFT_.
+
+# --- Required caller inputs (empty means "must be supplied") ---------------
+
+# Exactly one of these identifies the bbraft-node binary. A local source is
+# copied from the controller; a URL is downloaded. Both require sha256, and a
+# checksum mismatch aborts before the installed binary is touched.
+bbraft_node_binary_src: ""
+bbraft_node_binary_url: ""
+bbraft_node_binary_sha256: ""
+
+# Exactly one of these supplies the raw node token. The value alternative is
+# written with no_log; the file alternative is copied byte-for-byte. The
+# installed file is owned by the service user, mode 0600.
+bbraft_node_token: ""
+bbraft_node_token_src: ""
+
+# Guest image version directories (local paths on the controller). At least
+# one is required: bbraft-node refuses to start without a verified image. Each
+# must contain exactly the five published files and a manifest whose id
+# matches the directory basename. Artifacts are checked against their manifest
+# sha256 and size before the first install; published versions are immutable
+# and are never replaced or deleted here.
+bbraft_node_images: []
+
+# --- Identity, paths and ownership -----------------------------------------
+
+# bbraft-node runs as root: the jailer stages a root-owned runtime and gives
+# each QEMU and qemu-img attempt its own uid from bbraft_node_jail_uid_range.
+# The Phase 0.5 bbraft-node account is no longer created; an existing one is
+# left in place (docs/node.md).
+bbraft_node_kvm_group: kvm
+bbraft_node_service: bbraft-node
+
+# Fresh v1 paths (D-b): a Phase 0.5 data root (/var/lib/bbraft-node) and its
+# token are never reused, chowned or migrated. The role refuses an existing
+# data dir that is not an empty or marked v1 root before changing anything.
+bbraft_node_config_dir: /etc/bbraft-node-v1
+bbraft_node_data_dir: /var/lib/bbraft-node-v1
+bbraft_node_image_dir: "{{ bbraft_node_data_dir }}/images"
+bbraft_node_token_file: "{{ bbraft_node_config_dir }}/node.token"
+bbraft_node_binary_path: /usr/local/bin/bbraft-node
+# The unit file is named after the service: the rendered jail cgroup is
+# /sys/fs/cgroup/system.slice/<service>.service (validate.yml refuses a
+# unit_path whose basename differs).
+bbraft_node_unit_path: "/etc/systemd/system/{{ bbraft_node_service }}.service"
+bbraft_node_udev_rule_path: /etc/udev/rules.d/60-bbraft-kvm.rules
+bbraft_node_modules_load_path: /etc/modules-load.d/bbraft-vhost-vsock.conf
+
+bbraft_node_config_mode: "0750"
+bbraft_node_data_mode: "0700"
+bbraft_node_image_mode: "0555"
+bbraft_node_image_file_mode: "0444"
+bbraft_node_secret_mode: "0600"
+bbraft_node_binary_mode: "0755"
+bbraft_node_unit_mode: "0644"
+bbraft_node_udev_mode: "0644"
+bbraft_node_modules_load_mode: "0644"
+
+# Published image versions are root-owned and read-only to the service.
+bbraft_node_image_owner: root
+bbraft_node_image_group: root
+
+# The data root, config directory and token belong to the root supervisor.
+bbraft_node_data_owner: root
+bbraft_node_data_group: root
+bbraft_node_config_owner: root
+bbraft_node_config_group: root
+bbraft_node_token_owner: root
+bbraft_node_token_group: root
+
+# Root-owned system files. The role-local render test overrides these to its
+# own user because it runs without privilege.
+bbraft_node_binary_owner: root
+bbraft_node_binary_group: root
+bbraft_node_unit_owner: root
+bbraft_node_unit_group: root
+bbraft_node_udev_owner: root
+bbraft_node_udev_group: root
+bbraft_node_modules_load_owner: root
+bbraft_node_modules_load_group: root
+
+# Set false only in role-local render tests, which must not touch systemd,
+# udev or a real host.
+bbraft_node_manage_service: true
+
+# These guards are true on a real Debian 13 node and false in local render
+# tests running on another distribution without /dev/kvm.
+bbraft_node_require_debian: true
+bbraft_node_require_devices: true
+
+bbraft_node_packages:
+  - qemu-system-x86
+  - qemu-utils
+  - passt
+  # Production TAP networking: the node runs ip and nft itself.
+  - iproute2
+  - nftables
+
+# Kernel modules the jailed QEMU path needs before the service starts: TAP
+# devices, vhost-net and the guest-agent vsock. They are persisted in
+# bbraft_node_modules_load_path and loaded now; a module that is neither
+# loaded nor built in fails the play.
+bbraft_node_kernel_modules:
+  - tun
+  - vhost_net
+  - vhost_vsock
+
+# The production device nodes, all required to be character devices.
+bbraft_node_required_devices:
+  - /dev/kvm
+  - /dev/vhost-vsock
+  - /dev/vhost-net
+  - /dev/net/tun
+
+# findmnt argv prefix for the data-root mount check (role tests substitute a
+# fake that maps paths to mount options).
+bbraft_node_findmnt: [findmnt]
+
+# --- Exact bbraft-node flags (cmd/bbraft-node/config.go defaults) ----------
+
+# Plaintext phase 0.5 link: localhost, loopback or a private (RFC 1918 / ULA)
+# literal IP only. TLS is a later phase.
+bbraft_node_server_addr: 127.0.0.1:7701
+
+# Empty is the binary's default: it uses the hostname. The role omits
+# -node.id rather than guessing an identity from the inventory name.
+bbraft_node_id: ""
+bbraft_node_default_image: ""
+bbraft_node_cpu_model: Haswell-noTSX
+# bbraft-node owns host detection: auto adds +vmx only on Intel+vmx and is
+# off on AMD (phase 0.5 has no +svm); on with an unsupported host is a startup
+# error; off disables it. The role only validates and emits this mode.
+bbraft_node_cpu_nested: auto
+# Extra QEMU CPU feature toggles (-node.cpu-features), each "+name" or
+# "-name". Normally empty: when the host lacks optional nested VMX features
+# (APICv on desktop CPUs) the node turns exactly those off itself and logs a
+# warning. vmx/svm belong to bbraft_node_cpu_nested.
+bbraft_node_cpu_features: []
+bbraft_node_boot_timeout: 2m
+
+# 0 means autodetect the host scaled by the overcommit ratio below, minus the
+# reserve. Non-zero values are checked by the binary against the scaled
+# detected bound; the role only rejects values that cannot be represented.
+bbraft_node_capacity_vcpus: 0
+bbraft_node_capacity_memory_mib: 0
+bbraft_node_capacity_disk_gib: 0
+
+# Finite positive multipliers on the detected host resource. A detected
+# capacity offers floor(detected * ratio) minus the reserve; an explicit
+# capacity must not exceed floor(detected * ratio). 1.0 keeps the strict
+# no-overcommit behavior; a per-VM vCPU request never exceeds the host CPU
+# count at any ratio.
+bbraft_node_cpu_overcommit: 1.0
+bbraft_node_memory_overcommit: 1.0
+bbraft_node_disk_overcommit: 1.0
+
+bbraft_node_reserve_vcpus: 1
+bbraft_node_reserve_memory_mib: 1024
+bbraft_node_reserve_disk_gib: 1
+
+# --- VM networking (production TAP; cmd/bbraft-node/config.go) -------------
+
+# The role always deploys the production TAP mode. The node binary also has an
+# explicit dev/test user-network fallback (-node.network-mode=user); this role
+# refuses that value, so an inventory cannot silently deploy the fallback.
+bbraft_node_network_mode: tap
+
+# The per-node bridge that carries every VM TAP. The node creates it when it
+# is absent; the private inventory supplies the real host interface name, and
+# the hardening role's hardening_vm_bridge_interfaces must name the same one.
+bbraft_node_network_bridge: bbraft0
+
+# Required caller inputs: the private guest range and the node's address in
+# it. Guests are addressed statically from this range, so it must not overlap
+# the host's management, tailnet or public networks. 10.42.0.0/16 here is a
+# documentation placeholder only; the inventory supplies the real range.
+bbraft_node_network_prefix: ""
+bbraft_node_network_gateway: ""
+
+# Guests' DNS resolvers: public unicast IPv4 addresses only, at most two
+# because QEMU's direct-boot ip= parameter carries two nameservers. Guests
+# never use the host's resolvers.
+bbraft_node_network_resolvers:
+  - 1.1.1.1
+  - 9.9.9.9
+
+# Networks a guest must never reach, as IPv4 prefixes (the node's management
+# or tailnet network and anything else private to the host). The node's own
+# built-in isolation already blocks RFC 1918, CGNAT, loopback and link-local;
+# this adds operator-specific networks.
+bbraft_node_network_management: []
+
+# Required caller inputs: the reachable address SSH ingress ports are
+# published on, the host interface that ingress is bound to, and the bounded
+# inclusive DNAT port pool (min-max). The interface must differ from the VM
+# bridge. The private inventory supplies the real host values; examples use
+# documentation addresses only.
+bbraft_node_ssh_ingress_addr: ""
+bbraft_node_ssh_ingress_iface: ""
+bbraft_node_ssh_port_range: ""
+
+# --- Jailed QEMU (cmd/bbraft-node jail flags; required in tap mode) ---------
+
+# Required caller input: the inclusive host uid=gid pool, min-max with
+# 0 < min < max < 2^31. Every VM, the CPU probe and each qemu-img attempt
+# reserves one uid. No host account or group may use an id in the range.
+bbraft_node_jail_uid_range: ""
+
+# Trusted root-owned executables staged into every jail.
+bbraft_node_jail_qemu_binary: /usr/bin/qemu-system-x86_64
+bbraft_node_jail_tool_binary: /usr/bin/qemu-img
+
+# Trusted firmware files staged read-only into every jail: exactly the
+# Debian 13 files direct-kernel boot needs (no option ROM: virtio-net uses
+# romfile=).
+bbraft_node_jail_firmware:
+  - /usr/share/seabios/bios-256k.bin
+  - /usr/share/qemu/linuxboot_dma.bin
+  - /usr/share/qemu/kvmvapic.bin
+
+# Directories searched for QEMU's ELF libraries; empty uses the binary's
+# Debian multiarch defaults (the flag is omitted).
+bbraft_node_jail_library_dirs: []
+
+# Required caller inputs: MAJ:MIN of the whole disk holding the data and
+# image dirs, and at least one positive per-VM io.max rate. 0 omits a rate;
+# no hardware-specific default is guessed.
+bbraft_node_jail_io_device: ""
+bbraft_node_jail_io_read_bps: 0
+bbraft_node_jail_io_write_bps: 0
+bbraft_node_jail_io_read_iops: 0
+bbraft_node_jail_io_write_iops: 0
+
+# DelegateSubgroup= needs systemd 254 or newer; checked on real hosts only
+# (bbraft_node_manage_service).
+bbraft_node_systemd_min_version: 254

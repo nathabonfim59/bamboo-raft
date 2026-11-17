@@ -1,0 +1,8 @@
+# Invalid input: the loader defaults an empty id to the owner, so this
+# explicit id collides with the second entry's effective id.
+bbraft_server_api_keys:
+  - id: acct_placeholder
+    owner: acct_other
+    key: bmb_placeholder_key_one
+  - owner: acct_placeholder
+    key: bmb_placeholder_key_two

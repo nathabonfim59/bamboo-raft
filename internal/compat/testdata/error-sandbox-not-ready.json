@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 409,
+  "code": "sandbox_not_ready",
+  "message": "the sandbox stopped with an error and cannot be resumed; delete it instead",
+  "error": {
+    "code": "sandbox_not_ready",
+    "message": "the sandbox stopped with an error and cannot be resumed; delete it instead",
+    "status": 409,
+    "details": {"retryable": false}
+  },
+  "requestId": "req_example"
+}

@@ -1,0 +1,54 @@
+# Publishes one verified staging directory with no-clobber semantics. Imported
+# by image-install.yml after image-verify-staging.yml, and directly by the
+# collision regression test. Another apply may publish the same id while this
+# one stages; mv -nT never replaces the winner, and the staging directory is
+# removed by the caller's always block.
+- name: Re-check whether the destination appeared while staging
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_image_dest }}"
+    get_checksum: false
+    follow: false
+  register: bbraft_node_publish_dest
+
+- name: Another apply must not have published this id first
+  ansible.builtin.assert:
+    that: not bbraft_node_publish_dest.stat.exists
+    fail_msg: >-
+      {{ bbraft_node_image_dest }} appeared while this apply was staging;
+      refusing to replace the version another apply just published
+    quiet: true
+
+- name: Publish the staged image version with no-clobber
+  ansible.builtin.command:
+    argv: [mv, -nT, --, "{{ bbraft_node_image_staging }}", "{{ bbraft_node_image_dest }}"]
+  register: bbraft_node_publish_move
+  notify: Restart bbraft-node
+
+- name: Read the staging path after the no-clobber publish
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_image_staging }}"
+    get_checksum: false
+    follow: false
+  register: bbraft_node_publish_staging
+
+- name: The staged version was published and not skipped by no-clobber
+  ansible.builtin.assert:
+    that: not bbraft_node_publish_staging.stat.exists
+    fail_msg: >-
+      mv -n refused to publish {{ bbraft_node_image_dest }} because another
+      apply won the race; the existing version was not replaced
+    quiet: true
+
+- name: Read the published image manifest
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_image_dest }}/manifest.json"
+    get_checksum: false
+  register: bbraft_node_publish_manifest
+
+- name: The image version was published
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_publish_manifest.stat.exists
+      - bbraft_node_publish_manifest.stat.isreg
+    fail_msg: "{{ bbraft_node_image_dest }}/manifest.json was not published"
+    quiet: true

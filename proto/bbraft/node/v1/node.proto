@@ -1,0 +1,539 @@
+// Server ⇄ node contract. Frozen: a change needs the maintainers' approval
+// of the exact diff.
+//
+// Transport: the NODE dials the control plane (internal/nodelink) and then
+// serves this service on that connection; the server is the gRPC client.
+//
+// Errors are gRPC status codes, and the server maps them to API errors:
+//   NOT_FOUND            unknown sandbox or snapshot      → 404 not_found / snapshot_not_found
+//   INVALID_ARGUMENT     bad path, bad request            → 400 invalid_path / invalid_json
+//   FAILED_PRECONDITION  VM exists but is not READY       → 409 sandbox_not_ready
+//   RESOURCE_EXHAUSTED   no room for the VM on this node  → 503 out_of_capacity
+//   ALREADY_EXISTS       snapshot id taken, move target exists → 409
+//   ABORTED              CreateVM/StartVM fenced by a DeleteVM → the sandbox is gone
+//   OUT_OF_RANGE         ReadFile larger than max_bytes   → 413 file_too_large
+//   UNAVAILABLE          SSH host key not generated yet   → 503 ssh_host_key_unavailable
+//
+// FAILED_PRECONDITION always means "the VM is not in a state that allows
+// this call" (not READY, or for StopVM still BOOTING). Never use it for a
+// file-level condition; those are INVALID_ARGUMENT, NOT_FOUND or
+// ALREADY_EXISTS as each RPC documents, and NOT_FOUND for a missing path is
+// only returned once the sandbox itself is known.
+//
+// Phase 1 additions (stop/start, detached processes, files, SSH) keep the
+// Phase 0.5 RPCs unchanged.
+//   anything else        node or guest failure            → 502 sandbox_direct_failed
+syntax = "proto3";
+
+package bbraft.node.v1;
+
+option go_package = "github.com/nathabonfim59/bamboo-raft/internal/proto/nodev1;nodev1";
+
+service Node {
+  // Info describes the node and what it holds locally.
+  rpc Info(InfoRequest) returns (InfoResponse);
+
+  // CreateVM boots a sandbox VM and returns once its guest agent answers
+  // (state READY), or fails. It blocks for the whole boot; the caller sets the
+  // deadline. Idempotent on sandbox_id: a call for a VM that already exists
+  // waits for it and returns it, whatever the other fields say.
+  //
+  // If the caller gives up (cancel, deadline, lost link), the boot may go on
+  // or stop: afterwards the VM is either visible through GetVM/ListVMs or
+  // gone. The caller resolves that with GetVM, a new CreateVM or DeleteVM.
+  rpc CreateVM(CreateVMRequest) returns (VM);
+
+  // GetVM returns NOT_FOUND for an unknown sandbox_id.
+  rpc GetVM(GetVMRequest) returns (VM);
+
+  // ListVMs returns every VM the node has, for reconciliation after restarts.
+  rpc ListVMs(ListVMsRequest) returns (ListVMsResponse);
+
+  // DeleteVM kills the VM and removes its disk. Idempotent: an unknown
+  // sandbox_id is OK. Snapshots taken from the VM stay.
+  //
+  // It fences boots: when DeleteVM returns OK, no CreateVM for that
+  // sandbox_id that started before it can still create the VM. Such a boot is
+  // aborted (its CreateVM fails, code ABORTED) and waited for, and nothing of
+  // it stays on disk. Only a CreateVM that starts after DeleteVM returned can
+  // create the VM again.
+  rpc DeleteVM(DeleteVMRequest) returns (DeleteVMResponse);
+
+  // Exec runs `bash -lc <command>` in the guest as the unprivileged user
+  // `user` (HOME=/home/user) and streams its output. The stream is exactly:
+  // one `started`, any number of `stdout`/`stderr` chunks in write order, then
+  // one `exit`. Cancelling the RPC kills the command's whole process group.
+  rpc Exec(ExecRequest) returns (stream ExecEvent);
+
+  // PutFile writes one file in the guest. The first message is the header,
+  // the rest are data chunks (any size up to 1 MiB each). Parent directories
+  // are created (owned by `user`); an existing file is replaced atomically
+  // once all data arrived. Paths resolve as in the v1 API: relative to
+  // /home/user, and must end up under /home/user or /tmp (else
+  // INVALID_ARGUMENT).
+  rpc PutFile(stream PutFileRequest) returns (PutFileResponse);
+
+  // SaveSnapshot captures the VM's disk under snapshot_id while the VM keeps
+  // running (file systems frozen for the copy). CreateVM with from_snapshot
+  // then starts a new VM with that disk. A STOPPED VM's kept disk can be
+  // saved too (Phase 1); any other state is FAILED_PRECONDITION.
+  rpc SaveSnapshot(SaveSnapshotRequest) returns (Snapshot);
+
+  // DeleteSnapshot is idempotent: an unknown snapshot_id is OK. VMs created
+  // from it keep working.
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
+
+  // --- Stop and start (Phase 1) ---------------------------------------------
+  //
+  // A STOPPED VM has no QEMU process and holds no vCPU or memory capacity,
+  // only its disk on this node. It survives node restarts and is listed by
+  // ListVMs. DeleteVM removes it with its disk. CreateVM for a sandbox_id
+  // that exists in any state (including STOPPED) returns it unchanged and
+  // never boots it; StartVM does that.
+
+  // StopVM shuts the VM down and keeps its disk. The guest gets up to
+  // grace_seconds to sync and power off (ACPI/agent), then QEMU is killed;
+  // either way the disk is flushed and kept. Every process in the guest ends;
+  // detached processes keep their logs on the disk and report LOST after the
+  // next start. Returns the VM in state STOPPED.
+  //
+  // Idempotent: a STOPPED VM returns OK at once; a concurrent StopVM waits
+  // for the same stop. A FAILED VM stops too (QEMU killed if still running).
+  // A VM that is BOOTING (CreateVM or StartVM in flight) is
+  // FAILED_PRECONDITION: the caller retries after the boot ends.
+  rpc StopVM(StopVMRequest) returns (VM);
+
+  // StartVM boots a STOPPED VM from its kept disk and returns once its guest
+  // agent answers (READY), with CreateVM's blocking, cancellation and
+  // DeleteVM-fencing rules. resources may change vCPUs and memory, and may
+  // grow the disk (the guest grows its filesystem at boot); a smaller disk is
+  // INVALID_ARGUMENT. env and hostname replace the VM's previous values.
+  // Capacity is checked like CreateVM (RESOURCE_EXHAUSTED).
+  //
+  // Idempotent: a READY VM returns at once; a BOOTING one is waited for.
+  // STOPPING is waited for and then started. A FAILED VM is
+  // FAILED_PRECONDITION (StopVM it first). NOT_FOUND for an unknown VM.
+  rpc StartVM(StartVMRequest) returns (VM);
+
+  // --- Detached processes (Phase 1) -------------------------------------------
+  //
+  // A detached process runs `bash -lc <command>` like Exec, in its own
+  // session and process group, independent of any RPC: cancelling a call
+  // never touches it. Its stdout and stderr go to log files on the guest disk
+  // (log_path, err_log_path) and are read back by byte offset. Logs and the
+  // final status survive StopVM/StartVM; a process that was running when the
+  // VM stopped reports LOST. process_id is chosen by the server, unique per
+  // sandbox and never reused.
+
+  // StartProcess starts a detached process and returns once it runs (state
+  // RUNNING, pid set) or already ended. Idempotent on process_id: an existing
+  // process_id returns that process, whatever the other fields say.
+  // INVALID_ARGUMENT for process_id 0 or a bad cwd.
+  rpc StartProcess(StartProcessRequest) returns (Process);
+
+  // GetProcess returns the process and a window of its output (see
+  // GetProcessRequest). NOT_FOUND for an unknown process_id.
+  rpc GetProcess(GetProcessRequest) returns (ProcessOutput);
+
+  // AttachProcess streams a process's output from the given offsets: one
+  // `attached`, then `stdout`/`stderr` chunks in write order per stream (no
+  // gaps, no repeats), then, once the process has ended and all of its output
+  // was sent, one `exit`, and the stream closes. A process that already
+  // ended sends its remaining output and `exit` at once. Cancelling the RPC
+  // only stops the stream. Offsets past the end of a log start at its end.
+  rpc AttachProcess(AttachProcessRequest) returns (stream ProcessEvent);
+
+  // KillProcess sends SIGTERM to the process group, then SIGKILL to whatever
+  // is left after grace_seconds, and returns once the process ended.
+  // Idempotent: an ended process returns with signaled=false.
+  rpc KillProcess(KillProcessRequest) returns (KillProcessResponse);
+
+  // --- Files (Phase 1) -------------------------------------------------------
+  //
+  // Paths resolve as for PutFile: relative to /home/user, and the cleaned
+  // path must be under /home/user or /tmp, with symlinks never escaping
+  // those roots (INVALID_ARGUMENT otherwise). Operations run as `user`.
+  // NOT_FOUND: the path does not exist. File type problems (reading a
+  // directory, listing a file, a non-empty directory without recursive) are
+  // INVALID_ARGUMENT. The roots themselves (/home/user, /tmp) cannot be
+  // deleted or moved (INVALID_ARGUMENT).
+
+  // ReadFile streams one regular file: first `info`, then `data` chunks of at
+  // most 1 MiB in order. A file larger than max_bytes (when non-zero) is
+  // OUT_OF_RANGE before any data is sent.
+  rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
+
+  // StatFile describes one path (see FileInfo for symlinks).
+  rpc StatFile(StatFileRequest) returns (FileInfo);
+
+  // ListFiles lists a directory's direct entries, sorted by name, at most
+  // limit of them (truncated set when more exist).
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+
+  // DeleteFile removes a file, a symlink (not its target) or an empty
+  // directory; with recursive, a directory and everything in it.
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+
+  // MakeDir creates a directory and its missing parents (owned by `user`).
+  // An existing directory is OK and keeps its mode; an existing non-directory
+  // is ALREADY_EXISTS.
+  rpc MakeDir(MakeDirRequest) returns (FileInfo);
+
+  // MoveFile renames source to destination, creating destination's missing
+  // parents. An existing destination is ALREADY_EXISTS unless overwrite,
+  // which replaces a file or an empty directory.
+  rpc MoveFile(MoveFileRequest) returns (MoveFileResponse);
+
+  // ChmodFile sets permission bits (at most 0o7777, else INVALID_ARGUMENT).
+  rpc ChmodFile(ChmodFileRequest) returns (FileInfo);
+
+  // --- SSH (Phase 1) -----------------------------------------------------------
+
+  // AddSSHKey adds one OpenSSH public key to the guest user's
+  // authorized_keys (an identical key is not added twice) and returns how to
+  // reach the guest's sshd from outside the node: host and port are either
+  // the VM's own reachable address and 22, or a node address and a port the
+  // node forwards to the VM's port 22. INVALID_ARGUMENT for a key that is not
+  // one valid public key line (no options, no newlines). UNAVAILABLE while the
+  // guest's host key does not exist yet.
+  rpc AddSSHKey(AddSSHKeyRequest) returns (SSHAccess);
+}
+
+message InfoRequest {}
+
+message InfoResponse {
+  string node_id = 1;
+  // Total vCPU and memory offer after host reserve.
+  uint32 vcpus = 2;
+  uint64 memory_mib = 3;
+  // Disk still available to new sandboxes now, net of this node's own disk
+  // reservations and capped by the node's offer.
+  uint64 disk_free_mib = 4;
+  string cpu_model = 5;     // QEMU -cpu model, e.g. "Haswell-noTSX"
+  string qemu_version = 6;  // e.g. "10.0.13"
+  repeated Image images = 7;
+  repeated Snapshot snapshots = 8;
+  string default_image = 9;
+}
+
+message Image {
+  string id = 1;  // version id, e.g. "ubuntu-24.04-v0"
+  string sha256 = 2;
+}
+
+message Resources {
+  uint32 vcpus = 1;
+  uint64 memory_mib = 2;
+  uint64 disk_gib = 3;
+}
+
+enum VMState {
+  VM_STATE_UNSPECIFIED = 0;
+  VM_STATE_BOOTING = 1;  // QEMU started, guest agent not answering yet
+  VM_STATE_READY = 2;    // guest agent answers; Exec and PutFile work
+  VM_STATE_FAILED = 3;   // boot failed or the VM died; see VM.error
+  VM_STATE_STOPPING = 4; // StopVM in progress
+  VM_STATE_STOPPED = 5;  // no QEMU process; the disk is kept on this node
+}
+
+message CreateVMRequest {
+  string sandbox_id = 1;  // bx_xxxxxxxx
+  Resources resources = 2;
+  string image = 3;          // empty: the node's default image
+  string from_snapshot = 4;  // empty: a fresh disk from the image
+  map<string, string> env = 5;  // set for every Exec (Exec's own env wins)
+  string hostname = 6;
+}
+
+message VM {
+  string sandbox_id = 1;
+  VMState state = 2;
+  string image = 3;
+  string from_snapshot = 4;
+  Resources resources = 5;
+  int64 created_at_unix_ms = 6;
+  string error = 7;  // why FAILED
+  // When the VM last became READY (CreateVM or StartVM); 0 if never.
+  int64 started_at_unix_ms = 8;
+}
+
+message GetVMRequest { string sandbox_id = 1; }
+
+message ListVMsRequest {}
+
+message ListVMsResponse { repeated VM vms = 1; }
+
+message DeleteVMRequest { string sandbox_id = 1; }
+
+message DeleteVMResponse {}
+
+message ExecRequest {
+  string sandbox_id = 1;
+  string command = 2;  // run by bash -lc
+  // Relative to /home/user, or absolute. Empty: /home/user.
+  string cwd = 3;
+  map<string, string> env = 4;
+  // 0: no limit. On expiry the process group is killed and exit.timed_out set.
+  uint32 timeout_seconds = 5;
+}
+
+message ExecEvent {
+  oneof event {
+    Started started = 1;
+    bytes stdout = 2;
+    bytes stderr = 3;
+    Exit exit = 4;
+  }
+
+  message Started { int32 pid = 1; }
+
+  message Exit {
+    // Unset when the command did not exit by itself (signal, timeout).
+    optional int32 exit_code = 1;
+    string signal = 2;  // e.g. "SIGKILL", empty when it exited
+    bool timed_out = 3;
+    bool oom_killed = 4;
+    int64 duration_ms = 5;
+  }
+}
+
+message PutFileRequest {
+  oneof part {
+    Header header = 1;
+    bytes data = 2;
+  }
+
+  message Header {
+    string sandbox_id = 1;
+    string path = 2;
+    uint32 mode = 3;  // permission bits; 0 means 0644
+  }
+}
+
+message PutFileResponse {
+  string path = 1;  // canonical absolute path
+  int64 size = 2;
+}
+
+message SaveSnapshotRequest {
+  string sandbox_id = 1;
+  string snapshot_id = 2;  // chosen by the server, unique per node
+}
+
+message Snapshot {
+  string snapshot_id = 1;
+  string source_sandbox_id = 2;
+  string image = 3;
+  int64 size_bytes = 4;
+  int64 created_at_unix_ms = 5;
+}
+
+message DeleteSnapshotRequest { string snapshot_id = 1; }
+
+message DeleteSnapshotResponse {}
+
+// --- Phase 1 messages ---------------------------------------------------------
+
+message StopVMRequest {
+  string sandbox_id = 1;
+  uint32 grace_seconds = 2;  // 0: the node's default (30 s)
+}
+
+message StartVMRequest {
+  string sandbox_id = 1;
+  Resources resources = 2;      // unset: unchanged
+  map<string, string> env = 3;  // replaces the VM's env
+  string hostname = 4;          // empty: unchanged
+}
+
+enum ProcessState {
+  PROCESS_STATE_UNSPECIFIED = 0;
+  PROCESS_STATE_RUNNING = 1;
+  PROCESS_STATE_EXITED = 2;  // ended; exit is set
+  PROCESS_STATE_LOST = 3;    // ended without a recorded exit (VM stopped or died)
+}
+
+message Process {
+  uint32 process_id = 1;
+  int32 pid = 2;  // guest pid of the process group leader
+  ProcessState state = 3;
+  // Set when EXITED, with ExecEvent.Exit's meaning (exit_code unset when a
+  // signal ended it; timed_out is always false here).
+  ExecEvent.Exit exit = 4;
+  string command = 5;
+  string cwd = 6;  // canonical absolute working directory
+  int64 started_at_unix_ms = 7;
+  int64 finished_at_unix_ms = 8;  // 0 while RUNNING or when LOST
+  int64 stdout_size = 9;          // bytes written to the stdout log so far
+  int64 stderr_size = 10;
+  string log_path = 11;      // absolute guest path of the stdout log
+  string err_log_path = 12;  // absolute guest path of the stderr log
+}
+
+message StartProcessRequest {
+  string sandbox_id = 1;
+  uint32 process_id = 2;  // >= 1, chosen by the server
+  string command = 3;     // run by bash -lc
+  string cwd = 4;         // as ExecRequest.cwd
+  map<string, string> env = 5;  // merged over the VM's env, like Exec
+}
+
+// GetProcessRequest selects a window of each log.
+//
+// Without an offset for a stream, the window is the last limit_bytes of
+// that log (truncated set when the log is longer). With an offset, it is
+// the bytes from that offset, at most limit_bytes (more set when the log
+// goes on). Offsets past the end return no data at the log's end.
+message GetProcessRequest {
+  string sandbox_id = 1;
+  uint32 process_id = 2;
+  optional int64 stdout_offset = 3;
+  optional int64 stderr_offset = 4;
+  uint32 limit_bytes = 5;  // per stream; 0: 1 MiB; at most 8 MiB (INVALID_ARGUMENT above)
+}
+
+message ProcessOutput {
+  Process process = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+  int64 stdout_offset = 4;  // log offset of the first returned stdout byte
+  int64 stderr_offset = 5;
+  bool stdout_truncated = 6;  // tail mode: earlier output was left out
+  bool stderr_truncated = 7;
+  bool more = 8;  // offset mode: either log has bytes after the window
+}
+
+message AttachProcessRequest {
+  string sandbox_id = 1;
+  uint32 process_id = 2;
+  int64 stdout_offset = 3;
+  int64 stderr_offset = 4;
+}
+
+message ProcessEvent {
+  oneof event {
+    Attached attached = 1;
+    Chunk stdout = 2;
+    Chunk stderr = 3;
+    Process exit = 4;  // the final process record; the last message
+  }
+
+  message Attached {
+    Process process = 1;
+    int64 stdout_offset = 2;  // where this stream's stdout starts
+    int64 stderr_offset = 3;
+  }
+
+  message Chunk {
+    bytes data = 1;
+    int64 next_offset = 2;  // log offset just after data
+  }
+}
+
+message KillProcessRequest {
+  string sandbox_id = 1;
+  uint32 process_id = 2;
+  uint32 grace_seconds = 3;  // 0: 5 s
+}
+
+message KillProcessResponse {
+  Process process = 1;  // final state
+  bool signaled = 2;    // false when it had already ended
+}
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_REGULAR = 1;
+  FILE_TYPE_DIRECTORY = 2;
+  FILE_TYPE_OTHER = 3;  // device, socket, fifo, or a dangling/escaping symlink
+}
+
+// FileInfo describes a path. is_symlink reports the entry itself (lstat).
+// For a symlink whose target resolves inside the allowed roots, type, size
+// and mode describe the target; otherwise they describe the link (type
+// OTHER).
+message FileInfo {
+  string path = 1;  // canonical absolute path of the entry (not the target)
+  string name = 2;  // last path element
+  FileType type = 3;
+  bool is_symlink = 4;
+  int64 size = 5;
+  uint32 mode = 6;  // permission bits incl. setuid/setgid/sticky (0o7777)
+  int64 modified_at_unix_ms = 7;
+}
+
+message ReadFileRequest {
+  string sandbox_id = 1;
+  string path = 2;
+  int64 max_bytes = 3;  // 0: no limit
+}
+
+message ReadFileResponse {
+  oneof part {
+    FileInfo info = 1;  // first message
+    bytes data = 2;
+  }
+}
+
+message StatFileRequest {
+  string sandbox_id = 1;
+  string path = 2;
+}
+
+message ListFilesRequest {
+  string sandbox_id = 1;
+  string path = 2;
+  uint32 limit = 3;  // 0: 1000; at most 10000 (INVALID_ARGUMENT above)
+}
+
+message ListFilesResponse {
+  string path = 1;  // canonical absolute directory path
+  repeated FileInfo entries = 2;
+  bool truncated = 3;
+}
+
+message DeleteFileRequest {
+  string sandbox_id = 1;
+  string path = 2;
+  bool recursive = 3;
+}
+
+message DeleteFileResponse {
+  string path = 1;  // canonical absolute path
+}
+
+message MakeDirRequest {
+  string sandbox_id = 1;
+  string path = 2;
+  uint32 mode = 3;  // 0: 0755
+}
+
+message MoveFileRequest {
+  string sandbox_id = 1;
+  string source = 2;
+  string destination = 3;
+  bool overwrite = 4;
+}
+
+message MoveFileResponse {
+  string source = 1;       // canonical absolute paths
+  string destination = 2;
+}
+
+message ChmodFileRequest {
+  string sandbox_id = 1;
+  string path = 2;
+  uint32 mode = 3;
+}
+
+message AddSSHKeyRequest {
+  string sandbox_id = 1;
+  string public_key = 2;  // one authorized_keys line: type, base64, optional comment
+}
+
+message SSHAccess {
+  string user = 1;      // "user"
+  string host = 2;      // address to connect to
+  uint32 port = 3;
+  string host_key = 4;  // the guest's ed25519 host public key, OpenSSH format
+}

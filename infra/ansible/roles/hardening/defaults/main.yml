@@ -1,0 +1,24 @@
+# Host hardening for a tailnet-only bamboo-raft host: an nftables inbound
+# filter that only admits the tailnet, OpenSSH restrictions, and no LLMNR or
+# mDNS responders.
+
+# Interfaces that are fully trusted for inbound traffic.
+hardening_trusted_interfaces: [tailscale0]
+
+# VM bridges whose IPv4 traffic may be forwarded; the node's tables enforce isolation.
+hardening_vm_bridge_interfaces: []
+
+# Tailscale's WireGuard port, open on every interface so peers can connect
+# directly instead of through a relay. Empty list closes it (relay only).
+hardening_open_udp_ports: [41641]
+
+# Refuse to install the inbound filter unless Ansible itself reaches the host
+# through the tailnet, so applying it cannot cut the connection in use.
+hardening_require_tailnet_connection: true
+
+# Seconds after which the inbound filter is removed again unless Ansible
+# reconnects and confirms it. Protects against locking ourselves out.
+hardening_firewall_rollback_seconds: 300
+
+# The only accounts allowed to log in over SSH.
+hardening_ssh_allow_users: [debian]

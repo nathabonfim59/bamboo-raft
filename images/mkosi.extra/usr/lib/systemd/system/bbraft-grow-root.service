@@ -1,0 +1,16 @@
+[Unit]
+Description=Grow the bamboo-raft root filesystem to fill its block device
+Documentation=file:///usr/local/sbin/bbraft-grow-root
+DefaultDependencies=no
+After=systemd-remount-fs.service local-fs.target
+Before=basic.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/bbraft-grow-root
+TimeoutSec=infinity
+
+[Install]
+WantedBy=basic.target

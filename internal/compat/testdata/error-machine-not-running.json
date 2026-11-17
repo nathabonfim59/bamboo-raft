@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 409,
+  "code": "machine_not_running",
+  "message": "sandbox has no running machine",
+  "error": {
+    "code": "machine_not_running",
+    "message": "sandbox has no running machine",
+    "status": 409,
+    "details": {"state": "archived", "retryable": false}
+  },
+  "requestId": "req_example"
+}

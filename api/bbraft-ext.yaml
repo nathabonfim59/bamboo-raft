@@ -1,0 +1,248 @@
+openapi: 3.1.0
+info:
+  title: bamboo-raft API extensions
+  version: 0.5.0
+  description: |
+    Authenticated bamboo-raft extensions. They live under /api/bbraft, never
+    under the /api/v1 surface, so v1 clients never see them. The CLI uses the info endpoint to discover the exact command limits
+    this server enforces instead of guessing or silently truncating a timeout.
+servers:
+  - url: /api/bbraft
+security:
+  - BearerAuth: []
+tags:
+  - name: Extensions
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: sandbox_api_key
+  schemas:
+    SuccessBase:
+      type: object
+      required: [ok, type]
+      properties:
+        ok: { type: boolean }
+        type: { type: string }
+    ErrorEnvelope:
+      type: object
+      required: [ok, type, status, code, message, error, requestId]
+      properties:
+        ok: { type: boolean }
+        type: { type: string }
+        status: { type: integer }
+        code: { type: string }
+        message: { type: string }
+        requestId: { type: string }
+        error:
+          type: object
+          required: [code, message, status]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            status: { type: integer }
+            details:
+              type: object
+              additionalProperties: true
+    InfoCommands:
+      type: object
+      required: [streamMaxSeconds, syncMaxSeconds]
+      additionalProperties: false
+      properties:
+        streamMaxSeconds:
+          type: integer
+          minimum: 1
+          description: Maximum timeout for a streamed command.
+        syncMaxSeconds:
+          type: integer
+          minimum: 1
+          maximum: 600
+          description: Maximum timeout for a synchronous command.
+        detached:
+          type: boolean
+          description: |
+            Present and true when this server implements the detached
+            command start, status, attach and stop operations. An old server
+            omits the member or sends false. Only an explicit JSON boolean true
+            selects detached execution: an absent member or explicit false
+            keeps the legacy synchronous/streamed path, and a malformed
+            non-boolean value is a protocol error rather than a silent
+            fallback.
+    InfoResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [version, commands]
+          properties:
+            type: { type: string, const: bbraft.info }
+            version: { type: string }
+            commands: { $ref: '#/components/schemas/InfoCommands' }
+    UploadedFileResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [path, size]
+          properties:
+            type: { type: string, const: file.uploaded }
+            path: { type: string }
+            size: { type: integer, format: int64, minimum: 0 }
+paths:
+  /info:
+    get:
+      tags: [Extensions]
+      summary: Discover server metadata and command limits
+      description: |
+        Returns the build version and the command timeouts this server actually
+        enforces. The response contains no credential, node, host or account
+        data. Authentication is the same bearer API key as /api/v1.
+
+        `commands.detached: true` advertises the detached command start,
+        status, attach and stop operations. An old server omits the member or
+        sends false; the client then keeps the legacy synchronous/streamed
+        command path. The CLI reads this endpoint for `--timeout 0`, for a
+        positive exec timeout above 600 seconds (to choose detached or legacy
+        streaming), and once before a `run` create (to choose rolling or legacy
+        TTL). With `true` and `--timeout 0`, the detached start omits a timeout
+        entirely (unlimited); a legacy server receives the returned
+        streamMaxSeconds exactly. A 404 falls back to 600 with a note on stderr
+        (the v1-only case); any other failure or malformed response is an
+        error, never a silent fallback. The 7200-second streamed cap is
+        unchanged.
+      operationId: bbraftInfo
+      responses:
+        '200':
+          description: Server metadata and actual command limits.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InfoResponse' }
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /uploads/{token}:
+    put:
+      tags: [Extensions]
+      summary: Receive a signed upload stream
+      description: |
+        Streams the raw request body to the sandbox path named by the signed
+        upload token. This is the only API route that does not use the bearer
+        API key: the HMAC-signed token is the credential and authorizes exactly
+        one owner, sandbox and canonical path until it expires. The server
+        never derives the target from the request Host or proxy headers.
+
+        The body is forwarded to the guest in bounded chunks; the server never
+        buffers the whole upload. Any token failure answers the same 404 so the
+        receiver never says which check failed.
+      operationId: bbraftUploadReceiver
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: Opaque signed token from the upload-URL response.
+          schema: { type: string }
+      requestBody:
+        required: true
+        description: Raw file bytes, streamed without a multipart wrapper.
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: The guest stored the complete body at the signed path.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadedFileResponse' }
+        '400':
+          description: The request body could not be read.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '404':
+          description: The token is malformed, expired, tampered with, or names a missing sandbox.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '409':
+          description: The sandbox is not ready to accept an upload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '500':
+          description: A safe internal failure.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '502':
+          description: The node could not complete the upload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '405':
+          description: A method other than PUT reached the receiver; the token is never usable through it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /downloads/{token}:
+    get:
+      tags: [Extensions]
+      summary: Redeem a signed download URL
+      description: |
+        Streams the file named by the signed download token back as raw bytes.
+        This route does not use the bearer API key: the HMAC-signed token is
+        the credential and authorizes exactly one owner, sandbox and canonical
+        path until it expires. The server never derives the target from the
+        request Host or proxy headers.
+
+        The first node message is validated before any HTTP header is written,
+        so a missing file or unusable sandbox is a normal error envelope. After
+        the headers, a node failure aborts the connection rather than appending
+        an error to the file bytes. The body is streamed with backpressure and
+        is never buffered whole. Any token failure answers the same 404 so the
+        receiver never says which check failed.
+      operationId: bbraftDownloadReceiver
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: Opaque signed token from the download-URL response.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The file bytes, with Content-Disposition attachment and no size limit.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '400':
+          description: The signed path is not acceptable to the node.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '404':
+          description: The token is malformed, expired, tampered with, or names a missing sandbox or file.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '405':
+          description: A method other than GET reached the receiver; the token is never usable through it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '409':
+          description: The sandbox is not running or not ready to serve files.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '500':
+          description: A safe internal failure before the response headers.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '502':
+          description: The node could not open or finish the file stream.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }

@@ -1,0 +1,19 @@
+[Unit]
+Description=Generate a per-boot ed25519 SSH host key
+Documentation=man:sshd(8)
+DefaultDependencies=no
+After=local-fs.target
+# Order before every sshd entry point and before the guest agent can report
+# readiness, and regenerate only when the current boot has no key.
+Before=ssh.service ssh.socket ssh@.service bbraft-guest.service
+ConditionPathExists=!/run/ssh/ssh_host_ed25519_key
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/bbraft-ssh-host-key
+TimeoutSec=60
+
+[Install]
+WantedBy=multi-user.target

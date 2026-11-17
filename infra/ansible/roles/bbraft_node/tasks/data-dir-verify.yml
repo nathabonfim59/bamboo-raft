@@ -1,0 +1,12 @@
+# Re-proves, after the role's other tasks, that the data root is still the
+# acquired one: the same parent, root and marker inodes and the exact marker
+# (A10 fix A). Read-only.
+- name: The data root is still the acquired one
+  bbraft_node_data_root:
+    path: "{{ bbraft_node_data_dir }}"
+    owner: "{{ bbraft_node_data_owner }}"
+    group: "{{ bbraft_node_data_group }}"
+    marker_name: "{{ bbraft_node_data_marker_name }}"
+    marker_content: "{{ bbraft_node_data_marker_content }}"
+    mode: verify
+    expect: "{{ bbraft_node_data_root_acquired }}"

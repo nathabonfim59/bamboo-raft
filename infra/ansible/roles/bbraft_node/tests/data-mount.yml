@@ -1,0 +1,49 @@
+# A10 role fix C: the mount check probes the mount that actually holds the
+# data root: the data dir itself when it exists (it may be its own mount),
+# else its existing configured parent. A fake findmnt maps paths to mount
+# options; no real mount is touched.
+- name: Data-root mount target and options
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    dm_cases:
+      - {name: "existing data dir mounted noexec under a healthy parent", data_exists: true, child: "rw,nosuid,nodev,noexec", parent: "rw,relatime", expect: refuse}
+      - {name: "existing data dir mounted nodev", data_exists: true, child: "rw,nodev", parent: "rw", expect: refuse}
+      - {name: "existing healthy data dir under a noexec parent", data_exists: true, child: "rw,relatime", parent: "rw,noexec", expect: accept}
+      - {name: "absent data dir under a healthy parent", data_exists: false, child: "", parent: "rw,relatime", expect: accept}
+      - {name: "absent data dir under a nosuid parent", data_exists: false, child: "", parent: "rw,nosuid", expect: refuse}
+  tasks:
+    - name: Start with no failures
+      ansible.builtin.set_fact:
+        dm_failures: []
+
+    - name: Every case
+      ansible.builtin.include_tasks: data-mount-case.yml
+      loop: "{{ dm_cases }}"
+      loop_control:
+        loop_var: dm
+        label: "{{ dm.name }}"
+
+    - name: Absent data dir with an absent parent is refused
+      block:
+        - name: Check a missing parent
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: data-mount
+          vars:
+            bbraft_node_data_dir: /nonexistent-bbraft-parent/data
+            bbraft_node_findmnt: [python3, "{{ playbook_dir }}/fake-findmnt.py", /dev/null]
+        - name: A missing parent passed
+          ansible.builtin.set_fact:
+            dm_failures: "{{ dm_failures + ['a missing configured parent was accepted'] }}"
+      rescue:
+        - name: The missing parent was refused
+          ansible.builtin.set_fact:
+            dm_failures: "{{ dm_failures if 'parent' in (ansible_failed_result.msg | default('')) else dm_failures + ['missing parent refused for another reason: ' ~ (ansible_failed_result.msg | default(''))] }}"
+
+    - name: Every case behaved
+      ansible.builtin.assert:
+        that: dm_failures | length == 0
+        fail_msg: "{{ dm_failures | join(' | ') }}"
+        quiet: true

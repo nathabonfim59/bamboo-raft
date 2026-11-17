@@ -1,0 +1,4 @@
+- name: Restart systemd-resolved for Tailscale DNS
+  ansible.builtin.systemd_service:
+    name: systemd-resolved
+    state: restarted

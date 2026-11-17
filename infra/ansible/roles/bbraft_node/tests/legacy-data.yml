@@ -1,0 +1,63 @@
+# A10 D-b: Phase 0.5 -> Phase 1 requires a fresh data dir. The role's
+# read-only recognition runs before any file task: only an absent path, an
+# empty owner/group/0700 directory, or a directory holding the exact v1
+# marker is accepted; legacy data (including root-owned legacy data without
+# the marker), foreign owners, symlinks and bad markers are refused with the
+# tree unchanged. Local connection, temporary trees only.
+- name: Legacy and foreign data-dir recognition
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    lc_marker_name: .bbraft-node-data-v1
+    # sha256 of the exact marker bytes "bbraft-node data root v1\n".
+    lc_marker_sha256: "{{ 'bbraft-node data root v1\n' | hash('sha256') }}"
+    lc_user: "{{ ansible_facts['user_id'] }}"
+    lc_current: >-
+      mkdir -m 0700 "$D" && printf 'bbraft-node data root v1\n' >"$D/$M" && chmod 0600 "$D/$M"
+    lc_legacy_tree: >-
+      mkdir -m 0700 "$D" "$D/vms" "$D/vms/bx_aaaaaaaa" && printf '{}' >"$D/vms/bx_aaaaaaaa/vm.json" && : >"$D/node.lock"
+    lc_cases:
+      - {name: absent, setup: "", expect: accept}
+      - {name: empty owned directory, setup: 'mkdir -m 0700 "$D"', expect: accept}
+      - name: current v1 root with state
+        setup: '{{ lc_current }} && mkdir -m 0700 "$D/vms" && : >"$D/node.lock"'
+        expect: unchanged
+      - {name: root-owned legacy data without the marker, setup: "{{ lc_legacy_tree }}", expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: non-root legacy data, setup: "{{ lc_legacy_tree }}", owner: root, group: root, expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: non-root empty directory, setup: 'mkdir -m 0700 "$D"', owner: root, group: root, expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: owner mismatch only, setup: 'mkdir -m 0700 "$D"', owner: root, expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: group mismatch, setup: "{{ lc_current }}", group: root, expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: mode 0755, setup: 'mkdir -m 0700 "$D" && chmod 0755 "$D"', expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: symlink to a v1 root, setup: 'mkdir -m 0700 "$D.real" && printf "bbraft-node data root v1\n" >"$D.real/$M" && chmod 0600 "$D.real/$M" && ln -s "$D.real" "$D"', expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: regular file, setup: 'printf x >"$D"', expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: marker with other bytes, setup: 'mkdir -m 0700 "$D" && printf "bbraft-node data root v0\n" >"$D/$M" && chmod 0600 "$D/$M"', expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: marker without its newline, setup: 'mkdir -m 0700 "$D" && printf "bbraft-node data root v1" >"$D/$M" && chmod 0600 "$D/$M"', expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: marker is a symlink, setup: 'mkdir -m 0700 "$D" && printf "bbraft-node data root v1\n" >"$D.m" && chmod 0600 "$D.m" && ln -s "$D.m" "$D/$M"', expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: marker mode 0644, setup: "{{ lc_current }} && chmod 0644 \"$D/$M\"", expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: marker hard-linked, setup: "{{ lc_current }} && ln \"$D/$M\" \"$D.hard\"", expect: refuse, message: "not a bbraft-node v1 data root"}
+      - {name: marker is a directory, setup: 'mkdir -m 0700 "$D" "$D/$M"', expect: refuse, message: "not a bbraft-node v1 data root"}
+  tasks:
+    - name: The test user's primary group
+      ansible.builtin.command:
+        argv: [id, -gn]
+      register: lc_id_group
+      changed_when: false
+
+    - name: Name the test group
+      ansible.builtin.set_fact:
+        lc_group: "{{ lc_id_group.stdout }}"
+        lc_failures: []
+
+    - name: Every case
+      ansible.builtin.include_tasks: legacy-case.yml
+      loop: "{{ lc_cases }}"
+      loop_control:
+        loop_var: lc
+        label: "{{ lc.name }}"
+
+    - name: Every case behaved as recognized
+      ansible.builtin.assert:
+        that: lc_failures | length == 0
+        fail_msg: "{{ lc_failures | length }} data-dir case(s) failed: {{ lc_failures | join(' | ') }}"
+        quiet: true

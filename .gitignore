@@ -1,0 +1,15 @@
+# Local caches, never committed
+.cache/
+
+# Build output and agent worktrees
+/bin/
+/.tty59/
+
+# Maintainers' private context (tracked only in the private repository)
+/PRIVATE.md
+
+# Documentation site: dependencies, build output and the generated API reference
+/node_modules/
+/site/.vitepress/cache/
+/site/.vitepress/dist/
+/docs/api-reference/

@@ -1,0 +1,97 @@
+# Verifies one staged image version on the target before it is renamed into
+# place. Imported by image-install.yml after the copy and chmod, and directly
+# by the staged-corruption regression test. It re-hashes every staged artifact
+# (a controller swap after validate.yml cannot publish wrong content), checks
+# the exact five-entry set, the manifest content and the promised read-only,
+# service-readable ownership/modes.
+- name: List the staged image entries
+  ansible.builtin.find:
+    paths: "{{ bbraft_node_image_staging }}"
+    recurse: false
+    hidden: true
+    file_type: any
+  register: bbraft_node_staged_entries
+
+- name: The staged image has exactly the five fixed entries
+  ansible.builtin.assert:
+    that:
+      - (bbraft_node_staged_entries.files | map(attribute='path') | map('basename') | sort | list) == bbraft_node_image_entries
+    fail_msg: >-
+      the staged image contains entries outside {{ bbraft_node_image_entries }};
+      the node rejects extras and nothing was published
+    quiet: true
+
+- name: Re-hash every staged artifact on the target
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_image_staging }}/{{ item }}"
+    checksum_algorithm: sha256
+    follow: false
+  loop: "{{ bbraft_node_image_files }}"
+  register: bbraft_node_staged_artifacts
+
+- name: Every staged artifact matches the manifest and the read-only policy
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+      - item.stat.size == bbraft_node_image.manifest.artifacts[item.item].size
+      - item.stat.checksum == bbraft_node_image.manifest.artifacts[item.item].sha256
+      - item.stat.mode == bbraft_node_image_file_mode
+      - item.stat.pw_name == bbraft_node_image_owner
+      - item.stat.gr_name == bbraft_node_image_group
+    fail_msg: >-
+      staged {{ item.item }} does not match the manifest sha256/size or the
+      read-only owner/mode; nothing was published
+    quiet: true
+  loop: "{{ bbraft_node_staged_artifacts.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Read the staged manifest
+  ansible.builtin.slurp:
+    src: "{{ bbraft_node_image_staging }}/manifest.json"
+  register: bbraft_node_staged_manifest_raw
+
+- name: Stat the staged manifest
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_image_staging }}/manifest.json"
+    get_checksum: false
+    follow: false
+  register: bbraft_node_staged_manifest_stat
+
+- name: The staged manifest is the intended immutable version
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_staged_manifest_stat.stat.exists
+      - bbraft_node_staged_manifest_stat.stat.isreg
+      - not bbraft_node_staged_manifest_stat.stat.islnk
+      - bbraft_node_staged_manifest_stat.stat.mode == bbraft_node_image_file_mode
+      - bbraft_node_staged_manifest_stat.stat.pw_name == bbraft_node_image_owner
+      - bbraft_node_staged_manifest_stat.stat.gr_name == bbraft_node_image_group
+      - (bbraft_node_staged_manifest_raw.content | b64decode | from_json) == bbraft_node_image.manifest
+    fail_msg: >-
+      the staged manifest.json differs from the intended version or has the
+      wrong owner/mode; nothing was published
+    quiet: true
+
+- name: Stat the staged version directory
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_image_staging }}"
+    get_checksum: false
+    follow: false
+  register: bbraft_node_staged_dir
+
+- name: The staged directory is read-only and service-readable
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_staged_dir.stat.isdir
+      - not bbraft_node_staged_dir.stat.islnk
+      - bbraft_node_staged_dir.stat.mode == bbraft_node_image_mode
+      - bbraft_node_staged_dir.stat.pw_name == bbraft_node_image_owner
+      - bbraft_node_staged_dir.stat.gr_name == bbraft_node_image_group
+    fail_msg: >-
+      the staged version directory must match {{ bbraft_node_image_mode }},
+      {{ bbraft_node_image_owner }}:{{ bbraft_node_image_group }}; nothing was
+      published
+    quiet: true

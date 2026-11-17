@@ -1,0 +1,75 @@
+# Renders the attempt-unique units of the A10 jailed KVM harness through the
+# role's own validation and unit template, plus manifest.json for the
+# harness (BBRAFT_TEST_KVM_JAIL_UNITS). Run as the normal VM user before the
+# root test run; it writes only below kt_out, which must not exist yet:
+#
+#   cd infra/ansible && mise exec -- ansible-playbook \
+#     -i roles/bbraft_node/tests/inventory.yml roles/bbraft_node/tests/kvm-harness-render.yml \
+#     -e kt_out=$units -e kt_binary=$dir/bbraft-node \
+#     -e kt_binary_sha256=$(sha256sum $dir/bbraft-node | cut -d' ' -f1) \
+#     -e kt_image=/path/to/images/out/<id> \
+#     -e kt_jail_uid_range=900000-900999 -e kt_io_device=MAJ:MIN -e kt_io_write_bps=104857600
+#
+# Names per attempt (a = first 12 hex digits of a random uuid): service
+# bbraft-kt-<a>, data /var/lib/bbraft-kt-<a> (images below it), config
+# /etc/bbraft-kt-<a>, stage /var/lib/bbraft-kt-stage-<a> (staged binaries),
+# unit /run/systemd/system/bbraft-kt-<a>.service. The harness refuses any
+# existing object of these names before installing.
+- name: Render the A10 jailed KVM harness units
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - kvm-harness-vars.yml
+  vars:
+    kt_attempts: [startup, link, direct, restart, snapshot]
+  tasks:
+    - name: The harness inputs are supplied
+      ansible.builtin.assert:
+        that:
+          - kt_out is defined and kt_out is string and kt_out.startswith('/')
+          - kt_binary is defined and kt_binary_sha256 is defined
+          - kt_image is defined
+          - kt_jail_uid_range is defined and kt_io_device is defined and kt_io_write_bps is defined
+        fail_msg: "set kt_out, kt_binary, kt_binary_sha256, kt_image, kt_jail_uid_range, kt_io_device and kt_io_write_bps"
+        quiet: true
+
+    - name: Read the output directory
+      ansible.builtin.stat:
+        path: "{{ kt_out }}"
+        follow: false
+      register: kt_out_stat
+
+    - name: The output directory is fresh
+      ansible.builtin.assert:
+        that: not kt_out_stat.stat.exists
+        fail_msg: "{{ kt_out }} already exists; the harness renders into a fresh directory"
+        quiet: true
+
+    - name: Create the output directory
+      ansible.builtin.file:
+        path: "{{ kt_out }}"
+        state: directory
+        mode: "0755"
+
+    - name: Draw one random attempt id per unit
+      ansible.builtin.set_fact:
+        kt_ids: "{{ kt_ids | default({}) | combine({item: (lookup('ansible.builtin.pipe', 'python3 -c \"import uuid; print(uuid.uuid4().hex[:12])\"'))}) }}"
+      loop: "{{ kt_attempts }}"
+
+    - name: The attempt ids are distinct
+      ansible.builtin.assert:
+        that: kt_ids.values() | unique | length == kt_attempts | length
+        quiet: true
+
+    - name: Render each attempt through the role's validation and template
+      ansible.builtin.include_tasks: kvm-harness-attempt.yml
+      loop: "{{ kt_attempts }}"
+      loop_control:
+        loop_var: kt_name
+
+    - name: Write the harness manifest
+      ansible.builtin.copy:
+        dest: "{{ kt_out }}/manifest.json"
+        mode: "0644"
+        content: "{{ {'attempts': kt_manifest} | to_nice_json }}\n"

@@ -1,0 +1,48 @@
+# bbraft-server control plane. The caller supplies the built binary and every
+# credential; nothing secret has a repository default.
+- name: Validate the bbraft-server inputs
+  ansible.builtin.import_tasks: validate.yml
+
+- name: Create the bbraft-server group
+  ansible.builtin.group:
+    name: "{{ bbraft_server_group }}"
+    system: true
+
+- name: Create the bbraft-server service user
+  ansible.builtin.user:
+    name: "{{ bbraft_server_user }}"
+    group: "{{ bbraft_server_group }}"
+    system: true
+    home: "{{ bbraft_server_state_dir }}"
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Create the bbraft-server state directory
+  ansible.builtin.file:
+    path: "{{ bbraft_server_state_dir }}"
+    state: directory
+    owner: "{{ bbraft_server_user }}"
+    group: "{{ bbraft_server_group }}"
+    mode: "{{ bbraft_server_state_mode }}"
+
+- name: Create the bbraft-server configuration directory
+  ansible.builtin.file:
+    path: "{{ bbraft_server_config_dir }}"
+    state: directory
+    owner: root
+    group: "{{ bbraft_server_group }}"
+    mode: "{{ bbraft_server_config_mode }}"
+
+- name: Install files, credentials and the systemd unit
+  ansible.builtin.import_tasks: files.yml
+
+# daemon_reload loads a freshly written unit before it is started. Changes to
+# the unit, binary or credential files notify the handlers below, which reload
+# and restart only when something actually changed.
+- name: Run bbraft-server
+  ansible.builtin.systemd_service:
+    name: "{{ bbraft_server_service }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: bbraft_server_manage_service | bool

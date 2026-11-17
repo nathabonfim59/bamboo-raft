@@ -1,0 +1,4 @@
+{"type":"started","commandId":"cmd_example"}
+{"type":"stdout","data":"ok\n"}
+{"type":"stderr","data":"warning\n"}
+{"type":"exit","commandId":"cmd_example","exitCode":0,"success":true,"timedOut":false}

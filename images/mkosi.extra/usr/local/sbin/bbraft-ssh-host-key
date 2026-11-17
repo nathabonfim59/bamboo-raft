@@ -1,0 +1,33 @@
+#!/bin/sh
+# Generate a fresh ed25519 SSH host key for this boot.
+#
+# bbraft-ssh-host-key.service runs this before ssh.service. The key lives in
+# /run/ssh (tmpfs), never in /etc/ssh and never in the image, so resuming a
+# sandbox from its disk produces a new client-visible host key. The public
+# key is published through the node after AddSSHKey; until it exists that RPC
+# is UNAVAILABLE.
+#
+# BBRAFT_SSH_KEY_DIR, BBRAFT_SSH_PRIVSEP_DIR and BBRAFT_SSH_ETC_DIR exist for
+# the fast shell test; production uses /run/ssh, /run/sshd and /etc/ssh.
+set -eu
+
+key_dir=${BBRAFT_SSH_KEY_DIR:-/run/ssh}
+privsep_dir=${BBRAFT_SSH_PRIVSEP_DIR:-/run/sshd}
+etc_dir=${BBRAFT_SSH_ETC_DIR:-/etc/ssh}
+key="$key_dir/ssh_host_ed25519_key"
+
+# sshd needs its privilege-separation directory. ssh.service normally creates
+# it, but this unit may run first.
+install -d -m 0755 "$key_dir" "$privsep_dir"
+
+# Remove anything that could be served instead of the boot key: a stale key
+# in /run or a package-generated default in /etc. Naming HostKey in
+# sshd_config already disables the defaults, and this keeps that invariant
+# observable in the image tree.
+rm -f "$key" "$key.pub" "$etc_dir"/ssh_host_*
+umask 077
+ssh-keygen -q -t ed25519 -N '' -C bbraft-guest -f "$key"
+chmod 0600 "$key"
+chmod 0644 "$key.pub"
+
+printf 'bbraft-ssh-host-key: generated %s (%s)\n' "$key" "$(cat "$key.pub")"

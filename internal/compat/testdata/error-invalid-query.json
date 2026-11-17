@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 400,
+  "code": "invalid_query",
+  "message": "Unknown query parameter: org",
+  "error": {
+    "code": "invalid_query",
+    "message": "Unknown query parameter: org",
+    "status": 400,
+    "details": {"parameter": "org"}
+  },
+  "requestId": "req_01HXEXAMPLE"
+}

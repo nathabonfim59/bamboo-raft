@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "type": "file.read",
+  "success": true,
+  "path": "/home/user/notes.txt",
+  "encoding": "utf8",
+  "size": 12,
+  "content": "hello\nworld\n"
+}

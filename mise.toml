@@ -1,0 +1,5 @@
+# Toolchain for building bamboo-raft. `mise install` once, then `make check`.
+# infra/ansible has its own mise.toml for Ansible.
+[tools]
+go = "1.27.3"
+protoc = "36.2"

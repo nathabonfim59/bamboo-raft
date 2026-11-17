@@ -1,0 +1,210 @@
+# Exercises the actual device policy task with synthetic stat results, so no
+# real /dev/kvm or /dev/vhost-vsock is needed. The pass case uses the role
+# defaults; each rejection asserts the exact failing predicate.
+- name: Check the device policy task with synthetic stat results
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    bbraft_node_devices:
+      results:
+        - item: /dev/kvm
+          stat: {exists: true, ischr: true, islnk: false, gr_name: kvm, mode: "0660"}
+        - item: /dev/vhost-vsock
+          stat: {exists: true, ischr: true, islnk: false, gr_name: kvm, mode: "0660"}
+        # The root supervisor needs no group policy for these two (A10 fix B).
+        - item: /dev/vhost-net
+          stat: {exists: true, ischr: true, islnk: false, gr_name: root, mode: "0600"}
+        - item: /dev/net/tun
+          stat: {exists: true, ischr: true, islnk: false, gr_name: root, mode: "0666"}
+  tasks:
+    - name: The valid synthetic devices pass
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: device-assert
+
+    - name: Wrong group is rejected
+      block:
+        - name: Set a root-owned device
+          ansible.builtin.set_fact:
+            bbraft_node_devices:
+              results:
+                - item: /dev/kvm
+                  stat: {exists: true, ischr: true, islnk: false, gr_name: root, mode: "0660"}
+        - name: Check the wrong-group device
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: device-assert
+      rescue:
+        - name: Record the wrong-group rejection
+          ansible.builtin.set_fact:
+            bbraft_node_device_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The rejection names the group predicate
+      ansible.builtin.assert:
+        that: "'item.stat.gr_name' in bbraft_node_device_reason"
+        fail_msg: "the wrong device group failed at an unexpected predicate"
+        quiet: true
+
+    - name: Group without read/write is rejected
+      block:
+        - name: Set a read-only group device
+          ansible.builtin.set_fact:
+            bbraft_node_devices:
+              results:
+                - item: /dev/kvm
+                  stat: {exists: true, ischr: true, islnk: false, gr_name: kvm, mode: "0640"}
+        - name: Check the read-only group device
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: device-assert
+      rescue:
+        - name: Record the mode rejection
+          ansible.builtin.set_fact:
+            bbraft_node_device_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The rejection names the mode predicate
+      ansible.builtin.assert:
+        that: "'item.stat.mode' in bbraft_node_device_reason"
+        fail_msg: "the device mode failed at an unexpected predicate"
+        quiet: true
+
+    - name: A missing device is rejected
+      block:
+        - name: Set a missing device
+          ansible.builtin.set_fact:
+            bbraft_node_devices:
+              results:
+                - item: /dev/kvm
+                  stat: {exists: false, ischr: false, islnk: false, gr_name: kvm, mode: "0000"}
+        - name: Check the missing device
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: device-assert
+      rescue:
+        - name: Record the missing-device rejection
+          ansible.builtin.set_fact:
+            bbraft_node_device_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The rejection names the existence predicate
+      ansible.builtin.assert:
+        that: "'item.stat.exists' in bbraft_node_device_reason"
+        fail_msg: "a missing device failed at an unexpected predicate"
+        quiet: true
+
+    - name: A non-character device is rejected
+      block:
+        - name: Set a regular file as the device
+          ansible.builtin.set_fact:
+            bbraft_node_devices:
+              results:
+                - item: /dev/kvm
+                  stat: {exists: true, ischr: false, islnk: false, gr_name: kvm, mode: "0660"}
+        - name: Check the non-character device
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: device-assert
+      rescue:
+        - name: Record the non-character rejection
+          ansible.builtin.set_fact:
+            bbraft_node_device_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The rejection names the character-device predicate
+      ansible.builtin.assert:
+        that: "'item.stat.ischr' in bbraft_node_device_reason"
+        fail_msg: "a non-character device failed at an unexpected predicate"
+        quiet: true
+
+    # A10 fix B: all four production TAP/KVM devices are required; a base that
+    # only checks /dev/kvm and /dev/vhost-vsock cannot hide a missing one.
+    - name: The old two-device set is rejected
+      block:
+        - name: Set only kvm and vhost-vsock
+          ansible.builtin.set_fact:
+            bbraft_node_devices:
+              results:
+                - item: /dev/kvm
+                  stat: {exists: true, ischr: true, islnk: false, gr_name: kvm, mode: "0660"}
+                - item: /dev/vhost-vsock
+                  stat: {exists: true, ischr: true, islnk: false, gr_name: kvm, mode: "0660"}
+        - name: Check the two-device set
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: device-assert
+        - name: The two-device set passed
+          ansible.builtin.set_fact:
+            bbraft_node_device_reason: accepted
+      rescue:
+        - name: Record the incomplete-set rejection
+          ansible.builtin.set_fact:
+            bbraft_node_device_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The rejection names the required device set
+      ansible.builtin.assert:
+        that: "'bbraft_node_required_devices' in bbraft_node_device_reason"
+        fail_msg: "an incomplete device set was not rejected for the required set ({{ bbraft_node_device_reason }})"
+        quiet: true
+
+    - name: A missing tun device is rejected
+      block:
+        - name: Set a missing /dev/net/tun
+          ansible.builtin.set_fact:
+            bbraft_node_devices:
+              results:
+                - item: /dev/kvm
+                  stat: {exists: true, ischr: true, islnk: false, gr_name: kvm, mode: "0660"}
+                - item: /dev/vhost-vsock
+                  stat: {exists: true, ischr: true, islnk: false, gr_name: kvm, mode: "0660"}
+                - item: /dev/vhost-net
+                  stat: {exists: true, ischr: true, islnk: false, gr_name: root, mode: "0600"}
+                - item: /dev/net/tun
+                  stat: {exists: false}
+        - name: Check the missing tun device
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: device-assert
+        - name: The missing tun device passed
+          ansible.builtin.set_fact:
+            bbraft_node_device_reason: accepted
+      rescue:
+        - name: Record the missing-tun rejection
+          ansible.builtin.set_fact:
+            bbraft_node_device_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The tun rejection names the existence predicate
+      ansible.builtin.assert:
+        that: "'item.stat.exists' in bbraft_node_device_reason"
+        fail_msg: "a missing /dev/net/tun was not rejected ({{ bbraft_node_device_reason }})"
+        quiet: true
+
+    - name: A non-character vhost-net is rejected
+      block:
+        - name: Set a regular-file /dev/vhost-net
+          ansible.builtin.set_fact:
+            bbraft_node_devices:
+              results:
+                - item: /dev/kvm
+                  stat: {exists: true, ischr: true, islnk: false, gr_name: kvm, mode: "0660"}
+                - item: /dev/vhost-vsock
+                  stat: {exists: true, ischr: true, islnk: false, gr_name: kvm, mode: "0660"}
+                - item: /dev/vhost-net
+                  stat: {exists: true, ischr: false, islnk: false, gr_name: root, mode: "0600"}
+                - item: /dev/net/tun
+                  stat: {exists: true, ischr: true, islnk: false, gr_name: root, mode: "0666"}
+        - name: Check the non-character vhost-net
+          ansible.builtin.include_role:
+            name: bbraft_node
+            tasks_from: device-assert
+        - name: The non-character vhost-net passed
+          ansible.builtin.set_fact:
+            bbraft_node_device_reason: accepted
+      rescue:
+        - name: Record the vhost-net rejection
+          ansible.builtin.set_fact:
+            bbraft_node_device_reason: "{{ ansible_failed_result | default({}) | to_json }}"
+
+    - name: The vhost-net rejection names the character-device predicate
+      ansible.builtin.assert:
+        that: "'item.stat.ischr' in bbraft_node_device_reason"
+        fail_msg: "a non-character /dev/vhost-net was not rejected ({{ bbraft_node_device_reason }})"
+        quiet: true

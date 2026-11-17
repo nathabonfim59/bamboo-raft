@@ -1,0 +1,2 @@
+# YAML .nan loads as a float NaN: a non-finite ratio must be rejected.
+bbraft_node_memory_overcommit: .nan

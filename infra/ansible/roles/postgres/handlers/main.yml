@@ -1,0 +1,9 @@
+- name: Restart the PostgreSQL cluster
+  ansible.builtin.command:
+    argv:
+      - pg_ctlcluster
+      - "{{ postgres_version }}"
+      - "{{ postgres_cluster }}"
+      - restart
+  when: postgres_manage_service | bool
+  changed_when: true

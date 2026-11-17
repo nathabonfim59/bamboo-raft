@@ -1,0 +1,23 @@
+# Non-destructive role/database setup. The password is a module argument with
+# no_log, so it never enters Ansible output or a command line. Nothing here
+# drops, renames or reinitializes anything.
+- name: Create or update the bbraft PostgreSQL role
+  community.postgresql.postgresql_user:
+    name: "{{ postgres_user }}"
+    password: "{{ postgres_password }}"
+    login_unix_socket: "{{ postgres_unix_socket }}"
+    login_port: "{{ postgres_port | postgres_positive_int }}"
+    state: present
+  become: true
+  become_user: postgres
+  no_log: true
+
+- name: Create the bbraft database owned by that role
+  community.postgresql.postgresql_db:
+    name: "{{ postgres_database }}"
+    owner: "{{ postgres_user }}"
+    login_unix_socket: "{{ postgres_unix_socket }}"
+    login_port: "{{ postgres_port | postgres_positive_int }}"
+    state: present
+  become: true
+  become_user: postgres

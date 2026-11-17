@@ -1,0 +1,17 @@
+# Reads the device nodes the service needs and delegates the policy check
+# to device-assert.yml, which the role-local tests include with synthetic stat
+# results (no real /dev/kvm required).
+- name: Read the KVM and vsock device nodes
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ bbraft_node_required_devices }}"
+  register: bbraft_node_devices
+  when: bbraft_node_require_devices | bool
+
+- name: The KVM, vsock, vhost-net and tun devices exist
+  ansible.builtin.include_tasks: device-assert.yml
+  when:
+    - bbraft_node_require_devices | bool
+    - not ansible_check_mode

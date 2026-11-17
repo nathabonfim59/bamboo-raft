@@ -1,0 +1,3 @@
+# One swap partition per disk (OVH layout). Equal priority makes the kernel
+# alternate pages between them, like RAID0. Swap is an OOM safety net only.
+swap_priority: 10

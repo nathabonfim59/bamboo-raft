@@ -1,0 +1,7 @@
+# Bulk HDD: Garage (local S3), Postgres backups, parkana data. Never VM disks.
+# bulk_disk_device must be a /dev/disk/by-id path; set it in host_vars.
+bulk_disk_device: ""
+bulk_disk_mountpoint: /srv/bulk
+bulk_disk_label: bbraft-bulk
+# nofail: a dead HDD must not stop the node from booting.
+bulk_disk_mount_opts: defaults,noatime,nofail

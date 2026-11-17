@@ -1,0 +1,45 @@
+# Tailscale: the only way to reach a bamboo-raft host once the hardening
+# role closes the public interface.
+
+# Pinned package version from pkgs.tailscale.com/stable (Debian trixie).
+tailscale_version: "1.104.5"
+
+# Controller path to a file holding one tagged, pre-approved, single-use auth
+# key (tskey-auth-...). Used only when the host has not joined yet. The key is
+# copied to a root-only temporary file on the host, used, and deleted; it
+# never appears in a task argument, log or the repository.
+tailscale_authkey_file: ""
+
+# Tailnet machine name. Empty keeps the OS hostname.
+tailscale_hostname: ""
+
+# Tags the host advertises. The auth key must be allowed to set them.
+tailscale_tags: ["tag:bbraft"]
+
+# OpenSSH stays the SSH server (reached over the tailnet); Tailscale SSH stays off.
+tailscale_ssh: false
+
+# Local service published on the tailnet with `tailscale serve`. Empty
+# publishes nothing. Reachable only from tailnet devices the ACLs allow.
+tailscale_serve_target: ""
+
+# How it is published (infra/README.md, "API access: HTTPS or HTTP"):
+#   https  port 443 with a tailnet certificate. Needs MagicDNS and HTTPS
+#          certificates enabled for the tailnet; the certificate puts
+#          <machine>.<tailnet>.ts.net in the public Certificate Transparency
+#          logs.
+#   http   port 80, no certificate and nothing in the CT logs. Traffic is still
+#          encrypted between tailnet devices by WireGuard.
+tailscale_serve_scheme: https
+
+# SHA-256 of files/tailscale-archive-keyring.gpg (Tailscale Inc. package
+# signing key, fingerprint 2596A99EAAB33821893C0A79458CA832957F5868).
+tailscale_keyring_sha256: 3e03dacf222698c60b8e2f990b809ca1b3e104de127767864284e6c228f1fb39
+
+# --- DNS (tag tailscale_dns) ------------------------------------------------
+# Make Tailscale's resolver the host's primary DNS server for every name
+# (tasks/dns.yml). false removes the drop-in again.
+tailscale_dns_primary: true
+tailscale_dns_servers: ["100.100.100.100"]
+# Names that must resolve afterwards; the role adds the host's tailnet name.
+tailscale_dns_check_names: [deb.debian.org, pkgs.tailscale.com]

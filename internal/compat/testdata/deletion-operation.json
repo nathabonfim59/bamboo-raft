@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "type": "deletion.operation",
+  "operation": {
+    "id": "bdop_0123456789abcdef0123456789abcdef",
+    "kind": "sandbox",
+    "targetId": "bx_23456789",
+    "reason": "explicit",
+    "status": "processing",
+    "stage": "removing",
+    "attemptCount": 1,
+    "requestedAt": "2026-11-08T12:10:00Z",
+    "completedAt": null
+  }
+}

@@ -1,0 +1,2 @@
+# Invalid input: the gateway certificate name must not contain whitespace.
+bbraft_server_gateway_server_name: "gateway\tinternal"

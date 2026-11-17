@@ -1,0 +1,13 @@
+# Validation only, local connection: no package, cluster or service is
+# touched. Used for the positive case and, through run.sh, the rejections.
+- name: PostgreSQL role validation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: Validate the inputs
+      ansible.builtin.include_role:
+        name: postgres
+        tasks_from: validate

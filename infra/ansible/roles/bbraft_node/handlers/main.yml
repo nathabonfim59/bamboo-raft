@@ -1,0 +1,14 @@
+# A changed unit reloads systemd; a changed binary, token, image or unit
+# restarts the node. The node's own SIGTERM path stops boot workers, closes
+# guest connections and releases its lock; KillMode=process in the unit keeps
+# the QEMU children running for the next node to adopt.
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: bbraft_node_manage_service | bool
+
+- name: Restart bbraft-node
+  ansible.builtin.systemd_service:
+    name: "{{ bbraft_node_service }}"
+    state: restarted
+  when: bbraft_node_manage_service | bool

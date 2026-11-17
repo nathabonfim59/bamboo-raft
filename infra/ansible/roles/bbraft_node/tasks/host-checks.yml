@@ -1,0 +1,80 @@
+# Real-host checks for the root jail supervisor (skipped by the local render
+# tests). They only read: the binary re-proves each of them at startup and
+# fails closed, these give a clearer error before the unit is installed.
+
+- name: Read the systemd version
+  ansible.builtin.command:
+    argv: [systemctl, --version]
+  register: bbraft_node_systemctl_version
+  changed_when: false
+  check_mode: false
+
+- name: systemd supports DelegateSubgroup=
+  ansible.builtin.assert:
+    that:
+      - ((bbraft_node_systemctl_version.stdout_lines | first).split()[1] | int) >= ([bbraft_node_systemd_min_version | int, 254] | max)
+    fail_msg: >-
+      bbraft-node needs systemd {{ bbraft_node_systemd_min_version }} or newer
+      for DelegateSubgroup=supervisor; found
+      {{ bbraft_node_systemctl_version.stdout_lines | first }}
+    quiet: true
+
+- name: Enumerate host accounts and groups
+  ansible.builtin.getent:
+    database: "{{ item }}"
+  loop: [passwd, group]
+  register: bbraft_node_getent
+
+- name: No host account or group id lies inside the jail uid range
+  ansible.builtin.assert:
+    that: bbraft_node_jail_collisions | length == 0
+    fail_msg: >-
+      bbraft_node_jail_uid_range {{ bbraft_node_jail_uid_range }} overlaps
+      host ids: {{ bbraft_node_jail_collisions | join(', ') }}
+    quiet: true
+  vars:
+    bbraft_node_jail_min: "{{ bbraft_node_jail_uid_range.split('-')[0] | int }}"
+    bbraft_node_jail_max: "{{ bbraft_node_jail_uid_range.split('-')[1] | int }}"
+    # passwd entries are [password, uid, gid, ...]; group entries [password, gid, ...].
+    bbraft_node_jail_collisions: >-
+      {%- set out = [] -%}
+      {%- for name, fields in bbraft_node_getent.results[0].ansible_facts.getent_passwd.items() -%}
+      {%- for id in fields[1:3] if id is match('^[0-9]+$') and (bbraft_node_jail_min | int) <= (id | int) <= (bbraft_node_jail_max | int) -%}
+      {%- set _ = out.append('user ' ~ name ~ ' (' ~ id ~ ')') -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- for name, fields in bbraft_node_getent.results[1].ansible_facts.getent_group.items() -%}
+      {%- if fields[1] is match('^[0-9]+$') and (bbraft_node_jail_min | int) <= (fields[1] | int) <= (bbraft_node_jail_max | int) -%}
+      {%- set _ = out.append('group ' ~ name ~ ' (' ~ fields[1] ~ ')') -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: Check the data root's mount
+  ansible.builtin.include_tasks: data-mount.yml
+
+- name: Read the trusted jail executables and firmware
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop: "{{ [bbraft_node_jail_qemu_binary, bbraft_node_jail_tool_binary] + bbraft_node_jail_firmware }}"
+  register: bbraft_node_jail_files
+
+- name: The jail executables and firmware are root-owned, not group/other writable, regular files
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+      - item.stat.pw_name == 'root'
+      - not item.stat.wgrp
+      - not item.stat.woth
+    fail_msg: >-
+      {{ item.item }} must be a root-owned regular file that only root can
+      write (the jailer stages it into every jail; it re-proves this and its
+      parents at startup)
+    quiet: true
+  loop: "{{ bbraft_node_jail_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"

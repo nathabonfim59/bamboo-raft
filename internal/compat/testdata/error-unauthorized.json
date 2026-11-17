@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 401,
+  "code": "unauthorized",
+  "message": "Unauthorized",
+  "error": {"code": "unauthorized", "message": "Unauthorized", "status": 401},
+  "requestId": "req_01HXEXAMPLE"
+}

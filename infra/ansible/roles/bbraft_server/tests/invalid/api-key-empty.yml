@@ -1,0 +1,5 @@
+# Invalid input: the owner and raw key are required.
+bbraft_server_api_keys:
+  - id: main
+    owner: acct_placeholder
+    key: ""

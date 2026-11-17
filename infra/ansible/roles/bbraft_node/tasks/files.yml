@@ -1,0 +1,222 @@
+# Installs the caller-supplied binary, the token, verified guest images and
+# the systemd/udev files. Imported by main.yml after the user and directories
+# exist, and directly by the role-local render test, which points every path at
+# a temporary tree and sets bbraft_node_manage_service=false.
+
+- name: Read the installed binary
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_binary_path }}"
+    checksum_algorithm: sha256
+    follow: false
+  register: bbraft_node_installed_binary
+
+- name: The existing binary path is a file, symlink or absent
+  ansible.builtin.assert:
+    that: not bbraft_node_installed_binary.stat.exists or not bbraft_node_installed_binary.stat.isdir
+    fail_msg: "{{ bbraft_node_binary_path }} is a directory; refusing to replace it"
+    quiet: true
+
+- name: Decide whether the binary must be replaced
+  ansible.builtin.set_fact:
+    bbraft_node_binary_needs_install: >-
+      {{ (not bbraft_node_installed_binary.stat.exists) or
+         ((bbraft_node_installed_binary.stat.checksum | default('')) != bbraft_node_binary_sha256) }}
+
+# Every candidate is written to a unique staging file in the same directory,
+# checked against the expected sha256, owner, group and mode on the target, and
+# only then renamed over the installed binary. A source swapped after
+# validate.yml, a partial copy or a concurrent apply's cleanup therefore leaves
+# the old executable in place.
+- name: Stage and publish the binary
+  block:
+    - name: Create a unique binary staging file
+      ansible.builtin.tempfile:
+        state: file
+        path: "{{ bbraft_node_binary_path | dirname }}"
+        prefix: ".bbraft-node-staging-"
+      register: bbraft_node_binary_staging_file
+      when:
+        - not ansible_check_mode
+        - bbraft_node_binary_needs_install | bool
+
+    - name: Name the unique binary staging file
+      ansible.builtin.set_fact:
+        bbraft_node_binary_staging_path: "{{ bbraft_node_binary_staging_file.path }}"
+      when:
+        - not ansible_check_mode
+        - bbraft_node_binary_needs_install | bool
+
+    - name: Install the binary from the controller into staging
+      ansible.builtin.copy:
+        src: "{{ bbraft_node_binary_src }}"
+        dest: "{{ bbraft_node_binary_staging_path }}"
+        owner: "{{ bbraft_node_binary_owner }}"
+        group: "{{ bbraft_node_binary_group }}"
+        mode: "{{ bbraft_node_binary_mode }}"
+      when:
+        - not ansible_check_mode
+        - bbraft_node_binary_needs_install | bool
+        - bbraft_node_binary_src | length > 0
+
+    - name: Download the checksum-pinned binary into staging
+      ansible.builtin.get_url:
+        url: "{{ bbraft_node_binary_url }}"
+        dest: "{{ bbraft_node_binary_staging_path }}"
+        checksum: "sha256:{{ bbraft_node_binary_sha256 }}"
+        force: true
+        owner: "{{ bbraft_node_binary_owner }}"
+        group: "{{ bbraft_node_binary_group }}"
+        mode: "{{ bbraft_node_binary_mode }}"
+      when:
+        - not ansible_check_mode
+        - bbraft_node_binary_needs_install | bool
+        - bbraft_node_binary_url | length > 0
+
+    - name: Read the staged binary
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_binary_staging_path }}"
+        checksum_algorithm: sha256
+        follow: false
+      register: bbraft_node_binary_staged
+      when:
+        - not ansible_check_mode
+        - bbraft_node_binary_needs_install | bool
+
+    - name: The staged binary matches the expected sha256 and ownership
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_binary_staged.stat.exists
+          - bbraft_node_binary_staged.stat.isreg
+          - not bbraft_node_binary_staged.stat.islnk
+          - bbraft_node_binary_staged.stat.checksum == bbraft_node_binary_sha256
+          - bbraft_node_binary_staged.stat.mode == bbraft_node_binary_mode
+          - bbraft_node_binary_staged.stat.pw_name == bbraft_node_binary_owner
+          - bbraft_node_binary_staged.stat.gr_name == bbraft_node_binary_group
+        fail_msg: >-
+          the staged binary does not match bbraft_node_binary_sha256, mode or
+          ownership; the installed binary was left unchanged
+        quiet: true
+      when:
+        - not ansible_check_mode
+        - bbraft_node_binary_needs_install | bool
+
+    - name: Publish the verified binary atomically
+      ansible.builtin.command:
+        argv: [mv, -fT, --, "{{ bbraft_node_binary_staging_path }}", "{{ bbraft_node_binary_path }}"]
+      when:
+        - not ansible_check_mode
+        - bbraft_node_binary_needs_install | bool
+      notify: Restart bbraft-node
+  always:
+    - name: Remove this apply's binary staging file
+      ansible.builtin.file:
+        path: "{{ bbraft_node_binary_staging_path | default('') }}"
+        state: absent
+      when:
+        - not ansible_check_mode
+        - bbraft_node_binary_staging_path is defined
+
+# Enforce owner/group/mode even when the installed checksum already matches.
+- name: Enforce the installed binary ownership and mode
+  ansible.builtin.file:
+    path: "{{ bbraft_node_binary_path }}"
+    state: file
+    owner: "{{ bbraft_node_binary_owner }}"
+    group: "{{ bbraft_node_binary_group }}"
+    mode: "{{ bbraft_node_binary_mode }}"
+  when:
+    - not ansible_check_mode
+    - not (bbraft_node_binary_needs_install | bool) or bbraft_node_installed_binary.stat.exists
+
+# The source and staged copy were already checked. Check the final installed
+# file too, so no other path can leave a different executable in place.
+- name: Read the installed binary after installation
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_binary_path }}"
+    checksum_algorithm: sha256
+    follow: false
+  register: bbraft_node_binary_after
+  when: not ansible_check_mode
+
+- name: The installed binary is the expected regular file with its owner and mode
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_binary_after.stat.exists
+      - bbraft_node_binary_after.stat.isreg
+      - not bbraft_node_binary_after.stat.islnk
+      - bbraft_node_binary_after.stat.checksum == bbraft_node_binary_sha256
+      - bbraft_node_binary_after.stat.mode == bbraft_node_binary_mode
+      - bbraft_node_binary_after.stat.pw_name == bbraft_node_binary_owner
+      - bbraft_node_binary_after.stat.gr_name == bbraft_node_binary_group
+    fail_msg: >-
+      {{ bbraft_node_binary_path }} is missing, not a plain file, does not
+      match bbraft_node_binary_sha256, or has the wrong owner/mode
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Write the node token from the supplied value
+  ansible.builtin.copy:
+    dest: "{{ bbraft_node_token_file }}"
+    content: "{{ bbraft_node_token }}"
+    owner: "{{ bbraft_node_token_owner }}"
+    group: "{{ bbraft_node_token_group }}"
+    mode: "{{ bbraft_node_secret_mode }}"
+  no_log: true
+  diff: false
+  notify: Restart bbraft-node
+  when: bbraft_node_token | length > 0
+
+- name: Copy the node token from the controller
+  ansible.builtin.copy:
+    src: "{{ bbraft_node_token_src }}"
+    dest: "{{ bbraft_node_token_file }}"
+    owner: "{{ bbraft_node_token_owner }}"
+    group: "{{ bbraft_node_token_group }}"
+    mode: "{{ bbraft_node_secret_mode }}"
+  no_log: true
+  diff: false
+  notify: Restart bbraft-node
+  when: bbraft_node_token_src | length > 0
+
+- name: Install every supplied image version
+  ansible.builtin.include_tasks: image-install.yml
+  loop: "{{ bbraft_node_image_specs }}"
+  loop_control:
+    loop_var: bbraft_node_image
+    label: "{{ bbraft_node_image.manifest.id }}"
+
+- name: Allow the kvm group to use KVM and vhost-vsock devices
+  ansible.builtin.copy:
+    dest: "{{ bbraft_node_udev_rule_path }}"
+    content: |
+      # Managed by bamboo-raft infra/ansible (role bbraft_node).
+      # Debian's usual kvm-group access to KVM and vhost-vsock. The root jail
+      # supervisor does not rely on it; jailed QEMU gets private device nodes.
+      KERNEL=="kvm", GROUP="{{ bbraft_node_kvm_group }}", MODE="0660"
+      KERNEL=="vhost-vsock", GROUP="{{ bbraft_node_kvm_group }}", MODE="0660"
+    owner: "{{ bbraft_node_udev_owner }}"
+    group: "{{ bbraft_node_udev_group }}"
+    mode: "{{ bbraft_node_udev_mode }}"
+
+- name: Load the required kernel modules at boot
+  ansible.builtin.copy:
+    dest: "{{ bbraft_node_modules_load_path }}"
+    content: |
+      # Managed by bamboo-raft infra/ansible (role bbraft_node).
+      {% for module in bbraft_node_kernel_modules %}
+      {{ module }}
+      {% endfor %}
+    owner: "{{ bbraft_node_modules_load_owner }}"
+    group: "{{ bbraft_node_modules_load_group }}"
+    mode: "{{ bbraft_node_modules_load_mode }}"
+
+- name: Write the hardened systemd unit
+  ansible.builtin.template:
+    src: bbraft-node.service.j2
+    dest: "{{ bbraft_node_unit_path }}"
+    owner: "{{ bbraft_node_unit_owner }}"
+    group: "{{ bbraft_node_unit_group }}"
+    mode: "{{ bbraft_node_unit_mode }}"
+  notify:
+    - Reload systemd
+    - Restart bbraft-node

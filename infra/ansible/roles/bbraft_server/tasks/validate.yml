@@ -1,0 +1,255 @@
+# Inputs and transport rules. Imported first by tasks/main.yml and directly by
+# the role-local tests, so an invalid install never creates a user or a unit.
+- name: Required caller inputs are present
+  ansible.builtin.assert:
+    that:
+      - bbraft_server_binary_src is string
+      - bbraft_server_binary_src | length > 0
+      - bbraft_server_database_url is string
+      - bbraft_server_database_url | length > 0
+      - bbraft_server_gateway_token is string
+      - bbraft_server_gateway_token | length > 0
+      - bbraft_server_master_key_source is string
+      - bbraft_server_master_key_source | length > 0
+    fail_msg: >-
+      bbraft_server_binary_src, bbraft_server_database_url,
+      bbraft_server_gateway_token and bbraft_server_master_key_source are
+      required; there are no repository defaults for secrets
+    quiet: true
+  no_log: true
+
+- name: Secret values are single-line and shaped correctly
+  ansible.builtin.assert:
+    that:
+      - bbraft_server_database_url is match('^postgres(ql)?://')
+      - bbraft_server_database_url is not search("\\n")
+      - bbraft_server_database_url is not search("\\r")
+      - bbraft_server_database_url | trim == bbraft_server_database_url
+      - bbraft_server_gateway_token is not search("\\n")
+      - bbraft_server_gateway_token is not search("\\r")
+      - bbraft_server_gateway_token | trim == bbraft_server_gateway_token
+    fail_msg: >-
+      the database URL must start with postgres:// or postgresql:// and be a
+      single line; the gateway token must be a single line with no surrounding
+      whitespace
+    quiet: true
+  no_log: true
+
+- name: Server roles, names and limits are valid
+  ansible.builtin.assert:
+    that:
+      - bbraft_server_roles is string
+      - bbraft_server_roles is match('^(all|(api|lifecycle|nodehub)(,(api|lifecycle|nodehub))*)$')
+      - (bbraft_server_roles.split(',') | map('trim') | list | unique | length) == (bbraft_server_roles.split(',') | length)
+      - bbraft_server_user is match('^[a-z_][a-z0-9_-]*$')
+      - bbraft_server_group is match('^[a-z_][a-z0-9_-]*$')
+      - bbraft_server_service is match('^[A-Za-z0-9_.@-]+$')
+      - bbraft_server_key_prefix is string
+      - bbraft_server_key_prefix | length > 0
+      - bbraft_server_key_prefix is not search("\\s")
+      - (bbraft_server_stream_max_seconds | bbraft_positive_int) >= 1
+      - (bbraft_server_retry_seconds | bbraft_positive_int) >= 1
+      - (bbraft_server_reaper_seconds | bbraft_positive_int) >= 1
+      - (bbraft_server_job_poll_seconds | bbraft_positive_int) >= 1
+    fail_msg: >-
+      roles must be all or a comma-separated subset of api,lifecycle,nodehub
+      without duplicates; user/group/service/key prefix must be plain names;
+      every interval must be at least 1
+    quiet: true
+
+- name: Normalize numeric settings to validated integers
+  ansible.builtin.set_fact:
+    bbraft_server_stream_max_seconds_int: "{{ bbraft_server_stream_max_seconds | bbraft_positive_int }}"
+    bbraft_server_retry_seconds_int: "{{ bbraft_server_retry_seconds | bbraft_positive_int }}"
+    bbraft_server_reaper_seconds_int: "{{ bbraft_server_reaper_seconds | bbraft_positive_int }}"
+    bbraft_server_job_poll_seconds_int: "{{ bbraft_server_job_poll_seconds | bbraft_positive_int }}"
+
+- name: Work out which credential files the selected roles need
+  ansible.builtin.set_fact:
+    bbraft_server_api_enabled: >-
+      {{ bbraft_server_roles == 'all' or
+         'api' in (bbraft_server_roles.split(',') | map('trim') | list) }}
+    bbraft_server_nodehub_enabled: >-
+      {{ bbraft_server_roles == 'all' or
+         'nodehub' in (bbraft_server_roles.split(',') | map('trim') | list) }}
+
+- name: All listen addresses are syntactically valid
+  ansible.builtin.assert:
+    that:
+      - bbraft_server_listen | bbraft_listen_valid
+      - bbraft_server_node_listen | bbraft_listen_valid
+      - bbraft_server_gateway_listen | bbraft_listen_valid
+    fail_msg: >-
+      server.listen, node.listen and node.gateway-listen must be host:port
+      with an ASCII-digit port 1-65535; bracket IPv6 addresses. TLS does not
+      relax this syntax check.
+    quiet: true
+
+- name: TLS certificate and key pairs are complete
+  ansible.builtin.assert:
+    that:
+      - (bbraft_server_tls_cert_file | length == 0) == (bbraft_server_tls_key_file | length == 0)
+      - (bbraft_server_node_tls_cert_file | length == 0) == (bbraft_server_node_tls_key_file | length == 0)
+      - (bbraft_server_gateway_tls_cert_file | length == 0) == (bbraft_server_gateway_tls_key_file | length == 0)
+    fail_msg: >-
+      each tls-cert-file needs its tls-key-file and the other way around; set
+      both or neither for server, node and gateway
+    quiet: true
+
+# The public URL may carry credentials or a secret query, so the assertion is
+# no_log and the filter names the setting only, never the rejected value.
+- name: The API public URL is a trusted absolute http(s) URL
+  ansible.builtin.assert:
+    that:
+      - bbraft_server_public_url is string
+      - bbraft_server_public_url | bbraft_public_url_valid
+    fail_msg: >-
+      server.public-url must be an absolute http or https URL with a host and
+      no credentials, query or fragment; a base path is allowed
+    quiet: true
+  no_log: true
+
+- name: The gateway dial target and server name are well formed
+  ansible.builtin.assert:
+    that:
+      - bbraft_server_gateway_dial is string
+      - bbraft_server_gateway_dial | bbraft_dial_valid
+      - bbraft_server_gateway_ca_file is string
+      - bbraft_server_gateway_server_name is string
+      - bbraft_server_gateway_server_name | bbraft_gateway_server_name_valid
+    fail_msg: >-
+      node.gateway-dial must be host:port with a nonempty host and an
+      ASCII-digit port 1-65535; node.gateway-server-name must not contain
+      whitespace or NUL; paths are strings
+    quiet: true
+
+- name: Work out the effective gateway dial target
+  ansible.builtin.set_fact:
+    bbraft_server_gateway_dial_effective: >-
+      {{ bbraft_server_gateway_dial
+         if (bbraft_server_gateway_dial | length) > 0
+         else (bbraft_server_gateway_listen | bbraft_gateway_dial) }}
+
+# Mirrors config.Validate: only the api role (or all) builds signed public
+# URLs, so only it requires an explicit trusted URL for a wildcard bind.
+- name: A wildcard API listener needs an explicit public URL
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (bbraft_server_api_enabled | bool and
+        (bbraft_server_listen | bbraft_bind_is_wildcard)) or
+        (bbraft_server_public_url | length > 0)
+    fail_msg: >-
+      the api role binds a wildcard server.listen, so
+      bbraft_server_public_url must be the trusted absolute http(s) base URL;
+      signed URLs are never built from request headers
+    quiet: true
+
+- name: Gateway trust settings need the gateway TLS pair
+  ansible.builtin.assert:
+    that:
+      - >-
+        (bbraft_server_gateway_ca_file | length == 0 and
+        bbraft_server_gateway_server_name | length == 0) or
+        bbraft_server_gateway_tls_cert_file | length > 0
+    fail_msg: >-
+      node.gateway-ca-file and node.gateway-server-name need
+      bbraft_server_gateway_tls_cert_file and _key_file
+    quiet: true
+
+# Mirrors internal/server/config.Validate: plaintext node listeners only on
+# loopback/private addresses, and the internal gateway only on loopback, with
+# a loopback dial target (the wildcard default maps to 127.0.0.1).
+- name: Plaintext transport stays on loopback or private addresses
+  ansible.builtin.assert:
+    that:
+      - bbraft_server_node_tls_cert_file | length > 0 or not (bbraft_server_node_listen | bbraft_bind_is_public)
+      - >-
+        bbraft_server_gateway_tls_cert_file | length > 0 or
+        ((bbraft_server_gateway_listen | bbraft_bind_is_loopback) and
+        (bbraft_server_gateway_dial_effective | bbraft_dial_is_loopback))
+    fail_msg: >-
+      node.listen may be plaintext only on loopback/private addresses; set
+      bbraft_server_node_tls_cert_file/key_file for a public address. A
+      plaintext gateway needs a loopback listener and dial target; set the
+      gateway TLS pair to leave loopback.
+    quiet: true
+
+- name: The api role needs at least one API key
+  ansible.builtin.assert:
+    that:
+      - bbraft_server_api_keys is sequence
+      - bbraft_server_api_keys is not string
+      - bbraft_server_api_keys is not mapping
+      - bbraft_server_api_keys | length > 0
+    fail_msg: "bbraft_server_roles includes api, so bbraft_server_api_keys must not be empty"
+    quiet: true
+  no_log: true
+  when: bbraft_server_api_enabled | bool
+
+- name: Each API key entry is valid
+  ansible.builtin.assert:
+    that:
+      - item is mapping and (item.keys() | list | difference(['id', 'owner', 'key']) | length == 0)
+      - item.owner is defined and item.owner is string and item.owner | length > 0
+      - item.key is defined and item.key is string and item.key | length > 0
+      - (item.id is not defined) or (item.id is string)
+    fail_msg: "every bbraft_server_api_keys entry must contain only id, owner and key, with nonempty owner and key"
+    quiet: true
+  loop: "{{ bbraft_server_api_keys }}"
+  no_log: true
+  when: bbraft_server_api_keys | length > 0
+
+- name: API keys are unique
+  ansible.builtin.assert:
+    that: (bbraft_server_api_keys | map(attribute='key') | list | unique | length) == (bbraft_server_api_keys | length)
+    fail_msg: "bbraft_server_api_keys contains a duplicate raw key"
+    quiet: true
+  no_log: true
+  when: bbraft_server_api_keys | length > 0
+
+# auth.LoadKeysFile defaults an empty id to the owner, so two entries can
+# collide even when every explicit id is different.
+- name: API key effective ids are unique after defaulting
+  ansible.builtin.assert:
+    that: (bbraft_server_api_keys | bbraft_effective_key_ids | unique | length) == (bbraft_server_api_keys | length)
+    fail_msg: "bbraft_server_api_keys has duplicate effective ids (an empty id defaults to the owner)"
+    quiet: true
+  no_log: true
+  when: bbraft_server_api_keys | length > 0
+
+- name: The nodehub role needs at least one node token digest
+  ansible.builtin.assert:
+    that:
+      - bbraft_server_node_tokens is sequence
+      - bbraft_server_node_tokens is not string
+      - bbraft_server_node_tokens is not mapping
+      - bbraft_server_node_tokens | length > 0
+    fail_msg: "bbraft_server_roles includes nodehub, so bbraft_server_node_tokens must not be empty"
+    quiet: true
+  no_log: true
+  when: bbraft_server_nodehub_enabled | bool
+
+# Only the SHA-256 digest is accepted. An entry carrying a raw token has an
+# unknown member and is rejected before it can reach the server.
+- name: Each node token entry is a digest
+  ansible.builtin.assert:
+    that:
+      - item is mapping and (item.keys() | list | difference(['id', 'tokenSha256']) | length == 0)
+      - item.id is defined and item.id is string and item.id | length > 0
+      - item.tokenSha256 is defined and item.tokenSha256 is string
+      - item.tokenSha256 is match('^[0-9a-f]{64}$')
+    fail_msg: "every bbraft_server_node_tokens entry needs id and a 64-character lowercase hex tokenSha256; raw tokens are not accepted"
+    quiet: true
+  loop: "{{ bbraft_server_node_tokens }}"
+  no_log: true
+  when: bbraft_server_node_tokens | length > 0
+
+- name: Node ids are unique
+  ansible.builtin.assert:
+    that:
+      - (bbraft_server_node_tokens | map(attribute='id') | list | unique | length) == (bbraft_server_node_tokens | length)
+    fail_msg: "bbraft_server_node_tokens contains a duplicate id; different ids may share a digest"
+    quiet: true
+  no_log: true
+  when: bbraft_server_node_tokens | length > 0

@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "type": "sandbox.created",
+  "status": "provisioning",
+  "ttlSeconds": 3600,
+  "sandbox": {
+    "id": "bx_23456789",
+    "name": "Sandbox 2026-11-08 12:00",
+    "state": "provisioning",
+    "url": null,
+    "ip": null,
+    "createdAt": "2026-11-08T12:00:00Z",
+    "updatedAt": "2026-11-08T12:00:00Z",
+    "archiveAfter": "2026-11-08T13:00:00Z",
+    "desktopAvailable": false,
+    "desktopUrl": null,
+    "snapshotAvailable": false,
+    "snapshotCompletedAt": null
+  }
+}

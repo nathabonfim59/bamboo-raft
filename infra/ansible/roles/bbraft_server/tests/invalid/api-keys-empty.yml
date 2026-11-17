@@ -1,0 +1,2 @@
+# Invalid input: the api role needs at least one key.
+bbraft_server_api_keys: []

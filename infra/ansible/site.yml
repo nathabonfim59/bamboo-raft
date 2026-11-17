@@ -1,0 +1,45 @@
+# Host baseline for bamboo-raft nodes.
+#   ansible-playbook site.yml --check --diff   # preview
+#   ansible-playbook site.yml                  # apply
+# Set -e kernel_reboot_allowed=false to skip the reboot into a new kernel.
+#
+# Garage is optional (tag `never`): it runs only when asked for, e.g.
+#   ansible-playbook site.yml --tags all,garage   # baseline + Garage
+#   ansible-playbook site.yml --tags garage       # Garage only
+# Without it, point bbraft at R2, AWS S3 or any S3 service (infra/README.md).
+- name: Node baseline
+  hosts: nodes
+  roles:
+    - { role: kvm, tags: [kvm] }
+    - { role: swap, tags: [swap] }
+    - { role: bulk_disk, tags: [bulk_disk] }
+    - { role: garage, tags: [garage, never] }
+    # Last: reboots only when a newer kernel is installed than the one running.
+    - { role: kernel_reboot, tags: [kernel_reboot] }
+
+# Tailnet-only access (tag `access`). First run: Ansible still reaches the
+# host on its public address; tailscale joins the tailnet and prints the
+# tailnet name. Point ansible_host at that name, then run the hardening play,
+# which refuses to run over any other address.
+#   ansible-playbook site.yml --tags tailscale
+#   ansible-playbook site.yml --tags hardening
+- name: Tailnet access
+  hosts: nodes
+  # A later failure must not drop a pending sshd reload or resolved restart.
+  force_handlers: true
+  roles:
+    - { role: tailscale, tags: [access, tailscale] }
+    - { role: hardening, tags: [access, hardening] }
+
+# bamboo-raft itself (tag `bbraft`). The control group runs Postgres and
+# bbraft-server; every node runs bbraft-node and dials the server.
+- name: Control plane
+  hosts: control
+  roles:
+    - { role: postgres, tags: [bbraft, postgres] }
+    - { role: bbraft_server, tags: [bbraft, bbraft_server] }
+
+- name: Node agent
+  hosts: nodes
+  roles:
+    - { role: bbraft_node, tags: [bbraft, bbraft_node] }

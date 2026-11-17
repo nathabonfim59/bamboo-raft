@@ -1,0 +1,42 @@
+# One data-mount case (included by data-mount.yml).
+- name: "{{ dm.name }}: temporary parent"
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: bbraft-mount
+  register: dm_parent
+
+- name: "{{ dm.name }}: data dir"
+  ansible.builtin.file:
+    path: "{{ dm_parent.path }}/data"
+    state: directory
+    mode: "0700"
+  when: dm.data_exists
+
+- name: "{{ dm.name }}: mount table"
+  ansible.builtin.copy:
+    dest: "{{ dm_parent.path }}/mounts.json"
+    mode: "0644"
+    content: >-
+      {{ ({dm_parent.path: dm.parent} | combine({dm_parent.path ~ '/data': dm.child} if dm.data_exists else {})) | to_json }}
+
+- name: "{{ dm.name }}: run the role's mount check"
+  block:
+    - name: "{{ dm.name }}: mount check"
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: data-mount
+      vars:
+        bbraft_node_data_dir: "{{ dm_parent.path }}/data"
+        bbraft_node_findmnt: [python3, "{{ playbook_dir }}/fake-findmnt.py", "{{ dm_parent.path }}/mounts.json"]
+    - name: "{{ dm.name }}: accepted"
+      ansible.builtin.set_fact:
+        dm_result: accepted
+  rescue:
+    - name: "{{ dm.name }}: refused"
+      ansible.builtin.set_fact:
+        dm_result: refused
+
+- name: "{{ dm.name }}: record a wrong outcome"
+  ansible.builtin.set_fact:
+    dm_failures: "{{ dm_failures + [dm.name ~ ': expected ' ~ dm.expect ~ ', got ' ~ dm_result] }}"
+  when: (dm.expect == 'refuse') != (dm_result == 'refused')

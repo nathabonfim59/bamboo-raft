@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 503,
+  "code": "out_of_capacity",
+  "message": "The sandbox node has no capacity for this command",
+  "error": {
+    "code": "out_of_capacity",
+    "message": "The sandbox node has no capacity for this command",
+    "status": 503,
+    "details": {"retryAfterSeconds": 5}
+  },
+  "requestId": "req_01HXEXAMPLE"
+}

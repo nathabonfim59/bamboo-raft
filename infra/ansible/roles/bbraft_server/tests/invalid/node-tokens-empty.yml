@@ -1,0 +1,2 @@
+# Invalid input: the nodehub role needs at least one digest.
+bbraft_server_node_tokens: []

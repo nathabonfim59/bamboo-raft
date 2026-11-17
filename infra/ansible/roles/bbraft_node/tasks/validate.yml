@@ -1,0 +1,527 @@
+# Inputs, transport rules and image manifests. Imported first by tasks/main.yml
+# and directly by the role-local tests, so an invalid install never creates a
+# user, directory, image or unit.
+- name: Required caller inputs are present
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_binary_src is string
+      - bbraft_node_binary_url is string
+      - bbraft_node_binary_sha256 is string
+      - bbraft_node_token is string
+      - bbraft_node_token_src is string
+      - (bbraft_node_binary_src | length > 0) or (bbraft_node_binary_url | length > 0)
+      - (bbraft_node_token | length > 0) or (bbraft_node_token_src | length > 0)
+    fail_msg: >-
+      supply exactly one of bbraft_node_binary_src / bbraft_node_binary_url
+      and exactly one of bbraft_node_token / bbraft_node_token_src; there are
+      no repository defaults for the binary or the token
+    quiet: true
+  no_log: true
+
+- name: Exactly one binary source is supplied
+  ansible.builtin.assert:
+    that: (bbraft_node_binary_src | length > 0) != (bbraft_node_binary_url | length > 0)
+    fail_msg: "set bbraft_node_binary_src or bbraft_node_binary_url, not both"
+    quiet: true
+
+- name: The binary checksum is a sha256
+  ansible.builtin.assert:
+    that: bbraft_node_binary_sha256 is match('^[0-9a-f]{64}$')
+    fail_msg: "bbraft_node_binary_sha256 must be 64 lowercase hex characters"
+    quiet: true
+
+- name: The binary source is local or an HTTP(S) URL
+  ansible.builtin.assert:
+    that:
+      - (bbraft_node_binary_src | length == 0) or (bbraft_node_binary_src | bbraft_node_path_valid)
+      - (bbraft_node_binary_url | length == 0) or (bbraft_node_binary_url is match('^https?://[^[:space:]]+$'))
+    fail_msg: "bbraft_node_binary_src must be an absolute controller path and bbraft_node_binary_url an http(s) URL"
+    quiet: true
+
+# The local source is checked before files.yml copies it, so a wrong or
+# missing binary cannot replace a working installed copy.
+- name: Read the local binary source
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_binary_src }}"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  become: false
+  register: bbraft_node_binary_source
+  when: bbraft_node_binary_src | length > 0
+
+- name: The local binary source matches the supplied sha256
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_binary_source.stat.exists
+      - bbraft_node_binary_source.stat.isreg
+      - bbraft_node_binary_source.stat.checksum == bbraft_node_binary_sha256
+    fail_msg: >-
+      {{ bbraft_node_binary_src }} is missing, not a regular file, or does not
+      match bbraft_node_binary_sha256
+    quiet: true
+  when: bbraft_node_binary_src | length > 0
+
+- name: Exactly one token source is supplied
+  ansible.builtin.assert:
+    that: (bbraft_node_token | length > 0) != (bbraft_node_token_src | length > 0)
+    fail_msg: "set bbraft_node_token or bbraft_node_token_src, not both"
+    quiet: true
+  no_log: true
+
+- name: The token value is a single line within the node's byte bound
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_token is not search("\\n")
+      - bbraft_node_token is not search("\\r")
+      - bbraft_node_token | trim == bbraft_node_token
+      - (bbraft_node_token | bbraft_node_byte_length) > 0
+      - (bbraft_node_token | bbraft_node_byte_length) <= 8192
+    fail_msg: >-
+      bbraft_node_token must be one nonempty line with no surrounding
+      whitespace and at most 8192 UTF-8 bytes
+    quiet: true
+  no_log: true
+  when: bbraft_node_token | length > 0
+
+- name: The token source is an absolute controller path
+  ansible.builtin.assert:
+    that: bbraft_node_token_src | bbraft_node_path_valid
+    fail_msg: "bbraft_node_token_src must be an absolute controller path"
+    quiet: true
+  when: bbraft_node_token_src | length > 0
+
+- name: Read the token source
+  ansible.builtin.stat:
+    path: "{{ bbraft_node_token_src }}"
+    get_checksum: false
+  delegate_to: localhost
+  become: false
+  register: bbraft_node_token_source
+  when: bbraft_node_token_src | length > 0
+
+- name: The token source is a small regular file
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_token_source.stat.exists
+      - bbraft_node_token_source.stat.isreg
+      - bbraft_node_token_source.stat.size > 0
+      - bbraft_node_token_source.stat.size <= 8192
+    fail_msg: >-
+      {{ bbraft_node_token_src }} is missing, not a regular file, empty or
+      over the node's 8192-byte token limit
+    quiet: true
+  no_log: true
+  when: bbraft_node_token_src | length > 0
+
+- name: Read the token source content
+  ansible.builtin.slurp:
+    src: "{{ bbraft_node_token_src }}"
+  delegate_to: localhost
+  become: false
+  register: bbraft_node_token_source_raw
+  no_log: true
+  when: bbraft_node_token_src | length > 0
+
+- name: Decode the token source content
+  ansible.builtin.set_fact:
+    bbraft_node_token_source_content: "{{ bbraft_node_token_source_raw.content | b64decode }}"
+  no_log: true
+  when: bbraft_node_token_src | length > 0
+
+- name: The token source contains one nonempty token line
+  ansible.builtin.assert:
+    that:
+      - (bbraft_node_token_source_content | trim | bbraft_node_byte_length) > 0
+      - (bbraft_node_token_source_content | trim | bbraft_node_byte_length) <= 8192
+      - bbraft_node_token_source_content | trim is not search("\\n")
+      - bbraft_node_token_source_content | trim is not search("\\r")
+      - bbraft_node_token_source_content | trim is not search("\\0")
+    fail_msg: >-
+      {{ bbraft_node_token_src }} must contain exactly one nonempty token line
+      after trimming; whitespace-only or multiline content would be rejected by
+      bbraft-node
+    quiet: true
+  no_log: true
+  when: bbraft_node_token_src | length > 0
+
+- name: Identity, service and path settings are valid
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_data_owner is match('^[a-z_][a-z0-9_-]*$')
+      - bbraft_node_data_group is match('^[a-z_][a-z0-9_-]*$')
+      - bbraft_node_config_owner is match('^[a-z_][a-z0-9_-]*$')
+      - bbraft_node_config_group is match('^[a-z_][a-z0-9_-]*$')
+      - bbraft_node_token_owner is match('^[a-z_][a-z0-9_-]*$')
+      - bbraft_node_token_group is match('^[a-z_][a-z0-9_-]*$')
+      - bbraft_node_kvm_group is match('^[a-z_][a-z0-9_-]*$')
+      - bbraft_node_service is match('^[A-Za-z0-9_.@-]+$')
+      - bbraft_node_config_dir | bbraft_node_path_valid
+      - bbraft_node_data_dir | bbraft_node_path_valid
+      - bbraft_node_image_dir | bbraft_node_path_valid
+      - bbraft_node_token_file | bbraft_node_path_valid
+      - bbraft_node_binary_path | bbraft_node_path_valid
+      - bbraft_node_unit_path | bbraft_node_path_valid
+      - bbraft_node_udev_rule_path | bbraft_node_path_valid
+      - bbraft_node_modules_load_path | bbraft_node_path_valid
+      - bbraft_node_config_dir != '/'
+      - bbraft_node_data_dir != '/'
+      - bbraft_node_image_dir != '/'
+      - bbraft_node_token_file != '/'
+      - bbraft_node_binary_path != '/'
+      - bbraft_node_unit_path != '/'
+      - bbraft_node_udev_rule_path != '/'
+      - bbraft_node_modules_load_path != '/'
+      - ([bbraft_node_config_dir, bbraft_node_data_dir, bbraft_node_image_dir] | unique | length) == 3
+      - ([bbraft_node_token_file, bbraft_node_binary_path, bbraft_node_unit_path, bbraft_node_udev_rule_path, bbraft_node_modules_load_path] | unique | length) == 5
+      - bbraft_node_token_file not in [bbraft_node_config_dir, bbraft_node_data_dir, bbraft_node_image_dir]
+      - bbraft_node_binary_path not in [bbraft_node_config_dir, bbraft_node_data_dir, bbraft_node_image_dir]
+      - bbraft_node_unit_path not in [bbraft_node_config_dir, bbraft_node_data_dir, bbraft_node_image_dir]
+      - bbraft_node_udev_rule_path not in [bbraft_node_config_dir, bbraft_node_data_dir, bbraft_node_image_dir]
+      - bbraft_node_modules_load_path not in [bbraft_node_config_dir, bbraft_node_data_dir, bbraft_node_image_dir]
+      - bbraft_node_token_file.startswith(bbraft_node_config_dir ~ '/')
+      - not bbraft_node_binary_path.startswith(bbraft_node_data_dir ~ '/')
+      - not bbraft_node_binary_path.startswith(bbraft_node_image_dir ~ '/')
+      - not bbraft_node_binary_path.startswith(bbraft_node_config_dir ~ '/')
+      - not bbraft_node_unit_path.startswith(bbraft_node_data_dir ~ '/')
+      - not bbraft_node_unit_path.startswith(bbraft_node_image_dir ~ '/')
+      - not bbraft_node_udev_rule_path.startswith(bbraft_node_data_dir ~ '/')
+      - not bbraft_node_udev_rule_path.startswith(bbraft_node_image_dir ~ '/')
+      - not bbraft_node_modules_load_path.startswith(bbraft_node_data_dir ~ '/')
+      - not bbraft_node_modules_load_path.startswith(bbraft_node_image_dir ~ '/')
+      - not bbraft_node_config_dir.startswith(bbraft_node_data_dir ~ '/')
+      - not bbraft_node_config_dir.startswith(bbraft_node_image_dir ~ '/')
+      - not bbraft_node_image_dir.startswith(bbraft_node_config_dir ~ '/')
+      - bbraft_node_config_mode is match('^0[0-7]{3}$')
+      - bbraft_node_data_mode is match('^0[0-7]{3}$')
+      - bbraft_node_image_mode is match('^0[0-7]{3}$')
+      - bbraft_node_image_file_mode is match('^0[0-7]{3}$')
+      - bbraft_node_secret_mode is match('^0[0-7]{3}$')
+      - bbraft_node_binary_mode is match('^0[0-7]{3}$')
+      - bbraft_node_unit_mode is match('^0[0-7]{3}$')
+      - bbraft_node_udev_mode is match('^0[0-7]{3}$')
+      - bbraft_node_modules_load_mode is match('^0[0-7]{3}$')
+      - bbraft_node_image_owner is match('^[a-z_][a-z0-9_-]*$')
+      - bbraft_node_image_group is match('^[a-z_][a-z0-9_-]*$')
+    fail_msg: >-
+      user/group/service names must be plain names and every configured
+      destination path must be clean canonical absolute POSIX text
+    quiet: true
+
+# The node runs as root (the jail supervisor). The data root, config
+# directory and token share that one owner; production is root. The local
+# render tests (bbraft_node_manage_service=false) use their own user.
+# DelegateSubgroup= is a fixed capability requirement: a caller may raise the
+# floor checked on real hosts, never lower it below systemd 254.
+- name: The systemd floor is at least systemd 254
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_systemd_min_version | bbraft_node_rate_valid
+      - (bbraft_node_systemd_min_version | bbraft_node_rate_int) >= 254
+    fail_msg: >-
+      bbraft_node_systemd_min_version must be an integer of at least
+      systemd 254 (DelegateSubgroup=); it may be raised, never lowered
+    quiet: true
+
+# systemd names the unit after its file: the rendered jail cgroup and
+# ReadWritePaths use <service>.service, so the installed file must match.
+- name: The unit file is named after the service
+  ansible.builtin.assert:
+    that: (bbraft_node_unit_path | basename) == bbraft_node_service ~ '.service'
+    fail_msg: >-
+      bbraft_node_unit_path {{ bbraft_node_unit_path }} must be named
+      {{ bbraft_node_service }}.service, the service whose cgroup the unit
+      renders
+    quiet: true
+
+- name: The data root, config directory and token are owned by the root supervisor
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_config_owner == bbraft_node_data_owner
+      - bbraft_node_token_owner == bbraft_node_data_owner
+      - bbraft_node_config_group == bbraft_node_data_group
+      - bbraft_node_token_group == bbraft_node_data_group
+      - not (bbraft_node_manage_service | bool) or (bbraft_node_data_owner == 'root' and bbraft_node_data_group == 'root')
+    fail_msg: >-
+      the data root, config directory and token must be root-owned by the one
+      jail supervisor owner (bbraft_node_data_owner/group, config and token
+      owner/group all equal, and root:root on a real host)
+    quiet: true
+
+- name: The token, data, image and binary permission policy is enforced
+  ansible.builtin.assert:
+    that:
+      # bbraft-node requires perm & ~0600 == 0; owner execute is not allowed.
+      - bbraft_node_secret_mode in ['0600', '0400']
+      - bbraft_node_config_mode == '0750'
+      - bbraft_node_data_mode == '0700'
+      # The service is not the image owner or group, so the world bits must
+      # carry the promised read/traverse access. Exact masks avoid POSIX's
+      # owner/group class shadowing a weaker world bit.
+      - bbraft_node_image_mode == '0555'
+      - bbraft_node_image_file_mode == '0444'
+      - bbraft_node_binary_mode == '0755'
+      - bbraft_node_unit_mode == '0644'
+      - bbraft_node_udev_mode == '0644'
+      - bbraft_node_modules_load_mode == '0644'
+    fail_msg: >-
+      the token must be owned by the service at 0600/0400, config 0750,
+      data 0700, image directories 0555, image files 0444, the binary 0755 and
+      unit/udev/module files 0644; weaker or class-shadowed modes are refused
+    quiet: true
+
+- name: The unit flags are valid
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_server_addr | bbraft_node_server_addr_valid
+      - (bbraft_node_id | length) == 0 or (bbraft_node_id is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'))
+      - (bbraft_node_default_image | length) == 0 or (bbraft_node_default_image is match('^[a-z0-9][a-z0-9._-]{0,63}$'))
+      - bbraft_node_cpu_model is match('^[A-Za-z0-9._+-]{1,64}$')
+      - bbraft_node_cpu_model is not match('(?i)^(host|max)$')
+      - bbraft_node_cpu_nested in ['auto', 'on', 'off']
+      - bbraft_node_cpu_features is sequence and bbraft_node_cpu_features is not string
+      - bbraft_node_cpu_features | length <= 32
+      - bbraft_node_cpu_features | unique | map('regex_replace', '^[+-]', '') | unique | length == bbraft_node_cpu_features | length
+      - bbraft_node_cpu_features | reject('match', '^[+-][a-z0-9][a-z0-9._-]{0,63}$') | list | length == 0
+      - bbraft_node_cpu_features | select('match', '^[+-](vmx|svm)$') | list | length == 0
+      - (bbraft_node_boot_timeout | bbraft_node_go_duration) is string
+    fail_msg: >-
+      server.addr must be localhost, loopback or a private IP with a port;
+      node.id/default-image/cpu-model must be plain identifiers; cpu-model
+      may not be host or max; node.cpu-nested must be auto, on or off;
+      cpu-features must be at most 32 distinct +name/-name toggles, never vmx/svm;
+      boot-timeout must be a positive Go duration
+    quiet: true
+
+# The role always deploys production TAP networking. The node binary also has
+# an explicit dev/test user-mode network fallback (-node.network-mode=user);
+# this role refuses it, so no inventory can silently turn isolation off.
+- name: The production VM networking inputs are complete
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_network_mode == 'tap'
+      - bbraft_node_network_prefix is string
+      - (bbraft_node_network_prefix | length) > 0
+      - bbraft_node_network_gateway is string
+      - (bbraft_node_network_gateway | length) > 0
+      - bbraft_node_ssh_ingress_addr is string
+      - (bbraft_node_ssh_ingress_addr | length) > 0
+      - bbraft_node_ssh_ingress_iface is string
+      - (bbraft_node_ssh_ingress_iface | length) > 0
+      - bbraft_node_ssh_port_range is string
+      - (bbraft_node_ssh_port_range | length) > 0
+    fail_msg: >-
+      the bbraft_node role always deploys production TAP networking and
+      requires bbraft_node_network_prefix, bbraft_node_network_gateway,
+      bbraft_node_ssh_ingress_addr, bbraft_node_ssh_ingress_iface and
+      bbraft_node_ssh_port_range; the dev/test user-mode fallback is never
+      rendered by this role
+    quiet: true
+
+# These filters mirror nodenet.Config.Validate and the node's CLI checks, so a
+# role run cannot render a configuration the binary refuses at startup.
+- name: The VM networking values are valid and isolated
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_network_bridge | bbraft_node_iface_name_valid
+      - bbraft_node_network_prefix | bbraft_node_guest_prefix_valid
+      - bbraft_node_network_gateway | bbraft_node_gateway_valid(bbraft_node_network_prefix)
+      - bbraft_node_ssh_ingress_addr | bbraft_node_ingress_addr_valid
+      - not (bbraft_node_ssh_ingress_addr | bbraft_node_addr_in_prefix(bbraft_node_network_prefix))
+      - bbraft_node_ssh_ingress_iface | bbraft_node_iface_name_valid
+      - bbraft_node_ssh_ingress_iface != bbraft_node_network_bridge
+      - bbraft_node_ssh_port_range | bbraft_node_ssh_port_range_valid
+      - bbraft_node_network_management is sequence
+      - bbraft_node_network_management is not string
+      - (bbraft_node_network_management | reject('string') | list | length) == 0
+      - (bbraft_node_network_management | map('bbraft_node_ipv4_prefix_valid') | list | length) == (bbraft_node_network_management | length)
+      - (bbraft_node_network_management | map('bbraft_node_prefixes_overlap', bbraft_node_network_prefix) | select | list | length) == 0
+      - bbraft_node_network_resolvers is sequence
+      - bbraft_node_network_resolvers is not string
+      - (bbraft_node_network_resolvers | length) >= 1
+      - (bbraft_node_network_resolvers | length) <= 2
+      - (bbraft_node_network_resolvers | reject('string') | list | length) == 0
+      - (bbraft_node_network_resolvers | map('bbraft_node_resolver_valid') | list | length) == (bbraft_node_network_resolvers | length)
+      - (bbraft_node_network_resolvers | map('bbraft_node_addr_in_prefix', bbraft_node_network_prefix) | select | list | length) == 0
+      - (bbraft_node_network_resolvers | map('bbraft_node_addr_in_prefixes', bbraft_node_network_management) | select | list | length) == 0
+    fail_msg: >-
+      VM networking must be a complete, isolated production TAP
+      configuration: the bridge and SSH ingress interface are valid interface
+      names and differ; the guest prefix is private /8..30 with a decimal
+      length; the gateway is inside it and is neither the network nor
+      broadcast address; resolvers are one or two public unicast IPv4
+      addresses outside the guest prefix and management networks; management
+      networks are IPv4 prefixes with decimal lengths that do not overlap the
+      guest prefix; the SSH ingress address is a unicast IPv4 address outside
+      the guest prefix; and the port range is an inclusive 1024..65535
+      min-max
+    quiet: true
+
+# These mirror cmd/bbraft-node's jail flag checks (options.jail), so the
+# role never renders a jail configuration the binary refuses at startup.
+- name: The jailed QEMU inputs are valid
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_jail_uid_range | bbraft_node_uid_range_valid
+      - bbraft_node_jail_io_device | bbraft_node_block_device_valid
+      - bbraft_node_jail_io_read_bps | bbraft_node_rate_valid
+      - bbraft_node_jail_io_write_bps | bbraft_node_rate_valid
+      - bbraft_node_jail_io_read_iops | bbraft_node_rate_valid
+      - bbraft_node_jail_io_write_iops | bbraft_node_rate_valid
+      - ([bbraft_node_jail_io_read_bps, bbraft_node_jail_io_write_bps, bbraft_node_jail_io_read_iops, bbraft_node_jail_io_write_iops]
+         | map('bbraft_node_rate_int') | max) > 0
+      - bbraft_node_jail_qemu_binary | bbraft_node_path_ok
+      - bbraft_node_jail_tool_binary | bbraft_node_path_ok
+      - bbraft_node_jail_firmware is sequence and bbraft_node_jail_firmware is not string
+      - bbraft_node_jail_library_dirs is sequence and bbraft_node_jail_library_dirs is not string
+      - bbraft_node_jail_firmware | map('bbraft_node_path_ok') | reject | list | length == 0
+      - bbraft_node_jail_library_dirs | map('bbraft_node_path_ok') | reject | list | length == 0
+      - bbraft_node_jail_firmware | unique | length == bbraft_node_jail_firmware | length
+      - bbraft_node_jail_library_dirs | unique | length == bbraft_node_jail_library_dirs | length
+    fail_msg: >-
+      the jailed QEMU inputs are invalid: bbraft_node_jail_uid_range must be
+      canonical min-max with 0 < min < max < 2^31, bbraft_node_jail_io_device
+      canonical MAJ:MIN with a nonzero major, every io rate a non-negative
+      integer with at least one positive, and the QEMU and qemu-img binaries,
+      firmware files and library dirs distinct clean absolute paths without
+      commas
+    quiet: true
+
+# The hardening play runs before the node play, so the forward allowance is an
+# inventory-level pairing: hardening forwards only through the bridge this
+# node owns, never through the SSH ingress interface.
+- name: The hardening forward allowance names exactly the VM bridge
+  ansible.builtin.assert:
+    that:
+      - hardening_vm_bridge_interfaces is defined
+      - hardening_vm_bridge_interfaces is sequence and hardening_vm_bridge_interfaces is not string
+      - bbraft_node_network_bridge in hardening_vm_bridge_interfaces
+      - bbraft_node_ssh_ingress_iface not in hardening_vm_bridge_interfaces
+    fail_msg: >-
+      hardening_vm_bridge_interfaces must be defined in the inventory, contain
+      bbraft_node_network_bridge and not contain bbraft_node_ssh_ingress_iface
+    quiet: true
+
+- name: Normalize numeric capacity, overcommit and reserve flags
+  ansible.builtin.set_fact:
+    bbraft_node_capacity_vcpus_int: "{{ bbraft_node_capacity_vcpus | bbraft_node_uint }}"
+    bbraft_node_capacity_memory_mib_int: "{{ bbraft_node_capacity_memory_mib | bbraft_node_uint }}"
+    bbraft_node_capacity_disk_gib_int: "{{ bbraft_node_capacity_disk_gib | bbraft_node_uint }}"
+    bbraft_node_cpu_overcommit_ratio: "{{ bbraft_node_cpu_overcommit | bbraft_node_ratio }}"
+    bbraft_node_memory_overcommit_ratio: "{{ bbraft_node_memory_overcommit | bbraft_node_ratio }}"
+    bbraft_node_disk_overcommit_ratio: "{{ bbraft_node_disk_overcommit | bbraft_node_ratio }}"
+    bbraft_node_reserve_vcpus_int: "{{ bbraft_node_reserve_vcpus | bbraft_node_uint }}"
+    bbraft_node_reserve_memory_mib_int: "{{ bbraft_node_reserve_memory_mib | bbraft_node_uint }}"
+    bbraft_node_reserve_disk_gib_int: "{{ bbraft_node_reserve_disk_gib | bbraft_node_uint }}"
+    bbraft_node_jail_io_rates_int:
+      read_bps: "{{ bbraft_node_jail_io_read_bps | bbraft_node_rate_int }}"
+      write_bps: "{{ bbraft_node_jail_io_write_bps | bbraft_node_rate_int }}"
+      read_iops: "{{ bbraft_node_jail_io_read_iops | bbraft_node_rate_int }}"
+      write_iops: "{{ bbraft_node_jail_io_write_iops | bbraft_node_rate_int }}"
+
+# The limits mirror cmd/bbraft-node/config.go: vCPUs are uint32, and memory
+# and disk must fit their byte conversions.
+- name: Numeric flags fit the binary's resource types
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_capacity_vcpus_int <= 4294967295
+      - bbraft_node_reserve_vcpus_int <= 4294967295
+      - bbraft_node_capacity_memory_mib_int <= 17592186044415
+      - bbraft_node_reserve_memory_mib_int <= 17592186044415
+      - bbraft_node_capacity_disk_gib_int <= 17179869183
+      - bbraft_node_reserve_disk_gib_int <= 17179869183
+    fail_msg: "a capacity or reserve value overflows the resource type bbraft-node uses"
+    quiet: true
+
+- name: Supplied images are a unique list of local directories
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_images is sequence
+      - bbraft_node_images is not string
+      - bbraft_node_images is not mapping
+      - (bbraft_node_images | length) > 0
+      - (bbraft_node_images | reject('string') | list | length) == 0
+      - (bbraft_node_images | map('bbraft_node_path_valid') | list | length) == (bbraft_node_images | length)
+      - (bbraft_node_images | map('regex_replace', '/$', '') | unique | list | length) == (bbraft_node_images | length)
+    fail_msg: >-
+      bbraft_node_images must be a nonempty list of unique absolute controller
+      paths, one per published image version directory; bbraft-node refuses to
+      start without at least one verified image
+    quiet: true
+
+- name: Start with no image specifications
+  ansible.builtin.set_fact:
+    bbraft_node_image_specs: []
+
+- name: Read each supplied image manifest
+  ansible.builtin.set_fact:
+    bbraft_node_image_specs: >-
+      {{ bbraft_node_image_specs + [
+           {'src': (item | regex_replace('/$', '')),
+            'manifest': (lookup('file', (item | regex_replace('/$', '')) ~ '/manifest.json') | from_json)}
+         ] }}
+  loop: "{{ bbraft_node_images }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Supplied image manifests declare exactly the published entry set
+  ansible.builtin.assert:
+    that:
+      - item.manifest is mapping
+      - (item.manifest.schemaVersion | default(0)) | bbraft_node_is_int
+      - item.manifest.schemaVersion == 1
+      - item.manifest.id is string
+      - item.manifest.id is match('^[a-z0-9][a-z0-9._-]{0,63}$')
+      - item.manifest.id == (item.src | basename)
+      - item.manifest.artifacts is mapping
+      - (item.manifest.artifacts | length) == 4
+      - (item.manifest.artifacts.keys() | list | sort) == ['initrd', 'kernel', 'packages.json', 'root.qcow2']
+      - (item.manifest.artifacts.values() | rejectattr('sha256', 'defined') | list | length) == 0
+      - (item.manifest.artifacts.values() | rejectattr('size', 'defined') | list | length) == 0
+      - (item.manifest.artifacts.values() | map(attribute='sha256') | reject('match', '^[0-9a-f]{64}$') | list | length) == 0
+      - (item.manifest.artifacts.values() | map(attribute='size') | map('bbraft_node_is_int') | select('equalto', true) | list | length) == 4
+      - (item.manifest.artifacts.values() | map(attribute='size') | min) > 0
+      - item.manifest.root is mapping
+      - item.manifest.root.format == 'qcow2'
+      - item.manifest.root.filesystem == 'ext4'
+      - item.manifest.root.diskGiB | bbraft_node_is_int
+      - item.manifest.root.diskGiB >= 1
+      - item.manifest.root.diskGiB <= 1024
+      - item.manifest.root.virtualSizeBytes | bbraft_node_is_int
+      - item.manifest.root.virtualSizeBytes == (item.manifest.root.diskGiB * 1073741824)
+    fail_msg: >-
+      {{ item.src }}/manifest.json must be schemaVersion 1 with id equal to
+      the directory basename and exactly kernel, initrd, root.qcow2 and
+      packages.json, each with a genuine positive integer size and lowercase
+      sha256 (numeric strings and booleans are rejected); root must be
+      qcow2/ext4 with genuine integer 1..1024 GiB matching virtualSizeBytes
+    quiet: true
+  loop: "{{ bbraft_node_image_specs }}"
+  loop_control:
+    label: "{{ item.src }}"
+
+- name: Supplied image ids are unique
+  ansible.builtin.assert:
+    that:
+      - (bbraft_node_image_specs | map(attribute='manifest.id') | list | unique | length) == (bbraft_node_image_specs | length)
+    fail_msg: "bbraft_node_images contains two directories with the same manifest id"
+    quiet: true
+
+# A disposable image built for release-guard tests must never be published.
+# images/publish.sh refuses it; this role publishes version directories
+# directly, so it must refuse it independently and before any target
+# mutation. Legacy manifests without a distribution block stay valid; only an
+# explicit unpinned snapshot marker is refused.
+- name: Supplied images are not disposable unpinned test images
+  ansible.builtin.assert:
+    that:
+      - item.manifest.id is not search('-unpinned-test$')
+      - (item.manifest.distribution | default({})) is mapping
+      - (item.manifest.distribution | default({})).get('snapshot') != 'unpinned'
+    fail_msg: >-
+      {{ item.src }} is a disposable unpinned test image; images/publish.sh
+      refuses an id ending in -unpinned-test or distribution.snapshot
+      unpinned, and this role's direct publication refuses it too
+    quiet: true
+  loop: "{{ bbraft_node_image_specs }}"
+  loop_control:
+    label: "{{ item.src }}"

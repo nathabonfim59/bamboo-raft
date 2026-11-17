@@ -1,0 +1,36 @@
+{
+  "ok": true,
+  "type": "sandbox.stopped",
+  "id": "bx_23456789",
+  "status": "archived",
+  "sandbox": {
+    "id": "bx_23456789",
+    "name": "Sandbox 2026-11-11 10:00",
+    "state": "archived",
+    "subdomain": null,
+    "archiveAfter": "2026-11-11T11:00:00Z",
+    "ttlSeconds": 3600,
+    "stoppedAt": "2026-11-11T10:00:05Z",
+    "desktopAvailable": false,
+    "snapshotAvailable": false,
+    "stop": {
+      "id": "stop_0123456789abcdef",
+      "status": "completed",
+      "requestedAt": null,
+      "lastAttemptAt": "2026-11-11T10:00:05Z",
+      "error": null,
+      "endedAt": "2026-11-11T10:00:05Z",
+      "forced": false
+    }
+  },
+  "forced": false,
+  "operation": {
+    "id": "stop_0123456789abcdef",
+    "status": "completed",
+    "requestedAt": null,
+    "lastAttemptAt": "2026-11-11T10:00:05Z",
+    "error": null,
+    "endedAt": "2026-11-11T10:00:05Z"
+  },
+  "statusUrl": "/api/v1/sandboxes/bx_23456789/stops/stop_0123456789abcdef"
+}

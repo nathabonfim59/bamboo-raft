@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "type": "file.download_url",
+  "url": "https://api.example.test/api/bbraft/downloads/secret-token",
+  "method": "GET",
+  "path": "/home/user/archive.tar",
+  "expiresAt": "2026-11-08T12:15:00Z"
+}

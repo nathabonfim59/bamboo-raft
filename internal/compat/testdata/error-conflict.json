@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 409,
+  "code": "conflict",
+  "message": "Sandbox already exists",
+  "error": {
+    "code": "conflict",
+    "message": "Sandbox already exists",
+    "status": 409,
+    "details": {"retryable": false}
+  },
+  "requestId": "req_01HXEXAMPLE"
+}

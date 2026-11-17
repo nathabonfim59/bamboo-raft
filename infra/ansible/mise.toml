@@ -1,0 +1,5 @@
+# Tools for infra/ansible, the same on any distro, no sudo: `mise install`.
+# uv is listed first: mise's pypi backend installs Python tools with it.
+[tools]
+uv = "0.13.7"
+"pypi:ansible-core" = "2.22.0"

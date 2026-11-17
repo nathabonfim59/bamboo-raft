@@ -1,0 +1,10 @@
+# Managed by bamboo-raft infra/ansible (role postgres).
+#
+# A drop-in included by the cluster's postgresql.conf. The main configuration
+# and pg_hba.conf are never rewritten: add any non-loopback access rule there
+# yourself, together with postgres_listen_addresses.
+listen_addresses = '{{ postgres_listen_addresses }}'
+port = {{ postgres_port | postgres_positive_int }}
+
+# New passwords are stored as SCRAM-SHA-256. Existing hashes keep working.
+password_encryption = 'scram-sha-256'

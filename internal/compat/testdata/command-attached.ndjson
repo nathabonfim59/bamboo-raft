@@ -1,0 +1,7 @@
+{"type":"attached","processId":7,"stdoutOffset":0,"stderrOffset":0}
+{"type":"stdout","data":"€","nextOffset":3}
+{"type":"stderr","data":"warning\n","nextOffset":8}
+{"type":"heartbeat"}
+{"type":"exit","status":"exited","exitCode":0,"signal":null,"stdoutOffset":3,"stderrOffset":8}
+{"type":"reconnect","stdoutOffset":3,"stderrOffset":8}
+{"type":"error","error":"sandbox_direct_failed","message":"the sandbox machine could not complete the call","stdoutOffset":3,"stderrOffset":8}

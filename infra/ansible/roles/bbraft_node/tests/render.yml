@@ -1,0 +1,507 @@
+# Renders the binary, token, image and systemd/udev files into a temporary
+# tree and asserts exact flags, formats, modes, quoting and hardening. No
+# package, user, systemd unit or service is touched
+# (bbraft_node_manage_service is false; only tasks/files and validate run).
+- name: Render and assert the bbraft_node role
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars.yml
+  vars:
+    bbraft_node_binary_src: "{{ playbook_dir }}/fixtures/bbraft-node"
+    bbraft_node_manage_service: false
+    bbraft_node_verify_unit: true
+    bbraft_node_image_files:
+      - initrd
+      - kernel
+      - packages.json
+      - root.qcow2
+    bbraft_node_image_entries:
+      - initrd
+      - kernel
+      - manifest.json
+      - packages.json
+      - root.qcow2
+  tasks:
+    - name: Temporary root
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: bbraft-node-test
+      register: bbraft_node_test_root
+
+    - name: Read the role defaults
+      ansible.builtin.set_fact:
+        bbraft_node_defaults: "{{ lookup('file', playbook_dir ~ '/../defaults/main.yml') | from_yaml }}"
+
+    - name: The production defaults own published images as root
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_defaults.bbraft_node_image_owner == 'root'
+          - bbraft_node_defaults.bbraft_node_image_group == 'root'
+          - bbraft_node_defaults.bbraft_node_image_mode == '0555'
+          - bbraft_node_defaults.bbraft_node_image_file_mode == '0444'
+          - bbraft_node_defaults.bbraft_node_secret_mode == '0600'
+          - bbraft_node_defaults.bbraft_node_binary_owner == 'root'
+          - bbraft_node_defaults.bbraft_node_binary_group == 'root'
+          - bbraft_node_defaults.bbraft_node_binary_mode == '0755'
+          - bbraft_node_defaults.bbraft_node_unit_owner == 'root'
+          - bbraft_node_defaults.bbraft_node_unit_group == 'root'
+          - bbraft_node_defaults.bbraft_node_udev_owner == 'root'
+          - bbraft_node_defaults.bbraft_node_udev_group == 'root'
+          - bbraft_node_defaults.bbraft_node_modules_load_owner == 'root'
+          - bbraft_node_defaults.bbraft_node_modules_load_group == 'root'
+          - bbraft_node_defaults.bbraft_node_data_mode == '0700'
+          - bbraft_node_defaults.bbraft_node_id == ''
+          - bbraft_node_defaults.bbraft_node_cpu_overcommit == 1.0
+          - bbraft_node_defaults.bbraft_node_memory_overcommit == 1.0
+          - bbraft_node_defaults.bbraft_node_disk_overcommit == 1.0
+          - bbraft_node_defaults.bbraft_node_network_mode == 'tap'
+          - bbraft_node_defaults.bbraft_node_network_bridge == 'bbraft0'
+          - bbraft_node_defaults.bbraft_node_network_resolvers == ['1.1.1.1', '9.9.9.9']
+          - bbraft_node_defaults.bbraft_node_network_prefix == ''
+          - bbraft_node_defaults.bbraft_node_network_gateway == ''
+          - bbraft_node_defaults.bbraft_node_ssh_ingress_addr == ''
+          - bbraft_node_defaults.bbraft_node_ssh_ingress_iface == ''
+          - bbraft_node_defaults.bbraft_node_ssh_port_range == ''
+          # A10: a root jail supervisor on a fresh v1 data root (D-b), with no
+          # service account and no guessed jail hardware inputs (D-c).
+          - bbraft_node_defaults.bbraft_node_data_dir == '/var/lib/bbraft-node-v1'
+          - bbraft_node_defaults.bbraft_node_data_owner == 'root'
+          - bbraft_node_defaults.bbraft_node_data_group == 'root'
+          - bbraft_node_defaults.bbraft_node_config_owner == 'root'
+          - bbraft_node_defaults.bbraft_node_config_group == 'root'
+          - bbraft_node_defaults.bbraft_node_token_owner == 'root'
+          - bbraft_node_defaults.bbraft_node_token_group == 'root'
+          - "'bbraft_node_user' not in bbraft_node_defaults"
+          - "'bbraft_node_group' not in bbraft_node_defaults"
+          - bbraft_node_defaults.bbraft_node_jail_uid_range == ''
+          - bbraft_node_defaults.bbraft_node_jail_io_device == ''
+          - bbraft_node_defaults.bbraft_node_jail_io_read_bps == 0
+          - bbraft_node_defaults.bbraft_node_jail_io_write_bps == 0
+          - bbraft_node_defaults.bbraft_node_jail_io_read_iops == 0
+          - bbraft_node_defaults.bbraft_node_jail_io_write_iops == 0
+          - bbraft_node_defaults.bbraft_node_jail_qemu_binary == '/usr/bin/qemu-system-x86_64'
+          - bbraft_node_defaults.bbraft_node_jail_tool_binary == '/usr/bin/qemu-img'
+          - bbraft_node_defaults.bbraft_node_jail_firmware == ['/usr/share/seabios/bios-256k.bin', '/usr/share/qemu/linuxboot_dma.bin', '/usr/share/qemu/kvmvapic.bin']
+          - bbraft_node_defaults.bbraft_node_jail_library_dirs == []
+          # A10 fix B: the node needs ip and nft, and the tun, vhost_net and
+          # vhost_vsock modules, before the hardened service starts.
+          - "'iproute2' in bbraft_node_defaults.bbraft_node_packages"
+          - "'nftables' in bbraft_node_defaults.bbraft_node_packages"
+          - bbraft_node_defaults.bbraft_node_kernel_modules == ['tun', 'vhost_net', 'vhost_vsock']
+          # A10 fix D: the unit file is named after the service.
+          # (raw defaults text: the template expression itself is compared)
+          - bbraft_node_defaults.bbraft_node_unit_path == '/etc/systemd/system/' ~ '{' ~ '{ bbraft_node_service }' ~ '}' ~ '.service'
+        fail_msg: "published images/binary/unit must default to root-owned/read-only, data private on the fresh v1 root, node.id empty, overcommit 1.0, TAP mode with no defaulted operator network or jail hardware inputs"
+        quiet: true
+
+    - name: Use a temporary tree with spaces, percent, dollar and quotes in its path
+      ansible.builtin.set_fact:
+        bbraft_node_config_dir: '{{ bbraft_node_test_root.path }}/etc bbraft % $ "x"'
+        bbraft_node_data_dir: '{{ bbraft_node_test_root.path }}/state dir % $ "x"'
+        bbraft_node_image_dir: '{{ bbraft_node_test_root.path }}/state dir % $ "x"/images'
+        bbraft_node_binary_path: '{{ bbraft_node_test_root.path }}/bin/bbraft-node'
+        bbraft_node_unit_path: '{{ bbraft_node_test_root.path }}/bbraft-node.service'
+        bbraft_node_udev_rule_path: '{{ bbraft_node_test_root.path }}/60-bbraft-kvm.rules'
+        bbraft_node_modules_load_path: '{{ bbraft_node_test_root.path }}/bbraft-vhost-vsock.conf'
+        bbraft_node_token_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_token_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_binary_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_binary_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_unit_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_unit_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_udev_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_udev_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_modules_load_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_modules_load_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_image_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_image_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_data_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_data_group: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_config_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_node_config_group: "{{ ansible_facts['user_id'] }}"
+
+    - name: Point the token at the temporary config directory
+      ansible.builtin.set_fact:
+        bbraft_node_token_file: "{{ bbraft_node_config_dir }}/node.token"
+
+    - name: Create the simulated directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ bbraft_node_config_dir }}", mode: "0750" }
+        - { path: "{{ bbraft_node_data_dir }}", mode: "0700" }
+        - { path: "{{ bbraft_node_image_dir }}", mode: "0755" }
+        - { path: "{{ bbraft_node_binary_path | dirname }}", mode: "0755" }
+
+    - name: Validate the inputs before rendering
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate
+
+    - name: Render the binary, token, images and units
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: files
+
+    - name: Stat every rendered file
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        get_checksum: true
+      loop:
+        - { path: "{{ bbraft_node_binary_path }}", mode: "0755" }
+        - { path: "{{ bbraft_node_token_file }}", mode: "0600" }
+        - { path: "{{ bbraft_node_unit_path }}", mode: "0644" }
+        - { path: "{{ bbraft_node_udev_rule_path }}", mode: "0644" }
+        - { path: "{{ bbraft_node_modules_load_path }}", mode: "0644" }
+      register: bbraft_node_stats
+
+    - name: Every file exists with its documented mode
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.mode == item.item.mode
+        fail_msg: "{{ item.item.path }} is missing or has mode {{ item.stat.mode | default('missing') }}, want {{ item.item.mode }}"
+        quiet: true
+      loop: "{{ bbraft_node_stats.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    - name: Stat the published image version
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_image_dir }}/{{ (bbraft_node_image_specs | first).manifest.id }}"
+        get_checksum: false
+      register: bbraft_node_published_image_dir
+
+    - name: Stat the published image artifacts
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_image_dir }}/{{ (bbraft_node_image_specs | first).manifest.id }}/{{ item }}"
+        get_checksum: true
+      loop: "{{ bbraft_node_image_files }}"
+      register: bbraft_node_published_image_files
+
+    - name: The published image version is read-only with exact entries
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_published_image_dir.stat.isdir
+          - bbraft_node_published_image_dir.stat.mode == '0555'
+          - (bbraft_node_published_image_files.results | selectattr('stat.exists', 'equalto', false) | list | length) == 0
+          - (bbraft_node_published_image_files.results | map(attribute='stat.mode') | unique | list) == ['0444']
+        fail_msg: "the image version must be a 0555 directory with four 0444 artifacts"
+        quiet: true
+
+    - name: List the published image entries
+      ansible.builtin.find:
+        paths: "{{ bbraft_node_image_dir }}/{{ (bbraft_node_image_specs | first).manifest.id }}"
+        recurse: false
+        hidden: true
+        file_type: any
+      register: bbraft_node_published_entries
+
+    - name: The version directory contains exactly the five fixed entries
+      ansible.builtin.assert:
+        that:
+          - (bbraft_node_published_entries.files | map(attribute='path') | map('basename') | sort | list) == bbraft_node_image_entries
+        fail_msg: "the published image version contains an unexpected entry"
+        quiet: true
+
+    - name: Read the unit and the token
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ bbraft_node_unit_path }}"
+        - "{{ bbraft_node_token_file }}"
+      register: bbraft_node_slurped
+      no_log: true
+
+    - name: Decode the unit and token
+      ansible.builtin.set_fact:
+        bbraft_node_unit_content: "{{ bbraft_node_slurped.results[0].content | b64decode }}"
+        bbraft_node_token_content: "{{ bbraft_node_slurped.results[1].content | b64decode }}"
+      no_log: true
+
+    - name: The unit carries the exact supported flags and values
+      ansible.builtin.assert:
+        that:
+          - "'-server.addr \"127.0.0.1:7701\"' in bbraft_node_unit_content"
+          - "'-node.id' not in bbraft_node_unit_content"
+          - "'-node.token-file' in bbraft_node_unit_content"
+          - "'-node.data-dir' in bbraft_node_unit_content"
+          - "'-node.image-dir' in bbraft_node_unit_content"
+          - "'-node.default-image' not in bbraft_node_unit_content"
+          - "'-node.cpu-model \"Haswell-noTSX\"' in bbraft_node_unit_content"
+          - "'-node.cpu-nested \"auto\"' in bbraft_node_unit_content"
+          - "'-node.boot-timeout \"2m\"' in bbraft_node_unit_content"
+          - "'-node.capacity-vcpus \"0\"' in bbraft_node_unit_content"
+          - "'-node.capacity-memory-mib \"0\"' in bbraft_node_unit_content"
+          - "'-node.capacity-disk-gib \"0\"' in bbraft_node_unit_content"
+          - "'-node.cpu-overcommit \"1.0\"' in bbraft_node_unit_content"
+          - "'-node.memory-overcommit \"1.0\"' in bbraft_node_unit_content"
+          - "'-node.disk-overcommit \"1.0\"' in bbraft_node_unit_content"
+          - "'-node.cpu-allow-host' not in bbraft_node_unit_content"
+          - "'-node.reserve-vcpus \"1\"' in bbraft_node_unit_content"
+          - "'-node.reserve-memory-mib \"1024\"' in bbraft_node_unit_content"
+          - "'-node.reserve-disk-gib \"1\"' in bbraft_node_unit_content"
+          - "'-node.network-mode \"tap\"' in bbraft_node_unit_content"
+          - "'-node.network-mode \"user\"' not in bbraft_node_unit_content"
+          - "'-node.network-bridge \"bbraft0\"' in bbraft_node_unit_content"
+          - "'-node.network-prefix \"10.42.0.0/16\"' in bbraft_node_unit_content"
+          - "'-node.network-gateway \"10.42.0.1\"' in bbraft_node_unit_content"
+          - "'-node.network-resolvers \"1.1.1.1,9.9.9.9\"' in bbraft_node_unit_content"
+          - "'-node.network-management' not in bbraft_node_unit_content"
+          - "'-node.ssh-ingress-addr \"203.0.113.10\"' in bbraft_node_unit_content"
+          - "'-node.ssh-ingress-iface \"example0\"' in bbraft_node_unit_content"
+          - "'-node.ssh-port-range \"22000-22999\"' in bbraft_node_unit_content"
+          - "'-node.jail-uid-range \"900000-900999\"' in bbraft_node_unit_content"
+          - "'-node.jail-cgroup \"/sys/fs/cgroup/system.slice/bbraft-node.service/vms\"' in bbraft_node_unit_content"
+          - "'-node.jail-qemu-binary \"/usr/bin/qemu-system-x86_64\"' in bbraft_node_unit_content"
+          - "'-node.jail-tool-binary \"/usr/bin/qemu-img\"' in bbraft_node_unit_content"
+          - "'-node.jail-firmware \"/usr/share/seabios/bios-256k.bin,/usr/share/qemu/linuxboot_dma.bin,/usr/share/qemu/kvmvapic.bin\"' in bbraft_node_unit_content"
+          - "'-node.jail-library-dirs' not in bbraft_node_unit_content"
+          - "'-node.jail-io-device \"8:0\"' in bbraft_node_unit_content"
+          - "'-node.jail-io-write-bps \"104857600\"' in bbraft_node_unit_content"
+          - "'-node.jail-io-read-bps' not in bbraft_node_unit_content"
+          - "'-node.jail-io-read-iops' not in bbraft_node_unit_content"
+          - "'-node.jail-io-write-iops' not in bbraft_node_unit_content"
+          - "(bbraft_node_unit_content | regex_findall('(?m)^    -[a-z]') | length) == 31"
+        fail_msg: "the unit does not carry the exact cmd/bbraft-node/config flag names and defaults, or the production TAP networking configuration"
+        quiet: true
+
+    - name: Read the rendered modules-load file
+      ansible.builtin.slurp:
+        src: "{{ bbraft_node_modules_load_path }}"
+      register: bbraft_node_modules_load_slurped
+
+    - name: The modules-load file persists every required module
+      ansible.builtin.assert:
+        that:
+          - (bbraft_node_modules_load_slurped.content | b64decode).splitlines() | reject('match', '^(#|$)') | list == ['tun', 'vhost_net', 'vhost_vsock']
+        fail_msg: "the modules-load file must list exactly tun, vhost_net and vhost_vsock"
+        quiet: true
+
+    - name: Read the role's main tasks
+      ansible.builtin.set_fact:
+        bbraft_node_main_tasks: "{{ lookup('file', playbook_dir ~ '/../tasks/main.yml') | from_yaml }}"
+
+    - name: Module loading cannot be ignored and is proven before the service starts
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_load_task | length == 1
+          - "'failed_when' not in bbraft_node_load_task[0]"
+          - "'ignore_errors' not in bbraft_node_load_task[0]"
+          - bbraft_node_proof_task | length == 1
+          - (bbraft_node_main_tasks | map(attribute='name') | list).index(bbraft_node_proof_task[0].name) <
+            (bbraft_node_main_tasks | map(attribute='name') | list).index('Run bbraft-node')
+        fail_msg: "the kernel module load must fail on error and be proven before the service starts"
+        quiet: true
+      vars:
+        bbraft_node_load_task: "{{ bbraft_node_main_tasks | selectattr('name', 'equalto', 'Load the required kernel modules for this boot') | list }}"
+        bbraft_node_proof_task: "{{ bbraft_node_main_tasks | selectattr('name', 'equalto', 'The required kernel modules are loaded or built in') | list }}"
+
+    - name: The token file holds the placeholder and the unit does not
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_token_content == bbraft_node_token
+          - bbraft_node_token not in bbraft_node_unit_content
+        fail_msg: "the token was not written correctly or leaked into the unit"
+        quiet: true
+      no_log: true
+
+    - name: The unit can reach KVM, vsock, QMP and user-mode networking
+      ansible.builtin.assert:
+        that:
+          - "'PrivateDevices=false' in bbraft_node_unit_content"
+          - "'PrivateDevices=true' not in bbraft_node_unit_content"
+          - "'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_VSOCK' in bbraft_node_unit_content"
+          - "'KillMode=process' in bbraft_node_unit_content"
+          - "'TimeoutStopSec=30' in bbraft_node_unit_content"
+          - "'TasksMax=infinity' in bbraft_node_unit_content"
+          - "'LimitNOFILE=65536' in bbraft_node_unit_content"
+        fail_msg: "the unit may kill QEMU or deny a device/family QEMU needs"
+        quiet: true
+
+    - name: The unit keeps broad non-QEMU hardening without speculative deny lists
+      ansible.builtin.assert:
+        that:
+          - "'NoNewPrivileges=true' in bbraft_node_unit_content"
+          - "'ProtectSystem=strict' in bbraft_node_unit_content"
+          - "'ProtectHome=true' in bbraft_node_unit_content"
+          - "'PrivateTmp=true' in bbraft_node_unit_content"
+          - "'ProtectKernelTunables=true' in bbraft_node_unit_content"
+          - "'ProtectKernelModules=true' in bbraft_node_unit_content"
+          - "'ReadWritePaths=' in bbraft_node_unit_content"
+          - "'SystemCallFilter' not in bbraft_node_unit_content"
+          - "'RestrictNamespaces' not in bbraft_node_unit_content"
+          - "'MemoryDenyWriteExecute' not in bbraft_node_unit_content"
+        fail_msg: "a speculative deny list could break QEMU, or a hardening directive is missing"
+        quiet: true
+
+    - name: The unit runs a root jail supervisor inside the exact privilege boundary
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_unit_content is not search('(?m)^(User|Group|SupplementaryGroups|DynamicUser)=')
+          - (bbraft_node_unit_content | regex_findall('(?m)^CapabilityBoundingSet=(.*)$') | first | default('')).split() | sort ==
+            ['CAP_CHOWN', 'CAP_DAC_OVERRIDE', 'CAP_FOWNER', 'CAP_KILL', 'CAP_MKNOD', 'CAP_NET_ADMIN', 'CAP_SETGID', 'CAP_SETPCAP', 'CAP_SETUID', 'CAP_SYS_ADMIN', 'CAP_SYS_CHROOT', 'CAP_SYS_PTRACE']
+          - bbraft_node_unit_content | regex_findall('(?m)^CapabilityBoundingSet=') | length == 1
+          - bbraft_node_unit_content | regex_findall('(?m)^AmbientCapabilities=(.*)$') == ['']
+          - bbraft_node_unit_content | regex_findall('(?m)^NoNewPrivileges=(.*)$') == ['true']
+          - bbraft_node_unit_content | regex_findall('(?m)^SystemCallArchitectures=(.*)$') == ['native']
+          - bbraft_node_unit_content | regex_findall('(?m)^Delegate=(.*)$') == ['yes']
+          - bbraft_node_unit_content | regex_findall('(?m)^DelegateSubgroup=(.*)$') == ['supervisor']
+          - bbraft_node_unit_content | regex_findall('(?m)^DevicePolicy=(.*)$') == ['closed']
+          - bbraft_node_unit_content | regex_findall('(?m)^DeviceAllow=(.*)$') ==
+            ['/dev/kvm rwm', '/dev/vhost-vsock rw', '/dev/vhost-net rw', '/dev/net/tun rw', '/dev/null rwm', '/dev/urandom rwm', '/dev/vsock r']
+          - bbraft_node_unit_content | regex_findall('(?m)^ProtectControlGroups=(.*)$') == ['false']
+          - bbraft_node_unit_content | regex_findall('(?m)^ReadOnlyPaths=(.*)$') == ['/sys/fs/cgroup']
+          - bbraft_node_readwrite_line.endswith(' /sys/fs/cgroup/system.slice/bbraft-node.service')
+          - bbraft_node_unit_content is not search('(?m)^(RestrictNamespaces|SystemCallFilter|PrivateUsers|ProtectProc|ProcSubset)=')
+          - bbraft_node_unit_content | regex_findall('(?m)^KillMode=(.*)$') == ['process']
+        fail_msg: "the unit must run as root with exactly the jail supervisor capabilities, Delegate/DelegateSubgroup, a closed device policy with the six QEMU devices, a writable delegated service cgroup only, and no namespace or syscall filters"
+        quiet: true
+      vars:
+        bbraft_node_readwrite_line: "{{ bbraft_node_unit_content.splitlines() | select('match', '^ReadWritePaths=') | list | first }}"
+
+    - name: The temporary paths were quoted for systemd
+      ansible.builtin.assert:
+        that:
+          - "'%%' in bbraft_node_unit_content"
+          - "'$$' in bbraft_node_unit_content"
+          - "'state dir %% $' in bbraft_node_unit_content"
+          - "'$$' not in bbraft_node_readwrite_line"
+          - "'state dir %% $' in bbraft_node_readwrite_line"
+        fail_msg: "the systemd quoting filters did not escape the temporary paths"
+        quiet: true
+      vars:
+        bbraft_node_readwrite_line: "{{ bbraft_node_unit_content.splitlines() | select('match', '^ReadWritePaths=') | list | first }}"
+
+    - name: Record the rendered file checksums before a rerun
+      ansible.builtin.set_fact:
+        bbraft_node_first_checksums: "{{ bbraft_node_stats.results | map(attribute='stat.checksum') | list }}"
+
+    - name: Render again to prove idempotence
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: files
+
+    - name: Stat every rendered file after the rerun
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        get_checksum: true
+      loop:
+        - { path: "{{ bbraft_node_binary_path }}" }
+        - { path: "{{ bbraft_node_token_file }}" }
+        - { path: "{{ bbraft_node_unit_path }}" }
+        - { path: "{{ bbraft_node_udev_rule_path }}" }
+        - { path: "{{ bbraft_node_modules_load_path }}" }
+      register: bbraft_node_rerun_stats
+
+    - name: A rerun changes no rendered file
+      ansible.builtin.assert:
+        that:
+          - (bbraft_node_rerun_stats.results | map(attribute='stat.checksum') | list) == bbraft_node_first_checksums
+        fail_msg: "a second render changed a file; the role is not idempotent"
+        quiet: true
+
+    - name: Render with the optional node id, default image, nested choice and non-default ratios
+      ansible.builtin.set_fact:
+        bbraft_node_id: node-example
+        bbraft_node_default_image: image-fixture
+        bbraft_node_cpu_nested: "on"
+        bbraft_node_cpu_features: ["-vmx-apicv-vid", "-vmx-posted-intr"]
+        bbraft_node_cpu_overcommit: 2.5
+        bbraft_node_memory_overcommit: 4
+        bbraft_node_disk_overcommit: 1.25
+        bbraft_node_network_management: ["100.64.0.0/10"]
+        bbraft_node_jail_library_dirs: ["/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"]
+        bbraft_node_jail_io_read_bps: 52428800
+        bbraft_node_jail_io_read_iops: 2000
+        bbraft_node_jail_io_write_iops: 1000
+
+    - name: Re-validate and normalize the changed flag inputs
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate
+
+    - name: Render the optional flags and configured ratios
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: files
+
+    - name: Read the unit with optional flags
+      ansible.builtin.slurp:
+        src: "{{ bbraft_node_unit_path }}"
+      register: bbraft_node_optional_unit
+
+    - name: The optional node id, default image and configured ratios are emitted
+      ansible.builtin.assert:
+        that:
+          - "'-node.id \"node-example\"' in bbraft_node_optional_unit_content"
+          - "'-node.default-image \"image-fixture\"' in bbraft_node_optional_unit_content"
+          - "'-node.cpu-nested \"on\"' in bbraft_node_optional_unit_content"
+          - "'-node.cpu-features \"-vmx-apicv-vid,-vmx-posted-intr\"' in bbraft_node_optional_unit_content"
+          - "'-node.cpu-overcommit \"2.5\"' in bbraft_node_optional_unit_content"
+          - "'-node.memory-overcommit \"4\"' in bbraft_node_optional_unit_content"
+          - "'-node.disk-overcommit \"1.25\"' in bbraft_node_optional_unit_content"
+          - "'-node.network-mode \"tap\"' in bbraft_node_optional_unit_content"
+          - "'-node.network-management \"100.64.0.0/10\"' in bbraft_node_optional_unit_content"
+          - "'-node.jail-library-dirs \"/usr/lib/x86_64-linux-gnu,/lib/x86_64-linux-gnu\"' in bbraft_node_optional_unit_content"
+          - "'-node.jail-io-read-bps \"52428800\"' in bbraft_node_optional_unit_content"
+          - "'-node.jail-io-read-iops \"2000\"' in bbraft_node_optional_unit_content"
+          - "'-node.jail-io-write-iops \"1000\"' in bbraft_node_optional_unit_content"
+          - "'-node.jail-io-write-bps \"104857600\"' in bbraft_node_optional_unit_content"
+          - "(bbraft_node_optional_unit_content | regex_findall('(?m)^    -[a-z]') | length) == 39"
+        fail_msg: "a configured node id, default image, cpu-nested choice, cpu features, overcommit ratio, management network or optional jail setting did not reach ExecStart, or the flag count is not 39"
+        quiet: true
+      vars:
+        bbraft_node_optional_unit_content: "{{ bbraft_node_optional_unit.content | b64decode }}"
+
+    - name: Keep a copy of the full rendered unit for the real CLI flag check
+      ansible.builtin.copy:
+        content: "{{ bbraft_node_optional_unit.content | b64decode }}"
+        dest: "{{ bbraft_node_render_output }}"
+        mode: "0644"
+      when: bbraft_node_render_output is defined
+
+    - name: Keep a copy of the default rendered unit for the real CLI flag check
+      ansible.builtin.copy:
+        content: "{{ bbraft_node_unit_content }}"
+        dest: "{{ bbraft_node_render_output_default }}"
+        mode: "0644"
+      when: bbraft_node_render_output_default is defined
+
+    - name: Look for systemd-analyze
+      ansible.builtin.command:
+        argv: [systemd-analyze, --version]
+      register: bbraft_node_systemd_analyze
+      changed_when: false
+      failed_when: false
+
+    - name: Systemd-analyze must be available for this test
+      ansible.builtin.assert:
+        that: bbraft_node_systemd_analyze.rc == 0
+        fail_msg: >-
+          systemd-analyze is required for the bbraft_node render test.
+          Set bbraft_node_verify_unit=false only in a documented non-systemd
+          test container.
+        quiet: true
+      when: bbraft_node_verify_unit | bool
+
+    - name: Verify the rendered unit with systemd-analyze
+      ansible.builtin.command:
+        argv: [systemd-analyze, verify, "{{ bbraft_node_unit_path }}"]
+      changed_when: false
+      when: bbraft_node_verify_unit | bool
+
+    - name: Make the temporary image version writable for cleanup
+      ansible.builtin.file:
+        path: "{{ bbraft_node_image_dir }}/{{ (bbraft_node_image_specs | first).manifest.id }}"
+        state: directory
+        mode: "0755"
+
+    - name: Remove the temporary root
+      ansible.builtin.file:
+        path: "{{ bbraft_node_test_root.path }}"
+        state: absent

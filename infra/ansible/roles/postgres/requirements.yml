@@ -1,0 +1,11 @@
+# The role uses community.postgresql for postgresql_user / postgresql_db.
+# This file is role-local because the shared requirements.yml is owned by the
+# lead; install it into the same .collections directory as the shared ones:
+#
+#   cd infra/ansible
+#   mise exec -- ansible-galaxy collection install -r roles/postgres/requirements.yml
+#
+# Tested with community.postgresql 5.1.1 on ansible-core 2.22.0.
+collections:
+  - name: community.postgresql
+    version: "5.1.1"

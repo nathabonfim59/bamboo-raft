@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "type": "sandbox.error",
+  "status": 503,
+  "code": "ssh_host_key_unavailable",
+  "message": "ssh host key is not available yet",
+  "error": {
+    "code": "ssh_host_key_unavailable",
+    "message": "ssh host key is not available yet",
+    "status": 503,
+    "details": {"retryAfterSeconds": 5}
+  },
+  "requestId": "req_01HXEXAMPLE"
+}

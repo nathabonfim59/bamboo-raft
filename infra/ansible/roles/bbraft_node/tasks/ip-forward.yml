@@ -1,0 +1,88 @@
+# IPv4 forwarding for the node's guest networking. The node verifies
+# net.ipv4.ip_forward=1 at startup and fails closed, so the role provides it,
+# but only while the live ruleset proves the hardening role's forward filter:
+# one inet bbraft_filter forward base chain with policy drop that accepts only
+# IPv4 traffic of the configured bridges (filter bbraft_node_forward_guard).
+#
+# Order: read and prove the live ruleset, then persist the conf, then (when the
+# conf changed or the runtime value is not 1) read and prove the ruleset again
+# immediately before sysctl --load of exactly that file, then verify the
+# runtime value. A refused guard never writes the conf and never runs sysctl.
+# The two reads use nft's JSON output; `nft` and `sysctl` are looked up in
+# PATH, which the role-local tests use to substitute fakes.
+- name: Read the live nftables ruleset
+  ansible.builtin.command:
+    argv: [nft, -j, list, ruleset]
+  register: bbraft_node_forward_ruleset
+  changed_when: false
+  check_mode: false
+
+- name: The live ruleset has the hardening forward filter
+  ansible.builtin.assert:
+    that:
+      - >-
+        bbraft_node_forward_ruleset.stdout
+        | bbraft_node_forward_guard(hardening_vm_bridge_interfaces,
+                                    bbraft_node_network_bridge,
+                                    bbraft_node_ssh_ingress_iface)
+    fail_msg: refusing to enable IPv4 forwarding without the hardening forward filter
+    quiet: true
+
+- name: Persist IPv4 forwarding
+  ansible.builtin.copy:
+    dest: "{{ bbraft_node_ip_forward_conf }}"
+    content: |
+      # Managed by bamboo-raft (role bbraft_node): bbraft-node needs IPv4
+      # forwarding and refuses to start without it. Applied only while the
+      # hardening forward filter is loaded.
+      net.ipv4.ip_forward = 1
+    owner: "{{ bbraft_node_ip_forward_owner }}"
+    group: "{{ bbraft_node_ip_forward_group }}"
+    mode: "0644"
+  register: bbraft_node_ip_forward_persisted
+
+- name: Read the runtime IPv4 forwarding value
+  ansible.builtin.command:
+    argv: [sysctl, -n, net.ipv4.ip_forward]
+  register: bbraft_node_ip_forward_runtime
+  changed_when: false
+  check_mode: false
+
+- name: Apply IPv4 forwarding
+  when:
+    - not ansible_check_mode
+    - bbraft_node_ip_forward_persisted is changed or (bbraft_node_ip_forward_runtime.stdout | trim) != '1'
+  block:
+    - name: Read the live nftables ruleset again before applying
+      ansible.builtin.command:
+        argv: [nft, -j, list, ruleset]
+      register: bbraft_node_forward_ruleset_apply
+      changed_when: false
+
+    - name: The hardening forward filter is still live
+      ansible.builtin.assert:
+        that:
+          - >-
+            bbraft_node_forward_ruleset_apply.stdout
+            | bbraft_node_forward_guard(hardening_vm_bridge_interfaces,
+                                        bbraft_node_network_bridge,
+                                        bbraft_node_ssh_ingress_iface)
+        fail_msg: refusing to apply IPv4 forwarding without the hardening forward filter
+        quiet: true
+
+    - name: Load the persisted IPv4 forwarding setting
+      ansible.builtin.command:
+        argv: [sysctl, "--load={{ bbraft_node_ip_forward_conf }}"]
+      changed_when: true
+
+    - name: Read the runtime IPv4 forwarding value after the apply
+      ansible.builtin.command:
+        argv: [sysctl, -n, net.ipv4.ip_forward]
+      register: bbraft_node_ip_forward_applied
+      changed_when: false
+
+    - name: IPv4 forwarding is on
+      ansible.builtin.assert:
+        that: (bbraft_node_ip_forward_applied.stdout | trim) == '1'
+        fail_msg: net.ipv4.ip_forward is not 1 after loading {{ bbraft_node_ip_forward_conf }}
+        quiet: true
