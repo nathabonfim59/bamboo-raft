@@ -600,3 +600,68 @@ var (
 	_ nodeNetwork = (*fakeNetwork)(nil)
 	_ vmManager   = (*fakeManager)(nil)
 )
+
+// startupRunner is a [nodenet.Runner] for the real network manager: it answers
+// the host probes with a fixed address list and records every state-changing
+// command, so a test can prove start-up changed nothing.
+type startupRunner struct {
+	addrs string
+	runs  []string
+	outs  []string
+}
+
+func (r *startupRunner) Run(_ context.Context, name string, args []string, _ []byte) error {
+	r.runs = append(r.runs, name+" "+strings.Join(args, " "))
+	return nil
+}
+
+func (r *startupRunner) Output(_ context.Context, name string, args []string) ([]byte, error) {
+	cmd := name + " " + strings.Join(args, " ")
+	r.outs = append(r.outs, cmd)
+	switch cmd {
+	case "ip -Version", "nft --version":
+		return []byte("ok\n"), nil
+	case "ip -j -4 addr show":
+		return []byte(r.addrs), nil
+	}
+	return nil, errors.New("test: unexpected command " + cmd)
+}
+
+// TestRunRefusesGuestPrefixOverlappingAHostInterface is the two-node e2e
+// failure at command level: the host's own interface holds 10.42.0.2/16 and
+// the guest prefix is 10.42.0.0/16. Start-up runs the real network manager's
+// CheckHost right after construction, which refuses before the node manager,
+// the link, any TAP or any nft/ip change exists.
+func TestRunRefusesGuestPrefixOverlappingAHostInterface(t *testing.T) {
+	d, s := tapJailDeps(t)
+	runner := &startupRunner{addrs: `[{"ifname":"enp0s2","addr_info":[{"local":"10.42.0.2","prefixlen":16}]},` +
+		`{"ifname":"eth0","addr_info":[{"local":"203.0.113.10","prefixlen":24}]}]`}
+	d.newNetwork = func(cfg nodenet.Config, log *slog.Logger) (nodeNetwork, error) {
+		s.add("newNetwork")
+		cfg.StateDir = t.TempDir()
+		return nodenet.New(cfg, nodenet.Deps{Runner: runner, Logger: log})
+	}
+	serveReturns(&d, s, nil)
+	var stderr strings.Builder
+
+	err := runWithDeps(t.Context(), tapJailArgs(), &stderr, d)
+	if err == nil {
+		t.Fatal("start-up accepted a guest prefix that overlaps a host interface")
+	}
+	for _, want := range []string{"node networking: check host", "enp0s2", "10.42.0.2/16", "10.42.0.0/16", "-node.network-prefix"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+	for _, event := range s.snapshot() {
+		if event == "newManager" || event == "serve" {
+			t.Errorf("start-up reached %q after the refusal: %v", event, s.snapshot())
+		}
+	}
+	if len(runner.runs) != 0 {
+		t.Errorf("start-up changed the host before refusing: %v", runner.runs)
+	}
+	if strings.Contains(stderr.String(), "bbraft-node ready") || strings.Contains(stderr.String(), "vm networking ready") {
+		t.Errorf("readiness logged after the refusal: %q", stderr.String())
+	}
+}

@@ -24,20 +24,22 @@ Schema 2020-12 support.
 
 ## Operation matrix
 
-Operations implemented in 0.1.0:
+Operations implemented today:
 
 | Operation | Method and path | Notes |
 |---|---|---|
 | `me` | `GET /me` | Same envelope; account fields are a subset. |
 | `sandboxes` | `GET /sandboxes` | Cursor pagination, `state`, `name`, `namePrefix`, `label`. |
-| `create` | `POST /sandboxes` | Starts provisioning from the node base image; with `from`, restores a saved snapshot on its artifact node; status 202. |
+| `create` | `POST /sandboxes` | Starts provisioning from the node base image or a placed node; with `from` (a saved name or `bsh_` share code), restores a generation on any placed node with an object store (a legacy node-local row restores on the node that holds its artifact); `count` above one creates an all-or-nothing batch spread over the placed nodes; status 202. |
 | `get` | `GET /sandboxes/{sandboxId}` | Poll after create, stop, resume or delete. Exports `subdomain`, `sshEndpoint`, `stoppedAt`, `archiveAfter`, the configured `ttlSeconds` and, after any stop, its `stop` metadata. |
 | `update` | `PATCH /sandboxes/{sandboxId}` | Display name, tri-state `ttlSeconds` and validated globally unique `subdomain`. Empty names are rejected and over-long names are truncated to 120 characters. |
 | `deleteSandbox` | `DELETE /sandboxes/{sandboxId}` | Requires `X-Ascii-Confirm-Delete`; status 202 with a deletion operation. |
 | `getDeletionOperation` | `GET /deletion-operations/{operationId}` | Owner-scoped poll; `Cache-Control: no-store`. |
 | `stop` | `POST /sandboxes/{sandboxId}/stop` | 202 while archiving with the canonical `operation` and `statusUrl`; 200 with the last completed stop when already archived. `force` escalates a pending stop. |
 | `getStop` | `GET /sandboxes/{sandboxId}/stops/{stopId}` | Owner, sandbox and stop id are all bound; old stops stay readable after resume or a later stop. |
-| `resume` | `POST /sandboxes/{sandboxId}/resume` | Same-node resume of the retained disk, with optional `type`, `env`, `ttlSeconds` and `failFast`. Never falls back to another node or an empty disk. |
+| `resume` | `POST /sandboxes/{sandboxId}/resume` | Resume of the retained disk, with optional `type`, `env`, `ttlSeconds` and `failFast`. Same node first; with an object store, another node restores the last completed snapshot when the disk node cannot take it (see [Resume on another node](#resume-on-another-node)). Never an empty disk. |
+| `fork` | `POST /sandboxes/{sandboxId}/fork` | New sandbox on a new chain from a fresh (ready source) or the latest (stopped source) generation; optional `type`, `env`, `labels`, `ttlSeconds` and `failFast`. Status 202 `sandbox.forking`; the source keeps running. |
+| `recover` | `POST /sandboxes/{sandboxId}/recover` | 200 `sandbox.recovering`; asynchronously power-cycles the VM (`ResetVM`) keeping its disk. Refused while the guest answers a 3-second probe, within 10 minutes of the last recovery, without a running VM, or when the node is unreachable. |
 | `command` | `POST /sandboxes/{sandboxId}/commands` | Synchronous, `stream: true` and `detached: true`; sync/stream keep the 7200-second stream cap. |
 | `commandStatus` | `GET /sandboxes/{sandboxId}/commands/{processId}` | Durable detached status and log tails or offset windows; `LOST` and tenant scoping. |
 | `attachCommand` | `GET /sandboxes/{sandboxId}/commands/{processId}/stream` | NDJSON `attached`/`stdout`/`stderr`/`heartbeat`/`exit`/`reconnect`/`error`; raw byte offsets, bounded frames and 10-minute reconnect. |
@@ -53,18 +55,25 @@ Operations implemented in 0.1.0:
 | `setFilePermissions` | `POST /sandboxes/{sandboxId}/files/permissions` | Permission bits up to `0o7777`, including setuid, setgid and sticky; owner and group do not change. |
 | `createDownloadUrl` | `POST /sandboxes/{sandboxId}/files/download-url` | Server-served signed URL; the public receiver streams raw bytes without a bearer header. |
 | `sshKey` | `POST /sandboxes/{sandboxId}/sshkey` | One OpenSSH public key through `AddSSHKey`; returns `machineIp`, `sshUser`, `sshEndpoint` and the public `hostKey`. The endpoint is durable only for the current boot. |
-| `listSavedSnapshots` | `GET /saved-snapshots` | Local snapshots, newest first, with `name` and `namePrefix` filters. |
-| `saveSavedSnapshot` | `POST /saved-snapshots` | Status 202, `saving` until ready or failed. |
+| `listSavedSnapshots` | `GET /saved-snapshots` | Saved snapshots, newest first, with `name` and `namePrefix` filters. With an object store each row pins a completed generation; legacy node-local rows keep their artifact node. |
+| `saveSavedSnapshot` | `POST /saved-snapshots` | Status 202, `saving` until ready or failed. Records a new immutable generation (or a node-local artifact without an object store); a late save never replaces a newer one. |
 | `getSavedSnapshot` | `GET /saved-snapshots/{name}` | Poll a save. |
-| `deleteSavedSnapshot` | `DELETE /saved-snapshots/{name}` | Source sandbox deletion does not remove the artifact. |
+| `deleteSavedSnapshot` | `DELETE /saved-snapshots/{name}` | Revokes the name's share codes; source sandbox deletion does not remove the saved row. |
+| `listSnapshotShares` | `GET /saved-snapshots/{name}/shares` | The name's share codes, active and revoked. The code itself is never returned again. |
+| `createSnapshotShare` | `POST /saved-snapshots/{name}/shares` | 201; the full `bsh_` code appears only in this response. The database stores its SHA-256 and a display prefix. |
+| `revokeSnapshotShare` | `DELETE /saved-snapshots/{name}/shares/{shareId}` | 200; `shareId` is `shr_` plus 32 lowercase hex. Revoking stops new deployments and leaves existing sandboxes alone. |
+| `listSnapshots` | `GET /snapshots` | Completed generations of the account's live sandboxes; `limit`, `cursor`, `sort`; an unknown parameter is `400 invalid_query` naming it. |
+| `listSandboxSnapshots` | `GET /sandboxes/{sandboxId}/snapshots` | One sandbox's completed generations; a missing, foreign or deleted sandbox is `404`. |
+| `getLatestSandboxSnapshot` | `GET /sandboxes/{sandboxId}/snapshots/latest` | The newest completed generation, or an explicit `snapshot: null`; takes no query parameters. |
 
-Not implemented yet: fork and recover; command history and process
+Not implemented yet: command history and process
 lists (the detached records are exposed through command status/stop but not
 `command-history`); `searchFiles`, `findInFiles` and `replaceInFiles`;
-snapshot `tree`, `files` and `download`; `host` and `desktop`;
-prompts, conversations and events; environments, repos and secrets;
-organizations, teams, billing and `GET /limits`; webhooks; API keys; CI. They
-are not emulated with fake success.
+snapshot `tree`, `files` and `download`; `DELETE /snapshots/{id}` and
+`DELETE /sandboxes/{sandboxId}/snapshots`; `host` and `desktop`; prompts,
+conversations and events; environments, repos and secrets; organizations,
+teams, billing and `GET /limits`; webhooks; API keys; CI. They are not
+emulated with fake success.
 
 ## Stop and resume
 
@@ -73,9 +82,8 @@ its node, releases compute and archives the sandbox; resume starts that same
 disk on the same node. A forced stop persists the escalation on the canonical
 stop operation; the worker allows the current stop attempt a one-second grace
 before forcing it, so the stop stays asynchronous and queue-backed and keeps
-the disk as it is. There is no cloud snapshot chain, so force is not a
-rollback to an older snapshot and neither stop form restores an older point in
-time.
+the disk as it is. Force is not a rollback to an older generation, and neither
+stop form restores an older point in time.
 
 A stop is a durable operation: a new or pending stop returns `202` with the
 canonical `operation` and `statusUrl`, an already archived sandbox returns
@@ -88,8 +96,9 @@ that error) with no automatic retry; the row remains readable and a normal
 `DELETE` still works. Resuming such an error sandbox answers `409`
 `sandbox_not_ready` with `retryable: false` and does not admit a new machine.
 
-Resume keeps the retained disk and never falls back to another node or an
-empty replacement. `type` may keep or grow the disk but a shrink below it is
+Resume keeps the retained disk and never falls back to an empty
+replacement; it moves to another node only from a snapshot generation, with an
+object store configured. `type` may keep or grow the disk but a shrink below it is
 `409 type_too_small`; `env` replaces the per-sandbox environment; only
 `environment: base` is accepted (other names are `400 unknown_environment`) and
 `noEnv: true` is refused rather than ignored; `ttlSeconds` is tri-state
@@ -99,7 +108,111 @@ Changing type, requesting an environment change or requesting `noEnv` on a
 running sandbox is `409 sandbox_running_stop_first`; a resume that cannot take
 over an in-flight stop is `409 sandbox_stopping` with its `statusUrl`.
 `get`/list report the configured `ttlSeconds` (not the remaining time),
-`archiveAfter`, `stoppedAt`, `subdomain` and the latest `stop` object.
+`archiveAfter`, `stoppedAt`, `dataExpiredAt`, `subdomain` and the latest `stop`
+object.
+
+### Resume on another node
+
+With an object store configured, a stopped sandbox resumes on the node that
+keeps its disk whenever that node is connected and has room. Otherwise (the
+node is full or unreachable, or the disk is no longer on any node) the resume
+restores the sandbox's **last completed snapshot generation** on another node
+that has the snapshot's image and a working object store, preferring the node
+that wrote it. The snapshot chain continues: later generations keep numbering
+from the last one. The disk is never smaller than the snapshot's, whatever
+`type` asks for. Once the restored sandbox is ready, `hydrated` is recorded
+(`sandbox.hydrated` event) and the old node's copy of the disk is deleted, at
+once or, if that node is away, as soon as it reconnects; it is never started
+or snapshotted again.
+
+What is restored is the last completed generation, not the disk the old node
+kept. A normal stop takes a final generation, so the two are the same. After a
+forced stop whose final generation failed, the stop kept the previous
+generation, and writes made after it are lost when the sandbox resumes on
+another node (the forced stop already accepted that loss).
+
+A resume whose stored data expired answers `409 snapshot_data_expired`; one
+with neither a disk on any node nor a completed generation answers
+`409 resume_failed` (`retryable: false`). When the disk node is only full or
+away and there is no generation, the answer stays `503 no_ready_machine`. If
+the restore fails for good on the chosen node, the sandbox returns to stopped
+with no local disk and the next resume restores the same generation again.
+Without an object store, resume stays on the disk's node as described above.
+
+### Data retention
+
+With an object store configured, an archived sandbox keeps its stored data for
+`-lifecycle.data-retention-seconds` (14 days by default, `0` never; see
+[the server's retention rules](server.md#auto-stop-and-stopped-disk-retention)).
+When that passes, the sandbox stays in `archived` but `dataExpiredAt` is set and
+its disk no longer exists on any node or in the object store. `stoppedAt` keeps
+the stop time. Resume and fork then answer `409 snapshot_data_expired`, and so
+does `POST /saved-snapshots` from the sandbox; the row remains until an explicit
+`DELETE`. Saved snapshots are independent and never expire
+([Saved snapshot behavior](#saved-snapshot-behavior)). Without an object store
+the field is never set and stopped rows are deleted by the stopped-disk
+retention instead.
+
+### Node loss
+
+When a node stays unreachable past the server's grace (two minutes by
+default, see [the server's node loss rules](server.md#node-loss)), its
+sandboxes continue from the object store where they can:
+
+- A running sandbox with a completed snapshot generation is moved: `get`
+  shows it `provisioning` on another node and then `ready` again, with the
+  disk as of its **last completed generation** (writes made after that
+  generation are lost, at most one snapshot interval) and `hydrated` set. The
+  snapshot chain continues.
+- A running sandbox with nothing to restore from (snapshots off, or no
+  generation completed yet) becomes `error` with reason `node_lost`. It can
+  be deleted as usual.
+- A stopped sandbox whose disk was on that node keeps only its last
+  generation: the next resume restores it on another node. Without a
+  generation it stays as it is, and a resume answers `503 no_ready_machine`
+  until the node returns.
+- A stop in progress on that node completes from the last generation (writes
+  after it are lost); without one the stop keeps retrying.
+
+A link that drops and returns within the grace changes nothing. When a lost
+node comes back, its old copies of moved sandboxes are deleted; they never
+reappear in the API.
+
+## Fork
+
+`POST /sandboxes/{sandboxId}/fork` creates a new sandbox on a new snapshot
+chain from one generation of the source's. It answers `202` with
+`type: sandbox.forking`, `status: forking` and the fork as `sandbox`; the
+source is never modified and keeps running.
+
+A fork is a queued job, not a synchronous copy. For a ready source the job
+takes a fresh generation under the source's own guard before the fork boots, so
+the fork sees every file written before the call (the response can arrive
+before that cut finishes). A stopped (archived) source contributes its latest
+completed generation and is not snapshotted again; the job records that
+generation, so a fork always restores the data the client was answered for.
+
+The fork starts on a placed node, preferring the source node, and its disk is
+the larger of the requested type's and the source's, so a fork never shrinks
+the disk. It inherits the source's type and env unless the request sets `type`
+or `env` (an empty `env` object means no env; the source's env is never
+exposed, only copied inside the control plane). It never inherits the source's
+labels or TTL: `ttlSeconds` defaults to one hour and `null` disables auto-stop.
+`failFast` answers `503 no_ready_machine` when nothing can be placed right now;
+without it, an unplaceable fork is `503 out_of_capacity`. An `Idempotency-Key`
+makes a retry return the same fork.
+
+Refusals: a source created with `snapshots: false` answers `409
+snapshots_disabled` (and so does any fork when the installation has no object
+store), stopped data past retention answers `409 snapshot_data_expired`, a
+starting source `409 sandbox_resuming`, a stopping one `409 sandbox_stopping`,
+a source with no completed generation or a failed one `409 fork_failed`, a
+`type` whose disk cannot hold the source's data `409 type_too_small`, and a
+foreign or deleted source `404 not_found`. If the fork's own cut or restore
+fails, the fork ends in state `error` with reason `fork_failed` and its
+reserved capacity is released. As with create, `environment` accepts only
+`base` (other names are `400 unknown_environment`) and an explicit `monitoring`
+member is refused with `400 invalid_json`.
 
 ## Error codes by status
 
@@ -119,11 +232,31 @@ operation may answer:
   latter after a 60-second wait for a starting sandbox).
 
 `create` additionally answers `400` with `invalid_json`, `invalid_env`,
-`invalid_name`, `invalid_query` or `unknown_environment`, and `404
-snapshot_not_found` for a missing, foreign or not-ready saved snapshot.
+`invalid_name`, `invalid_query`, `unknown_environment`,
+`count_requires_from` (a batch without `from`) or `count_with_fail_fast`,
+and `404 snapshot_not_found` for a missing, foreign or not-ready saved
+snapshot or share code.
 `resume` answers `400` with `invalid_json`, `invalid_env` or
-`unknown_environment`. A starting sandbox is reported as `409
-sandbox_starting`.
+`unknown_environment`, and `409` with one of `conflict`,
+`sandbox_not_ready`, `sandbox_resuming`, `sandbox_running_stop_first`,
+`sandbox_stopping`, `snapshots_disabled`, `type_too_small`,
+`snapshot_data_expired` or `resume_failed`. A starting sandbox is reported as
+`409 sandbox_starting`. `recover` answers `404 not_found` for a missing or
+foreign sandbox and `409` with one of `no_machine`, `too_soon`,
+`sandbox_is_reachable`, `recover_unsupported` or `reset_failed`; an
+asynchronous reset that fails for good records `sandbox.recover_failed` with
+the fixed `reset_failed` code. `fork` answers `400` with `invalid_json`, `invalid_env`,
+`invalid_query` or `unknown_environment`, `404 not_found` or
+`snapshot_not_found`, and `409` with one of `conflict`, `fork_failed`,
+`snapshots_disabled`, `snapshot_data_expired`, `type_too_small`,
+`sandbox_resuming`, `sandbox_stopping`, `idempotency_in_progress` or
+`idempotency_key_reused`; its `503` carries `no_ready_machine` or
+`out_of_capacity` with `error.details.retryAfterSeconds`.
+The per-sandbox snapshot routes and the three share operations answer `404
+not_found` for a missing, foreign or deleted sandbox or name. The two
+paginated lists also answer `400 invalid_query` naming an unknown parameter,
+and `latest` takes no query parameters. An unknown or revoked share code is
+`404 snapshot_not_found` on a create.
 
 ## Files and signed downloads
 
@@ -278,9 +411,11 @@ Known limits:
   permission from their own `/home/user` or `/tmp` (for example mode `0111`);
   commands still work. The `mode: "0000"` createFolder race is
   described under [Files and signed downloads](#files-and-signed-downloads).
-- Stop and resume keep the retained disk on the same node. There is no
-  cross-node or empty-disk fallback; a confirmed missing disk ends in the
-  terminal `vm_missing` error.
+- Without an object store, stop and resume keep the retained disk on the
+  same node. There is no cross-node or empty-disk fallback; a confirmed
+  missing disk ends in the terminal `vm_missing` error. With one, resume may
+  move to another node from the last completed snapshot
+  ([Resume on another node](#resume-on-another-node)).
 - A saved-snapshot restore pin is held until the restore is ready, a confirmed
   outcome proves the retained disk is settled (a confirmed archived stop or a
   terminal missing-disk stop), or cleanup is confirmed. A cancelled or failed
@@ -302,12 +437,16 @@ Known limits:
    archived sandbox's retained disk is deleted with the sandbox (an ordinary
    explicit deletion through the normal deletion path) once it has been
    stopped longer than `-lifecycle.stopped-retention-seconds`, default seven
-   days, zero never. A resume of a sandbox whose retained disk the node
-   confirms missing ends in a terminal error; bamboo-raft never silently
-   boots an empty replacement disk. Likewise, a stop whose target VM and disk
-   are confirmed missing after the initial boot settled ends in the fixed
-   `vm_missing` failure instead of retrying forever; the row and stop stay
-   queryable and a normal `DELETE` still works.
+   days without an object store and `0` (off) with one, zero never. With an
+   object store the data expires first at
+   `-lifecycle.data-retention-seconds` (default fourteen days, zero never) and
+   the row stays until an explicit `DELETE`
+   ([Data retention](#data-retention)). A resume of a sandbox whose retained
+   disk the node confirms missing ends in a terminal error; bamboo-raft never
+   silently boots an empty replacement disk. Likewise, a stop whose target VM
+   and disk are confirmed missing after the initial boot settled ends in the
+   fixed `vm_missing` failure instead of retrying forever; the row and stop
+   stay queryable and a normal `DELETE` still works.
 3. **Reaching `ttlSeconds` archives the sandbox** (a durable stop with the disk
    kept), and `ttlSeconds: null` disables auto-stop.
 
@@ -361,11 +500,11 @@ These are omissions, not changes to the operations we do implement:
   `commandStatus`, `attachCommand` and `stopCommand` are implemented above.
   The legacy synchronous/stream command behavior and its 7200-second stream
   cap are unchanged. `command-history` and process lists remain out of scope.
-- **Saved snapshots are local.** It keeps a frozen disk on one node.
-  A create with `from` is placed on the node that holds the artifact. A source
-  sandbox can be deleted without deleting the saved artifact. Re-saving a
-  completed name creates a new immutable artifact; a late save can never
-  replace a newer one.
+- **Saved snapshots follow the object store.** With an object store a saved
+  snapshot pins a completed generation; without one it keeps a frozen disk on
+  one node. A source sandbox can be deleted without deleting the saved state,
+  and saved snapshots never expire: see
+  [Saved snapshot behavior](#saved-snapshot-behavior).
 - **No billing or organizations.** `cost`, `deletedCost`, wallets, plans and
   `org` scoping are not implemented. The list parser refuses the
   `org`, `stoppedBefore`, `dataExpired` and `include` parameters with
@@ -375,8 +514,9 @@ These are omissions, not changes to the operations we do implement:
   `failFast`, `count`, `setupScript`, `visibility`, `hostedPorts`, `files`,
   `org`, `teamId` and `from`. Handlers reject the features bamboo-raft does not
   support with a documented error; they never ignore a requested behavior.
-  Labels, env, name, type and TTL are supported; the other fields are accepted
-  only where their effect is implemented.
+  Labels, env, name, type, TTL, `from` (name or share code) and `count` are
+  supported; the other fields are accepted only where their effect is
+  implemented.
 - **Upload URLs are server-served.** The URL points at the control plane, is
   bound to owner, sandbox, path and expiry, and streams the body to the node in chunks with no
   application size limit. The URL token is secret-bearing and is redacted from
@@ -396,11 +536,34 @@ not the normal deletion path.
 
 ## Saved snapshot behavior
 
-The save job checks the durable in-flight/done artifact row and verifies the
-artifact in the node's `Info.snapshots`. A retry that finds a verified artifact
-is a success. An unknown artifact collision fails the save as an internal
-failure. A concurrent save of the same name returns `409 save_in_progress`.
-After a name is saved, it can be saved again under a new immutable artifact.
+With an object store, `POST /saved-snapshots` pins a generated disk state: a
+READY source is captured now (a fresh generation), and a STOPPED source pins
+its latest completed generation, which is the final offline generation its
+stop took. No node artifact is created; the saved row records the generation
+and the machine type, and its `snapshotId` identifies the immutable saved row.
+A failed save records the reason on the name and keeps an earlier ready
+generation deployable. A completed generation stays addressable while a
+replacement saves or fails; re-saving a completed name records a new immutable
+generation, so a late save can never replace a newer one.
+
+A saved snapshot pins one completed generation (`generation_id`) and restores
+on any placed node that has the object store and the manifest's image,
+preferring the node that wrote the generation. A legacy node-local row (an
+`artifact_id` and no generation) keeps its pinned-node rule: the save job
+checks the durable in-flight/done artifact row and verifies the artifact in
+the node's `Info.snapshots`; a retry that finds a verified artifact is a
+success, and an unknown artifact collision fails the save as an internal
+failure. Without an object store the save and a create with `from` stay on the
+node that holds the artifact. A concurrent save of the same name returns `409
+save_in_progress`. The boot restores from the manifest; env comes only from the
+create request, never from the source sandbox.
+
+Only a ready or confirmed-cleanup restore can release its durable pin; a lease
+expiry or an HTTP cancellation does not. `DELETE /saved-snapshots/{name}` is
+independent of sandbox deletion: VMs already booted from the artifact keep
+working. Saved snapshots never expire: a name saved before its source
+sandbox's data expired still restores, and a save *from* an expired sandbox
+answers `409 snapshot_data_expired`.
 
 The saved-snapshot list has no pagination: our handler walks every internal page and
 only validates the two documented query parameters (`name`, `namePrefix`).
@@ -408,22 +571,54 @@ only validates the two documented query parameters (`name`, `namePrefix`).
 `400 invalid_query` where the API documents no such answer. Every row and lookup is
 owner-scoped; a missing name and a foreign name are the same `404`.
 
-A completed generation stays addressable while a replacement saves or fails.
-Restoring by name resolves the newest ready generation, and re-saving a name
-records a new immutable artifact. Only a ready or confirmed-cleanup restore can
-release its durable artifact pin; a lease expiry or HTTP cancellation does not.
-`DELETE /saved-snapshots/{name}` is independent of sandbox deletion: VMs already
-booted from the artifact keep working.
-
 `POST /sandboxes` with `from` first replays the owner's idempotency key, then
-resolves the snapshot name. That order is required: a retry returns the
-originally accepted generation even after the name was deleted or replaced, or
-while its node is offline or full. An omitted `type` inherits the snapshot's
+resolves the snapshot name or share code. That order is required: a retry returns
+the originally accepted generation even after the name was deleted or replaced,
+or while its node is offline or full. An omitted `type` inherits the snapshot's
 canonical type; an explicit type may keep or grow the disk but never shrink it.
-Placement uses only the immutable artifact's recorded node and checks its live
-`Info` capacity; there is no fallback node and no fresh-image fallback. The
-guest boots with `image: ""` and `from_snapshot` set to the artifact, and env
-comes only from the create request, never from the source sandbox.
+An omitted `name` is the snapshot's name.
+
+`count` above one requires `from` (`400 count_requires_from`) and refuses
+`failFast` (`400 count_with_fail_fast`). The batch is all-or-nothing and spread
+over the placed nodes; the response lists every sandbox in `sandboxes`, in
+creation order, and the first one in `sandbox`. The server has no start or
+active-sandbox limits today, so a batch is bounded only by `count` (1 to 1000)
+and node capacity.
+
+Share codes (`POST /saved-snapshots/{name}/shares`) are `bsh_` plus 32 random
+bytes in base32. The full code appears only in the 201 response; the database
+stores its SHA-256 and a display prefix. `from: bsh_...` resolves the sharer's
+name to its current generation, so re-saving the name changes what the code
+deploys; the new sandbox belongs to the caller and gets no env from the source.
+A wrong or revoked code is `404 snapshot_not_found`. Deleting the name revokes
+its codes. Every create from a code — single or a `count` batch — checks and
+counts the use inside the same transaction that creates its sandboxes, so a
+code revoked between resolution and the create deploys nothing.
+Revoking a code stops new sandboxes; already created ones keep their own copy.
+
+## Snapshot lists
+
+`GET /snapshots`, `GET /sandboxes/{sandboxId}/snapshots` and
+`GET /sandboxes/{sandboxId}/snapshots/latest` expose the snapshot generations a
+sandbox captured. Only `completed` generations of a live, owner-scoped sandbox
+are listed: an attempt still pending, an attempt that failed and a generation
+whose stored data has been purged never reach the API. The per-sandbox routes
+answer `404` for a missing, foreign or deleted sandbox instead of an empty
+page. `latest` answers `200` with an explicit `snapshot: null` when the sandbox
+has no generation yet, and it takes no query parameters.
+
+Each row is one position in a chain. `generation` is the position (`0` is the
+base) and `kind` is `base` for position 0 and `incremental` afterwards.
+`sizeBytes` is what that generation uploaded, not the full restored disk;
+`contentSizeBytes` is the sandbox's own data it restores, with the base image
+excluded. These snapshots are block-level, so they carry no file inventory:
+`fileCount` and `contentFileCount` are always `null`. `origin` is always
+`captured`. `createdAt` is when the disk was captured and `completedAt` when
+the upload finished.
+
+Both paginated lists accept `limit` (1 to 200, default 100), `cursor` and
+`sort`; any other parameter is `400 invalid_query` naming it. Ordering and
+cursor rules are the shared ones in Pagination and filters below.
 
 ## Run auto-stop behavior
 

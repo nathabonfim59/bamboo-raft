@@ -13,11 +13,13 @@ import (
 	"github.com/nathabonfim59/bamboo-raft/internal/machinetype"
 )
 
-// TTL bounds from the pinned CLI reference.
+// TTL, name and batch bounds from the v1 API.
 const (
-	minTTLSeconds = 1
-	maxTTLSeconds = 2592000
-	maxNameChars  = 120
+	minTTLSeconds  = 1
+	maxTTLSeconds  = 2592000
+	maxNameChars   = 120
+	minCreateCount = 1
+	maxCreateCount = 1000
 )
 
 // newCreatedEvent is the first JSON Lines object of `new`.
@@ -47,17 +49,25 @@ type newCommandOptions struct {
 	ttl         int
 	ttlSet      bool
 	from        string
+	fromSet     bool
+	count       int
+	countSet    bool
+	failFast    bool
 	env         []string
 }
 
 // newNewCommand builds `bbraft new`.
 func newNewCommand(a *App) *cobra.Command {
 	var opts newCommandOptions
-	cmd := &cobra.Command{
+	var cmd *cobra.Command
+	cmd = &cobra.Command{
 		Use:   "new",
 		Short: "Create a sandbox and wait until it is ready",
 		Args:  cobra.NoArgs,
 		RunE: a.runE(func(ctx context.Context, _ []string) error {
+			opts.ttlSet = cmd.Flags().Changed("ttl")
+			opts.fromSet = cmd.Flags().Changed("from")
+			opts.countSet = cmd.Flags().Changed("count")
 			req, err := opts.request()
 			if err != nil {
 				return &UsageError{Err: err}
@@ -73,6 +83,9 @@ func newNewCommand(a *App) *cobra.Command {
 			created, err := client.CreateSandbox(ctx, req)
 			if err != nil {
 				return createFailure(err, ttl)
+			}
+			if opts.countSet && opts.count > 1 {
+				return a.reportBatchCreate(created, opts.count, ttl)
 			}
 			id := created.Sandbox.ID
 			if id == "" {
@@ -96,12 +109,33 @@ func newNewCommand(a *App) *cobra.Command {
 	cmd.Flags().StringVar(&opts.machineType, "type", "", "machine size: small, default, large or xlarge")
 	cmd.Flags().StringVar(&opts.name, "name", "", "display name")
 	cmd.Flags().IntVar(&opts.ttl, "ttl", 0, "seconds until the sandbox auto-stops (1 to 2592000)")
-	cmd.Flags().StringVar(&opts.from, "from", "", "saved snapshot name to create from")
+	cmd.Flags().StringVar(&opts.from, "from", "", "saved snapshot name or share code to create from")
+	cmd.Flags().IntVar(&opts.count, "count", 1, "number of sandboxes to create from a saved snapshot (1 to 1000)")
+	cmd.Flags().BoolVar(&opts.failFast, "fail-fast", false, "create only if a machine is ready now")
 	cmd.Flags().StringArrayVarP(&opts.env, "env", "e", nil, "environment variable KEY=VALUE (repeatable)")
-	cmd.PreRun = func(*cobra.Command, []string) {
-		opts.ttlSet = cmd.Flags().Changed("ttl")
-	}
 	return cmd
+}
+
+// reportBatchCreate renders a batch create response (count above one) without
+// waiting for each sandbox to become ready.
+func (a *App) reportBatchCreate(created api.CreateSandboxResponse, want int, ttl *int) error {
+	if len(created.Sandboxes) != want {
+		return ambiguousCreate(ttl)
+	}
+	for _, sandbox := range created.Sandboxes {
+		if sandbox.ID == "" {
+			return ambiguousCreate(ttl)
+		}
+	}
+	if a.out.JSON {
+		return a.out.JSONLine(created)
+	}
+	for _, sandbox := range created.Sandboxes {
+		if err := a.out.Humanf("%s", sandbox.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // request validates the flags and builds the pinned create body.
@@ -130,20 +164,31 @@ func (o newCommandOptions) request() (api.CreateSandboxRequest, error) {
 		ttl := o.ttl
 		req.TTLSeconds = api.TTLSeconds{Present: true, Value: &ttl}
 	}
+	if o.fromSet && o.from == "" {
+		return req, errors.New("--from requires a saved snapshot name or share code")
+	}
 	if o.from != "" {
-		req.From = &o.from
+		req.From = new(o.from)
+	}
+	if o.countSet {
+		if o.count < minCreateCount || o.count > maxCreateCount {
+			return req, fmt.Errorf("--count must be between %d and %d", minCreateCount, maxCreateCount)
+		}
+		if o.from == "" {
+			return req, errors.New("--count requires --from")
+		}
+		if o.failFast {
+			return req, errors.New("--count cannot be combined with --fail-fast")
+		}
+		req.Count = new(o.count)
+	}
+	if o.failFast {
+		req.FailFast = new(true)
 	}
 	if len(o.env) > 0 {
-		env := make(map[string]string, len(o.env))
-		for _, pair := range o.env {
-			key, value, ok := strings.Cut(pair, "=")
-			if !ok || key == "" {
-				return req, errors.New("--env value must be KEY=VALUE")
-			}
-			if strings.ContainsRune(key, '\x00') || strings.ContainsRune(value, '\x00') {
-				return req, errors.New("--env value contains a NUL byte")
-			}
-			env[key] = value
+		env, err := parseKeyValueFlag("--env", o.env)
+		if err != nil {
+			return req, err
 		}
 		req.Env = env
 	}

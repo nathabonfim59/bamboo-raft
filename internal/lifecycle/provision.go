@@ -120,9 +120,11 @@ func (w *Worker) provision(ctx context.Context, job db.Job, lease *Lease) error 
 		SandboxId: sbx.ID,
 		Resources: resourcesOf(sbx.Reserved),
 		Image:     "", // the node's default image, always
-		// from_snapshot is the canonical immutable artifact recorded on
-		// the sandbox row, never a payload or a re-resolved name.
+		// from_snapshot and from_manifest are the canonical immutable
+		// sources recorded on the sandbox row, never a payload or a
+		// re-resolved name.
 		FromSnapshot: sbx.FromSnapshotID,
+		FromManifest: sbx.FromManifestKey,
 		Env:          env,
 		// Hostname stays empty: the display name is user input that may
 		// contain spaces, unicode or exceed a hostname limit. The node
@@ -137,6 +139,9 @@ func (w *Worker) provision(ctx context.Context, job db.Job, lease *Lease) error 
 		return w.abortedBoot(ctx, lease, guard, sbx)
 	}
 	if err != nil {
+		if sbx.FromManifestKey != "" && status.Code(err) == codes.FailedPrecondition {
+			return w.manifestRefused(ctx, job, lease, guard, opCtx, sbx, p, client)
+		}
 		return w.bootFailed(ctx, job, lease, guard, opCtx, sbx, err)
 	}
 	if vm.GetSandboxId() != sbx.ID || vm.GetState() != nodev1.VMState_VM_STATE_READY {
@@ -161,6 +166,7 @@ func (w *Worker) provision(ctx context.Context, job db.Job, lease *Lease) error 
 		// READY): the confirmed-ready outcome may release a restore pin, and
 		// the stop job finalizes the archival this boot was racing.
 		w.releaseSnapshotPin(ctx, owner, sbx.ID)
+		w.markObjectStore(ctx, sbx)
 		return nil
 	}
 	if sbx.State != db.StateProvisioning {
@@ -178,11 +184,15 @@ func (w *Worker) provision(ctx context.Context, job db.Job, lease *Lease) error 
 		FromStates:      []db.SandboxState{db.StateProvisioning},
 		ExpectedVersion: sbx.Version,
 		To:              db.StateReady,
+		// Restores are eager: a READY manifest restore has its
+		// whole disk local.
+		Hydrated: sbx.FromManifestKey != "",
 	})
 	switch {
 	case err == nil:
 		// The boot is confirmed ready: the artifact pin may now release.
 		w.releaseSnapshotPin(ctx, owner, sbx.ID)
+		w.markObjectStore(ctx, sbx)
 		return nil
 	case errors.Is(err, db.ErrJobNotLeased):
 		return nil
@@ -210,6 +220,7 @@ func (w *Worker) bootFailed(ctx context.Context, job db.Job, lease *Lease, guard
 	opCtx context.Context, sbx db.Sandbox, cause error,
 ) error {
 	reason := classify(cause)
+	terminal := bootFailureReason(sbx, cause)
 	if status.Code(cause) == codes.Aborted {
 		// A DeleteVM fenced this boot. The deletion job owns the rest; if
 		// the row is somehow still live it is terminally broken.
@@ -219,7 +230,7 @@ func (w *Worker) bootFailed(ctx context.Context, job db.Job, lease *Lease, guard
 		}
 		return permanent("sandbox deleted")
 	}
-	if retryableProvision(cause) && job.Attempts < job.MaxAttempts {
+	if retryableProvision(cause) && !errors.Is(cause, errNoReadyMachine) && job.Attempts < job.MaxAttempts {
 		// A failed boot may still have left a disk or VM, but the guarded
 		// pre-RPC snapshot is stale the moment the RPC ran: reread the
 		// canonical row and let ITS owner decide whether cleaning up is
@@ -261,7 +272,7 @@ func (w *Worker) bootFailed(ctx context.Context, job db.Job, lease *Lease, guard
 	// release capacity only after the node confirmed the VM is gone.
 	cur, err := w.store.SandboxAny(ctx, job.OwnerID, sbx.ID)
 	if errors.Is(err, db.ErrNotFound) {
-		return permanent(terminalProvisionReason(cause))
+		return permanent(terminal)
 	}
 	if err != nil {
 		return retry("sandbox read failed", w.backoff(job.Attempts))
@@ -277,7 +288,7 @@ func (w *Worker) bootFailed(ctx context.Context, job db.Job, lease *Lease, guard
 	// boot never produced a disk. In every one of those cases the stale
 	// attempt neither deletes nor releases: its owning job resolves the row.
 	if cur.LifecycleGeneration != 0 || cur.State == db.StateArchiving || cur.State == db.StateArchived {
-		return permanent(terminalProvisionReason(cause))
+		return permanent(terminal)
 	}
 	if cur.State == db.StateProvisioning {
 		if !CanTransition(cur.State, db.StateError) {
@@ -289,7 +300,7 @@ func (w *Worker) bootFailed(ctx context.Context, job db.Job, lease *Lease, guard
 			FromStates:      []db.SandboxState{db.StateProvisioning},
 			ExpectedVersion: cur.Version,
 			To:              db.StateError,
-			ErrorReason:     terminalProvisionReason(cause),
+			ErrorReason:     terminal,
 		})
 		switch {
 		case err == nil:
@@ -323,18 +334,18 @@ func (w *Worker) bootFailed(ctx context.Context, job db.Job, lease *Lease, guard
 	if err := w.deleteVMUnderGuard(opCtx, guard, cur); err != nil {
 		// Cleanup not confirmed: leave the reservation for the reaper,
 		// which retries this now-failed job.
-		return permanent(terminalProvisionReason(cause))
+		return permanent(terminal)
 	}
 	if guard.Err() != nil || opCtx.Err() != nil || lease.Lost() {
 		// The guard or claim vanished after the delete: cleanup is
 		// unconfirmed until reconciliation proves it. Do not release.
-		return permanent(terminalProvisionReason(cause))
+		return permanent(terminal)
 	}
 	if err := w.store.ReleaseSandboxReservation(ctx, job.OwnerID, cur.ID); err != nil {
-		return permanent(terminalProvisionReason(cause))
+		return permanent(terminal)
 	}
 	w.releaseSnapshotPin(ctx, job.OwnerID, cur.ID)
-	return permanent(terminalProvisionReason(cause))
+	return permanent(terminal)
 }
 
 // abortedBoot handles cancellation (shutdown or lost lease). When deletion
@@ -488,7 +499,8 @@ func (w *Worker) acquireGuardWith(opParent, waitCtx context.Context, owner uuid.
 func payloadMatches(sbx db.Sandbox, p db.ProvisionPayload) bool {
 	return p.Generation == 0 && sbx.LifecycleGeneration == 0 &&
 		p.NodeID != "" && sbx.NodeID != nil && *sbx.NodeID == p.NodeID &&
-		sbx.Reserved == p.Resources && sbx.FromSnapshotID == p.FromSnapshot
+		sbx.Reserved == p.Resources && sbx.FromSnapshotID == p.FromSnapshot &&
+		sbx.FromManifestKey == p.FromManifest
 }
 
 // releaseSnapshotPin is the best-effort release after a confirmed outcome. A

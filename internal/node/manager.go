@@ -11,6 +11,7 @@ import (
 	"maps"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -22,10 +23,12 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/nathabonfim59/bamboo-raft/internal/ids"
+	"github.com/nathabonfim59/bamboo-raft/internal/node/chunkcache"
 	"github.com/nathabonfim59/bamboo-raft/internal/node/jailer"
 	"github.com/nathabonfim59/bamboo-raft/internal/node/qemu"
 	"github.com/nathabonfim59/bamboo-raft/internal/node/qmp"
 	"github.com/nathabonfim59/bamboo-raft/internal/node/storage"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore"
 	"github.com/nathabonfim59/bamboo-raft/internal/overcommit"
 	"github.com/nathabonfim59/bamboo-raft/internal/proto/guestv1"
 	"github.com/nathabonfim59/bamboo-raft/internal/proto/nodev1"
@@ -39,6 +42,8 @@ const DefaultBootTimeout = 2 * time.Minute
 const (
 	DefaultSnapshotLease          = 2 * time.Minute
 	DefaultSnapshotCleanupTimeout = 30 * time.Second
+	// DefaultSnapshotFreeFloor is Config.SnapshotFreeFloor's default.
+	DefaultSnapshotFreeFloor = 2 << 30
 )
 
 // DefaultMinCID and DefaultMaxCID bound vsock CIDs. 0..2 are reserved by the
@@ -97,6 +102,19 @@ type Config struct {
 	// localCID is the test seam for the one-shot startup probe. nil reads
 	// VM_SOCKETS_GET_LOCAL_CID from /dev/vsock. Production leaves it nil.
 	localCID func(context.Context) (uint32, error)
+	// Store is the object store shared with the control plane: Phase 2
+	// snapshots write to it and restores read from it. nil turns Phase 2
+	// off; the snapshot RPCs then fail with FAILED_PRECONDITION.
+	Store objstore.Store
+	// Phase2 is the startup probe's Phase 2 QMP capability check
+	// (qemu.CheckPhase2Schema on the probe QEMU). nil: the node checks the
+	// first VM's QEMU and caches the result. Anything missing turns Phase 2
+	// off with FAILED_PRECONDITION and VMs run without dirty bitmaps.
+	Phase2 *qemu.Phase2Support
+	// ChunkCacheBytes caps the local chunk cache under DataDir, in bytes.
+	// Zero disables the cache (restores read every chunk from the store).
+	// The cache lives under <DataDir>/chunks when a Store is configured.
+	ChunkCacheBytes int64
 	// BootTimeout bounds one boot from CreateVM until the guest answers
 	// Ping. Zero uses DefaultBootTimeout.
 	BootTimeout time.Duration
@@ -105,6 +123,11 @@ type Config struct {
 	// SnapshotCleanupTimeout bounds independent resume/thaw/stage cleanup.
 	// Zero uses 30 seconds.
 	SnapshotCleanupTimeout time.Duration
+	// SnapshotFreeFloor is the free space (bytes) the data directory's
+	// file system must keep while a live SnapshotVM reads its cut: below it
+	// the snapshot aborts, so the growing fleece image never fills the
+	// node. Zero uses DefaultSnapshotFreeFloor.
+	SnapshotFreeFloor uint64
 	// Network manages per-VM networking (TAP allocation, isolation rules,
 	// SSH ingress). It is borrowed, never closed by the manager: the command
 	// that constructs it owns its lifetime. nil selects the explicit dev/test
@@ -210,6 +233,10 @@ type Manager struct {
 	// beforeStartGate stages the window where a StartVM caller has observed
 	// STOPPED but not yet acquired the VM operation gate; tests only.
 	beforeStartGate func()
+	// beforeResetGate stages the window where a ResetVM worker has claimed
+	// its record (BOOTING) but not yet acquired the VM operation gate; tests
+	// only.
+	beforeResetGate func()
 	// beforeWatchGate holds an exit watcher before it takes the per-VM
 	// operation gate, and watchRetired reports a watcher that retired at its
 	// ownership recheck; tests only.
@@ -242,6 +269,24 @@ type Manager struct {
 	jailVsock     func() (*os.File, error)
 	jailCleanup   time.Duration
 	jailStopGrace time.Duration
+	// maintQuit is a test seam for the clean-exit wait of a maintenance
+	// session after QMP quit (maintQuitTimeout when zero).
+	maintQuit time.Duration
+
+	// phase2 caches the Phase 2 QMP capability check (phase2_launch.go).
+	phase2 phase2Gate
+	// openCutDisk opens a snapshot cut's NBD export (openNBDDisk); tests
+	// inject an in-memory disk.
+	openCutDisk func(ctx context.Context, opts cutDiskOptions) (cutDisk, error)
+	// chunks is the local chunk cache restores read through; nil when no
+	// object store is configured.
+	chunks *chunkcache.Cache
+	// openRestoreDisk opens a restore's writable NBD export
+	// (openNBDRestoreDisk); tests inject a recording disk.
+	openRestoreDisk func(ctx context.Context, opts restoreDiskOptions) (restoreDisk, error)
+	// fleeceUsage reports a fleece image's allocated bytes
+	// (fleeceAllocated); tests inject a size over the reservation.
+	fleeceUsage func(*os.File) (uint64, error)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -383,6 +428,10 @@ type vm struct {
 	snapshotRelease func()
 	snapshotSource  *storage.Snapshot
 	snapshotClient  *qmp.Client
+	// restore is a CreateVM from_manifest's checked manifest: the create's
+	// boot writes it into the new disk before the first launch. Set at
+	// joinCreate and never changed.
+	restore *restoreSource
 
 	// jail names the attempt that owns this VM's jail reservation, or is
 	// zero when it holds none. It is assigned before the jailer runs, so a
@@ -390,7 +439,21 @@ type vm struct {
 	// cleared only by settlement of that exact attempt. Guarded by vm.mu.
 	jail jailer.Ref
 
+	// maintCancel fences a running maintenance session (maintenance.go):
+	// set under vm.mu by the session after its deleting check, cleared when
+	// it ends. DeleteVM cancels it before waiting for the operation gate.
+	maintCancel context.CancelCauseFunc
+	// snapCancel fences a running live SnapshotVM (phase2_snapshot.go): set
+	// under vm.mu by the snapshot once it owns the operation gate and has
+	// seen deleting false, cleared when it ends. DeleteVM cancels it before
+	// waiting for the gate; the snapshot tears its cut down and returns.
+	snapCancel context.CancelCauseFunc
+
 	capacityHeld bool
+	// fleeceGiB is the disk a live snapshot's fleece image holds in
+	// Manager.reserved while it may exist (phase2_snapshot.go). Guarded by
+	// Manager.mu.
+	fleeceGiB uint64
 	// computeHeld reports that this VM's vCPU and memory are counted in
 	// Manager.reserved. A STOPPED VM holds only its disk (capacityHeld)
 	// until StartVM re-acquires compute or DeleteVM removes everything.
@@ -488,6 +551,19 @@ func New(ctx context.Context, cfg Config) (*Manager, error) {
 		snapshots[snap.Meta.SnapshotID] = snap
 	}
 
+	var chunks *chunkcache.Cache
+	if cfg.Store != nil {
+		chunks, err = chunkcache.Open(ctx, chunkcache.Options{
+			Dir:      filepath.Join(store.DataDir(), chunkCacheDir),
+			MaxBytes: cfg.ChunkCacheBytes,
+			Log:      cfg.Log,
+		})
+		if err != nil {
+			store.Close()
+			return nil, fmt.Errorf("node: open chunk cache: %w", err)
+		}
+	}
+
 	mctx, cancel := context.WithCancel(ctx)
 	m := &Manager{
 		cfg:            cfg,
@@ -509,6 +585,7 @@ func New(ctx context.Context, cfg Config) (*Manager, error) {
 		quarantined:    map[string]struct{}{},
 		fence:          map[string]*fenceToken{},
 		creating:       map[string]int{},
+		chunks:         chunks,
 	}
 	if m.launcher == nil {
 		m.launcher = qemuLauncher{}
@@ -548,12 +625,15 @@ func New(ctx context.Context, cfg Config) (*Manager, error) {
 		if m.jail != nil {
 			// A jailed QEMU's socket is in its chroot control directory.
 			m.verifyProc = func(ctx context.Context, pinned *pinnedProc, meta storage.VMMeta) (*qmp.Client, error) {
-				return m.verifyQMPAt(ctx, pinned, meta, m.jailControlQMP(meta.SandboxID))
+				return m.verifyQMPAt(ctx, pinned, meta, m.jailControlQMP(meta.SandboxID), true)
 			}
 		}
 	}
 	cfg.QemuVersion = qemuVersion(mctx, cfg.QemuVersion, m.log)
 	m.cfg.QemuVersion = cfg.QemuVersion
+	if cfg.Phase2 != nil {
+		m.setPhase2Support(*cfg.Phase2)
+	}
 
 	if m.net != nil {
 		// The storage lock is held (store.Open) and no VM is exposed yet:
@@ -622,6 +702,9 @@ func normalizeConfig(cfg *Config) error {
 	}
 	if cfg.SnapshotCleanupTimeout <= 0 {
 		cfg.SnapshotCleanupTimeout = DefaultSnapshotCleanupTimeout
+	}
+	if cfg.SnapshotFreeFloor == 0 {
+		cfg.SnapshotFreeFloor = DefaultSnapshotFreeFloor
 	}
 	if cfg.Jailer != nil || cfg.jail != nil {
 		// A jailed manager never detects or execs QEMU itself: the version
@@ -766,6 +849,9 @@ func (m *Manager) shutdown() error {
 		}
 	}
 	m.drains.Wait()
+	if m.chunks != nil {
+		errs = append(errs, m.chunks.Close())
+	}
 	errs = append(errs, m.store.Close())
 	return errors.Join(errs...)
 }
@@ -922,6 +1008,8 @@ func (m *Manager) releaseReservationLocked(v *vm) {
 // accounted: a STOPPED VM frees compute while its kept disk stays in the
 // stopped inventory. m.mu must be held.
 func (m *Manager) releaseComputeLocked(v *vm) {
+	// Without its QEMU no fleece image can be held open either.
+	m.releaseFleeceLocked(v)
 	if !v.computeHeld {
 		return
 	}
@@ -992,8 +1080,39 @@ func (v *vm) cloneVM() *nodev1.VM {
 		CreatedAtUnixMs: v.meta.CreatedAtUnixMs,
 		Error:           v.errMsg,
 		StartedAtUnixMs: v.meta.StartedAtUnixMs,
+		FromManifest:    v.meta.FromManifest,
+		Hydration:       hydrationOf(v.meta),
 	}
 	return vm
+}
+
+// readyCommitted mirrors storage.Store.CommitReady in the in-memory record
+// once that write succeeded. Callers hold v.mu.
+func (v *vm) readyCommitted(startedAtUnixMs int64) {
+	v.meta.StartedAtUnixMs = startedAtUnixMs
+	v.meta.StoppedAtUnixMs = 0
+	v.meta.HydratedAtUnixMs = cmp.Or(v.meta.HydratedAtUnixMs, startedAtUnixMs)
+}
+
+// hydrationOf is a VM's Hydration (always set, as the proto says). A VM not
+// restored from a manifest is hydrated from the start; records written
+// before Phase 2 have no hydration time and report their creation. Phase 2a
+// restores are eager, so a restored VM is hydrated, with every chunk done,
+// from its first READY on.
+func hydrationOf(meta storage.VMMeta) *nodev1.Hydration {
+	if meta.FromManifest == "" {
+		return &nodev1.Hydration{
+			Hydrated:         true,
+			HydratedAtUnixMs: cmp.Or(meta.HydratedAtUnixMs, meta.CreatedAtUnixMs),
+		}
+	}
+	h := &nodev1.Hydration{ChunksTotal: meta.RestoreChunks}
+	if meta.HydratedAtUnixMs != 0 {
+		h.Hydrated = true
+		h.HydratedAtUnixMs = meta.HydratedAtUnixMs
+		h.ChunksDone = meta.RestoreChunks
+	}
+	return h
 }
 
 // lookup returns the VM record, or a NotFound status for an unknown id.

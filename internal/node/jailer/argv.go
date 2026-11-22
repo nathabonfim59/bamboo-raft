@@ -46,6 +46,8 @@ func supportedOption(name string) (optionRule, bool) {
 		return optionRule{value: true, required: true, multiple: true}, true
 	case "-append", "-object":
 		return optionRule{value: true}, true
+	case "-S":
+		return optionRule{}, true
 	}
 	return optionRule{}, false
 }
@@ -159,7 +161,11 @@ func validateArgs(spec LaunchSpec, qcow []bool) error {
 		var err error
 		switch option {
 		case "-name":
-			err = expectValue(option, value, "guest="+spec.SandboxID+",process="+spec.SandboxID)
+			want := "guest=" + spec.SandboxID + ",process=" + spec.SandboxID
+			if spec.Maintenance {
+				want = MaintenanceName(spec.SandboxID)
+			}
+			err = expectValue(option, value, want)
 		case "-machine":
 			err = expectValue(option, value, argMachine)
 		case "-cpu":
@@ -203,7 +209,14 @@ func validateArgs(spec LaunchSpec, qcow []bool) error {
 			return err
 		}
 	}
-	for _, option := range requiredOptions() {
+	required := requiredOptions()
+	if spec.Maintenance {
+		if err := checkMaintenanceOptions(counts); err != nil {
+			return err
+		}
+		required = maintenanceRequiredOptions()
+	}
+	for _, option := range required {
 		if counts[option] == 0 {
 			return fmt.Errorf("jailer: required QEMU option %s is missing", option)
 		}
@@ -219,6 +232,10 @@ func validateArgs(spec LaunchSpec, qcow []bool) error {
 			return err
 		}
 		previous = node
+	}
+	if spec.Maintenance {
+		// checkMaintenanceOptions refused every -device.
+		return nil
 	}
 	return validateDevices(spec, devices, previous, counts["-object"] == 1)
 }

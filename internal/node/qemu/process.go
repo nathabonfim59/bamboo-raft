@@ -27,6 +27,10 @@ type StartOptions struct {
 	QMPTimeout time.Duration
 	// StopGrace is how long Stop waits after QMP quit before SIGKILL.
 	StopGrace time.Duration
+	// Maintenance starts the paused maintenance form
+	// (Config.PlainMaintenanceArgs) instead of the VM: no devices and no
+	// inherited descriptors. The caller never continues it.
+	Maintenance bool
 }
 
 func (o StartOptions) withDefaults() StartOptions {
@@ -144,7 +148,11 @@ func Start(ctx context.Context, cfg Config, opts StartOptions) (*Process, error)
 		}
 	}
 
-	argv, err := cfg.Args()
+	render := cfg.Args
+	if opts.Maintenance {
+		render = cfg.PlainMaintenanceArgs
+	}
+	argv, err := render()
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +168,9 @@ func Start(ctx context.Context, cfg Config, opts StartOptions) (*Process, error)
 	// order the fixed TapFD/VhostFD numbers require. The caller owns these
 	// files and keeps them open until Start returns; QEMU holds its own
 	// references afterwards.
-	cmd.ExtraFiles = cfg.extraFiles()
+	if !opts.Maintenance {
+		cmd.ExtraFiles = cfg.extraFiles()
+	}
 	// Own process group: terminal signals aimed at the node's group do not
 	// reach QEMU, and QEMU starts no descendants (sandbox spawn=deny).
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

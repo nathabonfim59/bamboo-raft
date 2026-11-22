@@ -386,6 +386,67 @@
       commas
     quiet: true
 
+# Phase 2 is optional: both modes empty means the object store is off. A
+# colocated Garage supplies an existing non-secret env file and its secret
+# file; a remote service supplies the five values and the secret directly.
+# The two modes are never combined, and a colocated deployment never carries
+# a secret value in the inventory.
+- name: The object store inputs are complete and unambiguous
+  ansible.builtin.assert:
+    that:
+      - bbraft_node_s3_env_file is string
+      - bbraft_node_s3_secret_file is string
+      - bbraft_node_s3 is mapping
+      - bbraft_node_s3_secret_access_key is string
+      - not ((bbraft_node_s3_env_file | length > 0) and (bbraft_node_s3 | length > 0))
+      - (bbraft_node_s3 | length > 0) or (bbraft_node_s3_secret_access_key | length == 0)
+      - (bbraft_node_s3_env_file | length == 0) or (bbraft_node_s3_env_file | bbraft_node_path_valid)
+      - (bbraft_node_s3_env_file | length == 0) or (bbraft_node_s3_secret_file | bbraft_node_path_valid)
+      - bbraft_node_s3_secret_file != bbraft_node_s3_env_file
+      - bbraft_node_s3_managed_env_file | bbraft_node_path_valid
+      - bbraft_node_s3_managed_secret_file | bbraft_node_path_valid
+      - bbraft_node_s3_managed_env_file != bbraft_node_s3_managed_secret_file
+    fail_msg: >-
+      set bbraft_node_s3_env_file (a Garage on this host) or bbraft_node_s3 (a
+      remote S3 service), never both; the remote secret belongs only to the
+      remote mode; every object-store path must be clean canonical absolute
+      text and the secret file must differ from the env file
+    quiet: true
+
+# Mirrors the node's -s3.* contract: an endpoint is an http(s) URL without
+# credentials or a query, the bucket is a lowercase S3 name, and the region
+# and access key id are nonempty tokens. The secret is one line at most.
+- name: The remote object store values are valid
+  ansible.builtin.assert:
+    that:
+      - (bbraft_node_s3 | length == 0) or
+        ((bbraft_node_s3.keys() | list | sort) == ['access_key_id', 'bucket', 'endpoint', 'path_style', 'region'])
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3.endpoint is string)
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3.endpoint is match('^https?://[^/?#@\s]+(/[^?#@\s]*)?$'))
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3.bucket is string)
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3.bucket is match('^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'))
+      - (bbraft_node_s3 | length == 0) or ('..' not in bbraft_node_s3.bucket)
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3.region is string)
+      - (bbraft_node_s3 | length == 0) or ((bbraft_node_s3.region | length) > 0)
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3.region is not search('\s'))
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3.path_style is sameas true or bbraft_node_s3.path_style is sameas false)
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3.access_key_id is string)
+      - (bbraft_node_s3 | length == 0) or ((bbraft_node_s3.access_key_id | length) > 0)
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3.access_key_id is not search('\s'))
+      - (bbraft_node_s3_secret_access_key | length == 0) or (bbraft_node_s3_secret_access_key is not search('\\n'))
+      - (bbraft_node_s3_secret_access_key | length == 0) or (bbraft_node_s3_secret_access_key is not search('\\r'))
+      - (bbraft_node_s3_secret_access_key | length == 0) or (bbraft_node_s3_secret_access_key is not search('\\0'))
+      - (bbraft_node_s3_secret_access_key | length == 0) or (bbraft_node_s3_secret_access_key | trim == bbraft_node_s3_secret_access_key)
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3_secret_access_key | bbraft_node_byte_length) > 0
+      - (bbraft_node_s3 | length == 0) or (bbraft_node_s3_secret_access_key | bbraft_node_byte_length) <= 8192
+    fail_msg: >-
+      bbraft_node_s3 needs exactly endpoint (http(s) URL without credentials or
+      query), region (nonempty), bucket (valid S3 name), path_style (boolean)
+      and access_key_id; the remote secret must be one nonempty line of at
+      most 8192 bytes without surrounding whitespace
+    quiet: true
+  no_log: true
+
 # The hardening play runs before the node play, so the forward allowance is an
 # inventory-level pairing: hardening forwards only through the bridge this
 # node owns, never through the SSH ingress interface.
@@ -417,6 +478,7 @@
       write_bps: "{{ bbraft_node_jail_io_write_bps | bbraft_node_rate_int }}"
       read_iops: "{{ bbraft_node_jail_io_read_iops | bbraft_node_rate_int }}"
       write_iops: "{{ bbraft_node_jail_io_write_iops | bbraft_node_rate_int }}"
+    bbraft_node_chunk_cache_bytes_int: "{{ bbraft_node_chunk_cache_bytes | bbraft_node_uint }}"
 
 # The limits mirror cmd/bbraft-node/config.go: vCPUs are uint32, and memory
 # and disk must fit their byte conversions.
@@ -431,6 +493,22 @@
       - bbraft_node_reserve_disk_gib_int <= 17179869183
     fail_msg: "a capacity or reserve value overflows the resource type bbraft-node uses"
     quiet: true
+
+# cmd/bbraft-node stores the cache cap in an int64-backed byte count.
+- name: The chunk cache cap fits the binary's byte count
+  ansible.builtin.assert:
+    that: bbraft_node_chunk_cache_bytes_int <= 9223372036854775807
+    fail_msg: "bbraft_node_chunk_cache_bytes overflows the node's int64 byte count"
+    quiet: true
+
+- name: Select the object store mode
+  ansible.builtin.set_fact:
+    bbraft_node_s3_configured: >-
+      {{ (bbraft_node_s3_env_file | length > 0) or (bbraft_node_s3 | length > 0) }}
+    bbraft_node_s3_env_file_effective: >-
+      {{ bbraft_node_s3_env_file if (bbraft_node_s3_env_file | length > 0) else bbraft_node_s3_managed_env_file }}
+    bbraft_node_s3_secret_file_effective: >-
+      {{ bbraft_node_s3_secret_file if (bbraft_node_s3_env_file | length > 0) else bbraft_node_s3_managed_secret_file }}
 
 - name: Supplied images are a unique list of local directories
   ansible.builtin.assert:

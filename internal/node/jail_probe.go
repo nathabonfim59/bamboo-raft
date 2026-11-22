@@ -49,6 +49,9 @@ type CPUEvidence struct {
 	Host        qemu.HostCPU
 	Status      string
 	PID         int
+	// Phase2 is the probe QEMU's Phase 2 schema check, nil when the schema
+	// could not be read (the node then checks on the first VM launch).
+	Phase2 *qemu.Phase2Support
 }
 
 // Jailed CPU probe defaults.
@@ -132,6 +135,11 @@ func probeJailedCPU(ctx context.Context, runner probeRunner, rc *JailReclaimer, 
 	ev := CPUEvidence{
 		QEMUVersion: client.Greeting().Version.String(),
 		Option:      opts.Option, Host: opts.Host, Status: status, PID: run.PID(),
+	}
+	// The Phase 2 capability gate reads this same binary's schema; a failed
+	// read only defers the check to the first VM launch.
+	if s, err := qemu.CheckPhase2Schema(qctx, client); err == nil {
+		ev.Phase2 = &s
 	}
 	if err := ctx.Err(); err != nil {
 		return CPUEvidence{}, failJailedProbe(ctx, proc, grace, fmt.Errorf("node: cpu probe: %w", context.Cause(ctx)))

@@ -99,6 +99,7 @@ func TestAPIDTOsValidateThroughCompat(t *testing.T) {
 			"/api/v1/sandboxes/bx_23456789/stops/stop_0123456789abcdef", false,
 		)},
 		{"resume", "resume", http.StatusAccepted, jsonMediaType, api.NewResumeActionResponse(provisioning.ID, provisioning)},
+		{"fork", "fork", http.StatusAccepted, jsonMediaType, api.NewForkActionResponse(provisioning.ID, provisioning)},
 		{"create provisioning", "create", http.StatusAccepted, jsonMediaType, api.NewCreateSandboxResponse(api.CreateProvisioning, nil, provisioning)},
 		{"create ready", "create", http.StatusAccepted, jsonMediaType, api.NewCreateSandboxResponse(api.CreateReady, new(3600), ready)},
 		{"delete sandbox", "deleteSandbox", http.StatusAccepted, jsonMediaType, api.NewSandboxDeletingResponse(operation)},

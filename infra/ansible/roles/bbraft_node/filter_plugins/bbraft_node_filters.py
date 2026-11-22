@@ -492,6 +492,29 @@ def bbraft_node_systemd_unit_quote(value):
     return f'"{escaped}"'
 
 
+def bbraft_node_systemd_path_value(value):
+    """Render one absolute path for a setting systemd reads verbatim.
+
+    ``EnvironmentFile=`` and ``LoadCredential=<id>:<path>`` do not unquote:
+    a value in double quotes is "not absolute" to systemd, which logs it and
+    ignores the setting while the unit still starts (the node then runs
+    without its object store settings). So the path is rendered as is, with
+    only ``%`` doubled (specifiers still expand). What cannot be represented
+    that way is refused: a relative path, a quote or backslash at either
+    end, surrounding whitespace (systemd strips it), a line break or NUL.
+    """
+    text = str(value)
+    if "\n" in text or "\r" in text or "\0" in text:
+        raise ValueError(f"path contains a line break or NUL: {text!r}")
+    if not text.startswith("/"):
+        raise ValueError(f"path {text!r} is not absolute")
+    if text != text.strip():
+        raise ValueError(f"path {text!r} has leading or trailing whitespace")
+    if text.endswith("\\"):
+        raise ValueError(f"path {text!r} ends with a backslash")
+    return text.replace("%", "%%")
+
+
 def bbraft_node_path_ok(path):
     """Like bbraft_node_path_valid but report False instead of raising, so a
     caller's own message names the input (jail paths). A comma is refused too:
@@ -773,6 +796,7 @@ class FilterModule:
             "bbraft_node_mode_lacks": bbraft_node_mode_lacks,
             "bbraft_node_systemd_exec_quote": bbraft_node_systemd_exec_quote,
             "bbraft_node_systemd_unit_quote": bbraft_node_systemd_unit_quote,
+            "bbraft_node_systemd_path_value": bbraft_node_systemd_path_value,
             "bbraft_node_path_ok": bbraft_node_path_ok,
             "bbraft_node_uid_range_valid": bbraft_node_uid_range_valid,
             "bbraft_node_block_device_valid": bbraft_node_block_device_valid,

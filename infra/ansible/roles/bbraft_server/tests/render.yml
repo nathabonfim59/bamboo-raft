@@ -126,6 +126,11 @@
           - "'-lifecycle.retry-seconds \"5\"' in bbraft_server_unit_content"
           - "'-lifecycle.reaper-seconds \"60\"' in bbraft_server_unit_content"
           - "'-lifecycle.job-poll-seconds \"15\"' in bbraft_server_unit_content"
+          - "'-lifecycle.snapshot-interval-seconds \"60\"' in bbraft_server_unit_content"
+          - "'-lifecycle.snapshot-timeout-seconds \"600\"' in bbraft_server_unit_content"
+          - "'-lifecycle.node-lost-seconds \"120\"' in bbraft_server_unit_content"
+          - "'-lifecycle.data-retention-seconds \"1209600\"' in bbraft_server_unit_content"
+          - "'-lifecycle.disk-low-percent \"10\"' in bbraft_server_unit_content"
           - "'-auth.key-prefix \"bmb_\"' in bbraft_server_unit_content"
           - "'-database.url-file' in bbraft_server_unit_content"
           - "'-node.gateway-token-file' in bbraft_server_unit_content"
@@ -147,6 +152,15 @@
           binary must keep its own defaults
         quiet: true
 
+    - name: The object store stays off unless enabled
+      ansible.builtin.assert:
+        that:
+          - "'BBRAFT_S3' not in bbraft_server_unit_content"
+          - "'EnvironmentFile=' not in bbraft_server_unit_content"
+          - "'LoadCredential=' not in bbraft_server_unit_content"
+        fail_msg: "an object-store setting was rendered with the object store disabled"
+        quiet: true
+
     - name: The unit never carries a secret or ephemeral mode
       ansible.builtin.assert:
         that:
@@ -154,6 +168,7 @@
           - "'placeholder-gateway-token-not-real' not in bbraft_server_unit_content"
           - "'placeholder-password' not in bbraft_server_unit_content"
           - "'bmb_placeholder_key_not_real' not in bbraft_server_unit_content"
+          - "'placeholder-s3-secret-not-real' not in bbraft_server_unit_content"
           - "'postgresql://' not in bbraft_server_unit_content"
         fail_msg: "a secret or -secrets.allow-ephemeral leaked into ExecStart"
         quiet: true
@@ -201,6 +216,133 @@
       vars:
         bbraft_server_master_key_size: "{{ bbraft_server_stats.results[3].stat.size }}"
 
+    # The object store is optional. When enabled, the non-secret settings go
+    # to s3.env, the secret alone to a 0600 file, and the unit passes the
+    # secret as a systemd credential rather than an environment value.
+    - name: Enable the object store for one render
+      ansible.builtin.set_fact:
+        bbraft_server_s3_enabled: true
+        bbraft_server_s3_dir: "{{ bbraft_server_test_root.path }}/s3"
+        bbraft_server_s3_env_file: "{{ bbraft_server_test_root.path }}/s3/s3.env"
+        bbraft_server_s3_secret_file: "{{ bbraft_server_test_root.path }}/s3/s3-secret-access-key"
+        bbraft_server_s3_dir_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_server_s3_dir_group: "{{ ansible_facts['user_gid'] }}"
+        bbraft_server_s3_secret_owner: "{{ ansible_facts['user_id'] }}"
+        bbraft_server_s3_secret_group: "{{ ansible_facts['user_gid'] }}"
+
+    - name: Render with the object store enabled
+      ansible.builtin.include_role:
+        name: bbraft_server
+        tasks_from: files
+
+    - name: Read the object-store unit
+      ansible.builtin.slurp:
+        src: "{{ bbraft_server_unit_path }}"
+      register: bbraft_server_s3_unit
+
+    - name: Stat the object-store files
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        get_checksum: false
+      loop:
+        - { path: "{{ bbraft_server_s3_dir }}", mode: "0750" }
+        - { path: "{{ bbraft_server_s3_env_file }}", mode: "0600" }
+        - { path: "{{ bbraft_server_s3_secret_file }}", mode: "0600" }
+      register: bbraft_server_s3_stats
+
+    - name: The object-store files exist with their documented modes
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.mode == item.item.mode
+        fail_msg: "{{ item.item.path }} is missing or has mode {{ item.stat.mode | default('missing') }}, want {{ item.item.mode }}"
+        quiet: true
+      loop: "{{ bbraft_server_s3_stats.results }}"
+
+    - name: Read the object-store files
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ bbraft_server_s3_env_file }}"
+        - "{{ bbraft_server_s3_secret_file }}"
+      register: bbraft_server_s3_slurped
+      no_log: true
+
+    - name: Decode the object-store files
+      ansible.builtin.set_fact:
+        bbraft_server_s3_env_content: "{{ bbraft_server_s3_slurped.results[0].content | b64decode }}"
+        bbraft_server_s3_secret_content: "{{ bbraft_server_s3_slurped.results[1].content | b64decode }}"
+      no_log: true
+
+    - name: The unit carries the credential lines and keeps the secret out of the environment
+      ansible.builtin.assert:
+        that:
+          - "'EnvironmentFile=' ~ bbraft_server_s3_env_file ~ '\n' in bbraft_server_s3_unit_content"
+          - "'LoadCredential=s3-secret-access-key:' ~ bbraft_server_s3_secret_file ~ '\n' in bbraft_server_s3_unit_content"
+
+          - "'Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE=%d/s3-secret-access-key' in bbraft_server_s3_unit_content"
+          - "'placeholder-s3-secret-not-real' not in bbraft_server_s3_unit_content"
+        fail_msg: "the object-store unit lines are missing or a secret reached the unit"
+        quiet: true
+      vars:
+        bbraft_server_s3_unit_content: "{{ bbraft_server_s3_unit.content | b64decode }}"
+      no_log: true
+
+    - name: The environment file carries only the five non-secret settings
+      ansible.builtin.assert:
+        that:
+          - bbraft_server_s3_env_content | trim == bbraft_server_s3_env_expected | trim
+          - "'placeholder-s3-secret-not-real' not in bbraft_server_s3_env_content"
+        fail_msg: "s3.env does not hold exactly the documented non-secret settings"
+        quiet: true
+      vars:
+        bbraft_server_s3_env_expected: |
+          BBRAFT_S3_ENDPOINT={{ bbraft_server_s3_endpoint }}
+          BBRAFT_S3_REGION={{ bbraft_server_s3_region }}
+          BBRAFT_S3_BUCKET={{ bbraft_server_s3_bucket }}
+          BBRAFT_S3_PATH_STYLE=true
+          BBRAFT_S3_ACCESS_KEY_ID={{ bbraft_server_s3_access_key_id }}
+      no_log: true
+
+    - name: The secret file holds only the secret
+      ansible.builtin.assert:
+        that:
+          - bbraft_server_s3_secret_content == bbraft_server_s3_secret_access_key ~ '\n'
+        fail_msg: "the object-store secret file does not hold exactly the secret"
+        quiet: true
+      no_log: true
+
+    # systemd does not unquote EnvironmentFile= or LoadCredential=. A quoted
+    # path is not a path: systemd logs "path is not absolute, ignoring" or
+    # "Credential source ... not valid, ignoring" and starts the unit without
+    # the object store. Verify must catch that, not only a non-zero exit.
+    - name: Verify the object-store unit with systemd-analyze
+      ansible.builtin.command:
+        argv: [systemd-analyze, verify, "{{ bbraft_server_unit_path }}"]
+      register: bbraft_server_s3_verify
+      changed_when: false
+      failed_when: false
+      when: bbraft_server_verify_unit | bool
+
+    - name: The object-store unit has no settings systemd ignored
+      ansible.builtin.assert:
+        that:
+          - bbraft_server_s3_verify.rc == 0
+          - "'ignoring' not in bbraft_server_s3_verify_output"
+          - "'not valid' not in bbraft_server_s3_verify_output"
+          - "'not absolute' not in bbraft_server_s3_verify_output"
+        fail_msg: >-
+          systemd-analyze verify ignored a unit setting; the object store would
+          start disabled. Output: {{ bbraft_server_s3_verify.stdout ~ bbraft_server_s3_verify.stderr }}
+        quiet: true
+      vars:
+        bbraft_server_s3_verify_output: "{{ (bbraft_server_s3_verify.stdout ~ '\n' ~ bbraft_server_s3_verify.stderr) | lower }}"
+      when: bbraft_server_verify_unit | bool
+
+    - name: Turn the object store back off
+      ansible.builtin.set_fact:
+        bbraft_server_s3_enabled: false
+
     # roles=lifecycle does not need API keys and does not write their files;
     # the unit must omit both flags rather than point at missing files.
     - name: Render for the lifecycle-only role
@@ -228,6 +370,9 @@
           - "'-roles \"lifecycle\"' in bbraft_server_lifecycle_content"
           - "'-auth.keys-file' not in bbraft_server_lifecycle_content"
           - "'-node.tokens-file' not in bbraft_server_lifecycle_content"
+          - "'BBRAFT_S3' not in bbraft_server_lifecycle_content"
+          - "'EnvironmentFile=' not in bbraft_server_lifecycle_content"
+          - "'LoadCredential=' not in bbraft_server_lifecycle_content"
         fail_msg: "the unit points at credential files the lifecycle role did not write"
         quiet: true
       vars:

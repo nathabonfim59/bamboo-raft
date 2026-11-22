@@ -17,8 +17,10 @@ type snapshotEvent struct {
 	SnapshotID string                  `json:"snapshotId,omitempty"`
 }
 
-// newSnapshotCommand builds `bbraft snapshot ID NAME` and
-// `bbraft snapshot rm NAME`.
+// newSnapshotCommand builds `bbraft snapshot ID NAME`, `bbraft snapshot rm
+// NAME`, `bbraft snapshot latest SANDBOX_ID`, and `bbraft snapshot
+// share|shares|unshare`. The child subcommands cannot collide with the save
+// form because its first argument is always a sandbox id (`bx_...`).
 func newSnapshotCommand(a *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "snapshot ID NAME",
@@ -28,6 +30,22 @@ func newSnapshotCommand(a *App) *cobra.Command {
 			return a.saveSnapshot(ctx, args[0], args[1])
 		}),
 	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "latest SANDBOX_ID",
+		Short: "Show the newest snapshot of a sandbox",
+		Args:  cobra.ExactArgs(1),
+		RunE: a.runE(func(ctx context.Context, args []string) error {
+			client, err := a.apiClient(ctx)
+			if err != nil {
+				return err
+			}
+			response, err := client.GetLatestSandboxSnapshot(ctx, args[0])
+			if err != nil {
+				return err
+			}
+			return a.printSnapshotLatest(response, args[0])
+		}),
+	})
 	cmd.AddCommand(&cobra.Command{
 		Use:   "rm NAME",
 		Short: "Remove a saved snapshot",
@@ -47,6 +65,11 @@ func newSnapshotCommand(a *App) *cobra.Command {
 			return a.out.Humanf("deleted snapshot %s", response.Name)
 		}),
 	})
+	cmd.AddCommand(
+		newSnapshotShareCommand(a),
+		newSnapshotSharesCommand(a),
+		newSnapshotUnshareCommand(a),
+	)
 	return cmd
 }
 

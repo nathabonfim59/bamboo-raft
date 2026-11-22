@@ -11,7 +11,22 @@ const (
 	PathSandboxStop       = "/api/v1/sandboxes/{sandboxId}/stop"
 	PathSandboxStops      = "/api/v1/sandboxes/{sandboxId}/stops/{stopId}"
 	PathSandboxResume     = "/api/v1/sandboxes/{sandboxId}/resume"
+	PathSandboxRecover    = "/api/v1/sandboxes/{sandboxId}/recover"
+	PathSandboxFork       = "/api/v1/sandboxes/{sandboxId}/fork"
 	PathDeletionOperation = "/api/v1/deletion-operations/{operationId}"
+)
+
+// Snapshot listing route patterns.
+const (
+	PathSnapshots             = "/api/v1/snapshots"
+	PathSandboxSnapshots      = "/api/v1/sandboxes/{sandboxId}/snapshots"
+	PathSandboxSnapshotLatest = "/api/v1/sandboxes/{sandboxId}/snapshots/latest"
+)
+
+// Saved-snapshot share-code route patterns.
+const (
+	PathSavedSnapshotShares = "/api/v1/saved-snapshots/{name}/shares"
+	PathSavedSnapshotShare  = "/api/v1/saved-snapshots/{name}/shares/{shareId}"
 )
 
 // Path parameter names set by the route patterns. Handlers read them with
@@ -37,6 +52,13 @@ type Handlers struct {
 	StopSandbox          http.HandlerFunc
 	GetSandboxStop       http.HandlerFunc
 	ResumeSandbox        http.HandlerFunc
+	RecoverSandbox       http.HandlerFunc
+	ForkSandbox          http.HandlerFunc
+
+	// Snapshot listings. NewGenerationHandlers sets exactly these three.
+	ListSnapshots            http.HandlerFunc
+	ListSandboxSnapshots     http.HandlerFunc
+	GetLatestSandboxSnapshot http.HandlerFunc
 }
 
 // Register adds the core v1 routes to mux. The mux should be the
@@ -57,4 +79,9 @@ func Register(mux *http.ServeMux, h Handlers) {
 	handle("POST "+PathSandboxStop, h.StopSandbox)
 	handle("GET "+PathSandboxStops, h.GetSandboxStop)
 	handle("POST "+PathSandboxResume, h.ResumeSandbox)
+	handle("POST "+PathSandboxRecover, h.RecoverSandbox)
+	handle("POST "+PathSandboxFork, h.ForkSandbox)
+	handle("GET "+PathSnapshots, h.ListSnapshots)
+	handle("GET "+PathSandboxSnapshots, h.ListSandboxSnapshots)
+	handle("GET "+PathSandboxSnapshotLatest, h.GetLatestSandboxSnapshot)
 }

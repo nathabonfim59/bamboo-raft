@@ -366,6 +366,82 @@ class GatewayServerNameTest(unittest.TestCase):
                 self.assertNotIn(name, str(caught.exception))
 
 
+class SystemdAbsPathTest(unittest.TestCase):
+    def test_absolute_path_is_rendered_verbatim(self):
+        self.assertEqual(
+            FILTERS.bbraft_systemd_abs_path("/etc/bbraft/s3.env"),
+            "/etc/bbraft/s3.env",
+        )
+
+    def test_percent_is_doubled_for_specifier_escaping(self):
+        self.assertEqual(
+            FILTERS.bbraft_systemd_abs_path("/etc/bbraft/%s/s3.env"),
+            "/etc/bbraft/%%s/s3.env",
+        )
+
+    def test_relative_path_is_rejected(self):
+        for value in ["", "etc/bbraft/s3.env", "./s3.env", "../s3.env"]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    FILTERS.bbraft_systemd_abs_path(value)
+
+    def test_whitespace_is_rejected(self):
+        for value in [
+            "/etc/bb raft/s3.env",
+            "/etc/bbraft/s3.env\n",
+            "/etc/bbraft/s3.env\r",
+            "/etc/bbraft/\u00a0s3.env",
+            "/etc/bbraft/\u2028s3.env",
+        ]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    FILTERS.bbraft_systemd_abs_path(value)
+
+    def test_quotes_and_backslash_are_rejected(self):
+        for value in [
+            '/etc/"bbraft"/s3.env',
+            "/etc/'bbraft'/s3.env",
+            "/etc/bbraft\\s3.env",
+        ]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    FILTERS.bbraft_systemd_abs_path(value)
+
+    def test_nul_is_rejected(self):
+        with self.assertRaises(ValueError):
+            FILTERS.bbraft_systemd_abs_path("/etc/bbraft/s3\0.env")
+
+    def test_dot_elements_are_rejected(self):
+        for value in ["/etc/./s3.env", "/etc/../s3.env", "/etc/bbraft/.."]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    FILTERS.bbraft_systemd_abs_path(value)
+
+    def test_trailing_slash_is_rejected(self):
+        for value in ["/etc/bbraft/", "/"]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    FILTERS.bbraft_systemd_abs_path(value)
+
+
+class NonnegativeIntTest(unittest.TestCase):
+    def test_accepts_zero_ints_and_ascii_digit_strings(self):
+        self.assertEqual(FILTERS.bbraft_nonnegative_int(0), 0)
+        self.assertEqual(FILTERS.bbraft_nonnegative_int("0"), 0)
+        self.assertEqual(FILTERS.bbraft_nonnegative_int(1209600), 1209600)
+        self.assertEqual(FILTERS.bbraft_nonnegative_int("1209600"), 1209600)
+
+    def test_rejects_floats_negatives_and_non_decimal_strings(self):
+        for value in [1.5, "1.5", "100x", "1e3", " 100", "-1", -1, True]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    FILTERS.bbraft_nonnegative_int(value)
+
+    def test_rejects_unicode_digits(self):
+        with self.assertRaises(ValueError):
+            FILTERS.bbraft_nonnegative_int("\u0667\u0662\u0660\u0660")
+
+
 class PositiveIntTest(unittest.TestCase):
     def test_accepts_ints_and_ascii_digit_strings(self):
         self.assertEqual(FILTERS.bbraft_positive_int(7200), 7200)

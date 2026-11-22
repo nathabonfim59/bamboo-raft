@@ -193,3 +193,50 @@ func TestValidateFiles(t *testing.T) {
 		})
 	}
 }
+
+// bitmapPausedArgv inserts -S after -no-reboot, where qemu.JailedArgs puts it.
+func bitmapPausedArgv(t *testing.T, args []string, copies int) []string {
+	t.Helper()
+	i := slices.Index(args, "-no-reboot")
+	if i < 0 {
+		t.Fatal("argv has no -no-reboot")
+	}
+	out := slices.Clone(args[:i+1])
+	for range copies {
+		out = append(out, "-S")
+	}
+	return append(out, args[i+1:]...)
+}
+
+// TestPausedLaunchOption: the validator accepts the Phase 1 argv (no -S) and
+// the Phase 2 paused argv (one -S), both for a launch and for adoption, and
+// refuses a repeated -S or one that takes a value.
+func TestPausedLaunchOption(t *testing.T) {
+	spec := jailerSpec(t, jailerLaunchID, jailerQCOW("", 0), jailerQCOW("/base.qcow2", 0))
+	qcow := []bool{true, true}
+	withValue := bitmapPausedArgv(t, spec.Args, 1)
+	i := slices.Index(withValue, "-S")
+	withValue = slices.Insert(withValue, i+1, "on")
+	tests := []struct {
+		name string
+		args []string
+		ok   bool
+	}{
+		{"phase 1 without -S", spec.Args, true},
+		{"phase 2 with -S", bitmapPausedArgv(t, spec.Args, 1), true},
+		{"-S twice", bitmapPausedArgv(t, spec.Args, 2), false},
+		{"-S with a value", withValue, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := spec
+			s.Args = tt.args
+			if err := validateArgs(s, qcow); (err == nil) != tt.ok {
+				t.Errorf("validateArgs = %v, want ok=%t", err, tt.ok)
+			}
+			if err := ValidateArgv(jailerLaunchID, tt.args, spec.Disks); (err == nil) != tt.ok {
+				t.Errorf("ValidateArgv = %v, want ok=%t", err, tt.ok)
+			}
+		})
+	}
+}

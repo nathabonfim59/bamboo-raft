@@ -260,6 +260,47 @@ expect_fail "descending ssh port range" "is above maximum" "$here/validate.yml" 
     -e 'bbraft_node_ssh_port_range=22999-22000'
 expect_fail "malformed ssh port range" "is not an inclusive min-max port range" "$here/validate.yml" \
     -e 'bbraft_node_ssh_port_range=22000'
+
+# Phase 2 object store: the five remote values and the colocated env file are
+# each accepted alone; the secret is required in remote mode and refused in
+# colocated mode.
+play "$here/validate.yml" -e '{"bbraft_node_s3": {"endpoint": "http://203.0.113.20:3900", "region": "garage", "bucket": "bbraft-remote", "path_style": true, "access_key_id": "GKvalid"}, "bbraft_node_s3_secret_access_key": "placeholder-remote-secret-not-real"}' >/dev/null
+play "$here/validate.yml" -e 'bbraft_node_s3_env_file=/etc/bbraft/s3.env' >/dev/null
+play "$here/validate.yml" -e 'bbraft_node_chunk_cache_bytes=0' >/dev/null
+echo "ok: off, colocated and remote object store modes accepted"
+
+expect_fail "remote endpoint with credentials" "The remote object store values are valid" "$here/validate.yml" \
+    -e @"$here/invalid/s3-endpoint-credentials.yml"
+expect_fail "remote endpoint with a query" "The remote object store values are valid" "$here/validate.yml" \
+    -e @"$here/invalid/s3-endpoint-query.yml"
+expect_fail "remote endpoint without http(s)" "The remote object store values are valid" "$here/validate.yml" \
+    -e @"$here/invalid/s3-endpoint-scheme.yml"
+expect_fail "invalid remote bucket name" "The remote object store values are valid" "$here/validate.yml" \
+    -e @"$here/invalid/s3-bucket.yml"
+expect_fail "empty remote region" "The remote object store values are valid" "$here/validate.yml" \
+    -e @"$here/invalid/s3-region.yml"
+expect_fail "string path_style" "The remote object store values are valid" "$here/validate.yml" \
+    -e @"$here/invalid/s3-path-style.yml"
+expect_fail "remote dict with a misspelled key" "The remote object store values are valid" "$here/validate.yml" \
+    -e @"$here/invalid/s3-keys.yml"
+expect_fail "remote secret with a newline" "The remote object store values are valid" "$here/validate.yml" \
+    -e @"$here/invalid/s3-secret-newline.yml"
+expect_fail "empty remote secret" "The remote object store values are valid" "$here/validate.yml" \
+    -e @"$here/invalid/s3-secret-empty.yml"
+expect_fail "both object store modes" "The object store inputs are complete and unambiguous" "$here/validate.yml" \
+    -e @"$here/invalid/s3-both-modes.yml"
+expect_fail "secret value in colocated mode" "The object store inputs are complete and unambiguous" "$here/validate.yml" \
+    -e @"$here/invalid/s3-colocated-secret.yml"
+expect_fail "relative object store env file" "is not absolute" "$here/validate.yml" \
+    -e @"$here/invalid/s3-env-relative.yml"
+expect_fail "relative object store secret file" "is not absolute" "$here/validate.yml" \
+    -e @"$here/invalid/s3-secret-path.yml"
+expect_fail "negative chunk cache" "expected a non-negative decimal integer" "$here/validate.yml" \
+    -e 'bbraft_node_chunk_cache_bytes=-1'
+expect_fail "fractional chunk cache" "expected a non-negative decimal integer" "$here/validate.yml" \
+    -e 'bbraft_node_chunk_cache_bytes=1.5'
+expect_fail "overflowing chunk cache" "The chunk cache cap fits the binary's byte count" "$here/validate.yml" \
+    -e 'bbraft_node_chunk_cache_bytes=9223372036854775808'
 expect_fail "no image" "nonempty list of unique absolute controller" "$here/validate.yml" -e '{"bbraft_node_images":[]}'
 expect_fail "missing image manifest" "manifest.json" "$here/validate.yml" -e "$(images_json "/nonexistent/image-fixture")"
 expect_fail "relative image path" "is not absolute" "$here/validate.yml" -e "$(images_json "relative/image-fixture")"
@@ -339,7 +380,17 @@ if grep -F -q -- 'placeholder-node-token-not-real' "$log"; then
     rm -f "$log"
     exit 1
 fi
+if grep -F -q -- 'SENTINEL-bbraft-node-s3-secret-5c9d' "$log"; then
+    echo "FAIL: verbose output leaked the colocated S3 secret sentinel" >&2
+    rm -f "$log"
+    exit 1
+fi
+if grep -F -q -- 'SENTINEL-bbraft-node-remote-secret-8e2a' "$log"; then
+    echo "FAIL: verbose output leaked the remote S3 secret sentinel" >&2
+    rm -f "$log"
+    exit 1
+fi
 rm -f "$log"
-echo "ok: verbose render prints no token"
+echo "ok: verbose render prints no token or S3 secret"
 
 echo "bbraft_node role tests passed"

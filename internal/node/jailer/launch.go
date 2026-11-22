@@ -123,7 +123,11 @@ func (m *Manager) Start(ctx context.Context, spec LaunchSpec) (*Child, error) {
 	if _, err := spec.validate(); err != nil {
 		return nil, err
 	}
-	if err := m.checkDeviceRoles(spec); err != nil {
+	checkDevices := m.checkDeviceRoles
+	if spec.Maintenance {
+		checkDevices = m.checkMaintenanceDevices
+	}
+	if err := checkDevices(spec); err != nil {
 		return nil, err
 	}
 	return m.launchLocked(ctx, spec, KindVM, nil)

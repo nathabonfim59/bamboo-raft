@@ -18,3 +18,18 @@ bbraft_node_capacity_vcpus: 0
 bbraft_node_capacity_memory_mib: 0
 bbraft_node_capacity_disk_gib: 0
 bbraft_node_manage_service: false
+# Phase 2 object store for the attempts that run Phase 2 conformance (link and
+# direct). The role renders the unit's EnvironmentFile=, LoadCredential= and
+# BBRAFT_S3_SECRET_ACCESS_KEY_FILE from bbraft_node_s3 exactly as in
+# production; these values only have to validate. The harness
+# (jail_kvm_infra_test.go, writeS3) writes the real files at the paths the
+# rendered unit names: the endpoint is the forwarder it listens on inside the
+# node namespace (jailKVMS3Addr) and the key is the test's own Garage key.
+kt_s3_attempts: [link, direct]
+kt_s3:
+  endpoint: http://127.0.0.1:7702
+  region: garage
+  bucket: bbrafttest
+  path_style: true
+  access_key_id: placeholder-kvm-harness-key-id
+kt_s3_secret_access_key: placeholder-kvm-harness-secret

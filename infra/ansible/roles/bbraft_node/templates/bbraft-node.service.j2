@@ -70,8 +70,20 @@ ExecStart={{ bbraft_node_binary_path | bbraft_node_systemd_exec_quote }} \
 {% for name, value in [('read-bps', bbraft_node_jail_io_rates_int.read_bps), ('write-bps', bbraft_node_jail_io_rates_int.write_bps), ('read-iops', bbraft_node_jail_io_rates_int.read_iops), ('write-iops', bbraft_node_jail_io_rates_int.write_iops)] if (value | int) > 0 %}
     -node.jail-io-{{ name }} {{ value | string | bbraft_node_systemd_exec_quote }} \
 {% endfor %}
+{% if bbraft_node_s3_configured | bool %}
+    -node.chunk-cache-bytes {{ bbraft_node_chunk_cache_bytes_int | string | bbraft_node_systemd_exec_quote }} \
+{% endif %}
     -node.jail-io-device {{ bbraft_node_jail_io_device | bbraft_node_systemd_exec_quote }}
 
+{% if bbraft_node_s3_configured | bool %}
+# Phase 2 object store. The env file holds only non-secret settings; the
+# secret is a root-only file that systemd copies into the credential directory
+# owned by this service (mode 0400). The Environment= line comes after
+# EnvironmentFile= so the credential path wins over any stale value there.
+EnvironmentFile={{ bbraft_node_s3_env_file_effective | bbraft_node_systemd_path_value }}
+LoadCredential=s3-secret-access-key:{{ bbraft_node_s3_secret_file_effective | bbraft_node_systemd_path_value }}
+Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE=%d/s3-secret-access-key
+{% endif %}
 Restart=on-failure
 RestartSec=5
 # QEMU VMs are children of this process. KillMode=process signals only the

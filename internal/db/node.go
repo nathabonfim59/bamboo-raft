@@ -28,6 +28,21 @@ type Node struct {
 	LastSeenAt   time.Time
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// ObjectStoreOK is false while the node is known to lack a usable object
+	// store (it refused a manifest restore with FAILED_PRECONDITION although
+	// it had the image); placement for manifest restores skips it.
+	// ObjectStoreCheckedAt is when the flag last changed, nil if never.
+	ObjectStoreOK        bool
+	ObjectStoreCheckedAt *time.Time
+}
+
+// Free is the capacity not reserved yet, never negative.
+func (n Node) Free() Resources {
+	return Resources{
+		VCPUs:     n.Total.VCPUs - min(n.Reserved.VCPUs, n.Total.VCPUs),
+		MemoryMiB: n.Total.MemoryMiB - min(n.Reserved.MemoryMiB, n.Total.MemoryMiB),
+		DiskGiB:   n.Total.DiskGiB - min(n.Reserved.DiskGiB, n.Total.DiskGiB),
+	}
 }
 
 // NodeInfo is the inventory payload the nodehub role writes from a node's
@@ -50,14 +65,14 @@ type NodeInfo struct {
 const nodeCols = `id, cpu_model, qemu_version, default_image,
 	total_vcpus, total_memory_mib, total_disk_gib,
 	reserved_vcpus, reserved_memory_mib, reserved_disk_gib,
-	last_seen_at, created_at, updated_at`
+	last_seen_at, created_at, updated_at, objstore_ok, objstore_checked_at`
 
 func scanNode(row scanner) (Node, error) {
 	var n Node
 	err := row.Scan(&n.ID, &n.CPUModel, &n.QEMUVersion, &n.DefaultImage,
 		&n.Total.VCPUs, &n.Total.MemoryMiB, &n.Total.DiskGiB,
 		&n.Reserved.VCPUs, &n.Reserved.MemoryMiB, &n.Reserved.DiskGiB,
-		&n.LastSeenAt, &n.CreatedAt, &n.UpdatedAt)
+		&n.LastSeenAt, &n.CreatedAt, &n.UpdatedAt, &n.ObjectStoreOK, &n.ObjectStoreCheckedAt)
 	return n, err
 }
 
@@ -76,11 +91,14 @@ func scanNode(row scanner) (Node, error) {
 // once each. A reservation the node has not seen yet, or a deletion it has
 // not finished, can skew the baseline until the next poll; node admission
 // remains the authority.
+//
+// The observation time is also the node's last_up_at, the clock node-loss
+// detection reads ([Store.LostNodes]); [Store.TouchNodeSeen] never moves it.
 func (s *Store) UpsertNodeInfo(ctx context.Context, info NodeInfo) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO nodes (id, cpu_model, qemu_version, default_image,
-			total_vcpus, total_memory_mib, total_disk_gib, last_seen_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+			total_vcpus, total_memory_mib, total_disk_gib, last_seen_at, last_up_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, now(), now())
 		ON CONFLICT (id) DO UPDATE SET
 			cpu_model = EXCLUDED.cpu_model,
 			qemu_version = EXCLUDED.qemu_version,
@@ -89,6 +107,7 @@ func (s *Store) UpsertNodeInfo(ctx context.Context, info NodeInfo) error {
 			total_memory_mib = EXCLUDED.total_memory_mib,
 			total_disk_gib = EXCLUDED.total_disk_gib + nodes.reserved_disk_gib,
 			last_seen_at = EXCLUDED.last_seen_at,
+			last_up_at = EXCLUDED.last_seen_at,
 			updated_at = now()`,
 		info.ID, info.CPUModel, info.QEMUVersion, info.DefaultImage,
 		info.Capacity.VCPUs, info.Capacity.MemoryMiB, info.DiskFreeGiB, info.SeenAt)
@@ -99,6 +118,9 @@ func (s *Store) UpsertNodeInfo(ctx context.Context, info NodeInfo) error {
 }
 
 // TouchNodeSeen refreshes connection freshness without changing inventory.
+// It leaves last_up_at alone: the inventory writer calls it with the epoch to
+// mark a disconnected node stale, which must not make a short blip look like
+// a node gone for good.
 func (s *Store) TouchNodeSeen(ctx context.Context, id string, at time.Time) error {
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE nodes SET last_seen_at = $2, updated_at = now() WHERE id = $1`, id, at)
@@ -242,4 +264,28 @@ func (s *Store) ReleaseSandboxReservation(ctx context.Context, owner uuid.UUID, 
 		}
 		return nil
 	})
+}
+
+// MarkNodeObjectStore records whether nodeID has a usable object store. A
+// manifest restore refused with FAILED_PRECONDITION on a node that has the
+// manifest's image marks it false; a later successful SnapshotVM or manifest
+// restore marks it true again. objstore_checked_at moves only when the flag
+// changes, so the success path can call this on every snapshot cheaply. An
+// unknown node answers [ErrNotFound].
+func (s *Store) MarkNodeObjectStore(ctx context.Context, nodeID string, ok bool) error {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		WITH changed AS (
+			UPDATE nodes SET objstore_ok = $2, objstore_checked_at = now(), updated_at = now()
+			WHERE id = $1 AND objstore_ok IS DISTINCT FROM $2
+			RETURNING id)
+		SELECT EXISTS (SELECT 1 FROM changed) OR EXISTS (SELECT 1 FROM nodes WHERE id = $1)`,
+		nodeID, ok).Scan(&exists)
+	if err != nil {
+		return fmtError("mark node object store", err)
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	return nil
 }

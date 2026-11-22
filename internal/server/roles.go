@@ -1,6 +1,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -18,9 +19,11 @@ import (
 	"github.com/nathabonfim59/bamboo-raft/internal/api"
 	"github.com/nathabonfim59/bamboo-raft/internal/apierr"
 	"github.com/nathabonfim59/bamboo-raft/internal/auth"
+	"github.com/nathabonfim59/bamboo-raft/internal/gc"
 	"github.com/nathabonfim59/bamboo-raft/internal/lifecycle"
 	snapshotsplugin "github.com/nathabonfim59/bamboo-raft/internal/lifecycle/snapshots"
 	"github.com/nathabonfim59/bamboo-raft/internal/nodelink"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore"
 	"github.com/nathabonfim59/bamboo-raft/internal/scheduler"
 	"github.com/nathabonfim59/bamboo-raft/internal/server/config"
 	"github.com/nathabonfim59/bamboo-raft/internal/server/nodegateway"
@@ -39,7 +42,11 @@ const (
 // runAPI starts the public HTTP role. It owns one store handle, the auth
 // bootstrap and the bearer stack; it reaches nodes only through the internal
 // gateway client factory.
-func runAPI(ctx context.Context, cfg *config.Config, logger *slog.Logger, options Options, openStore StoreOpener, shutdownTimeout time.Duration) error {
+//
+// objectStore reports whether an object store is configured; it enables
+// resume on another node and fork (both need a generation), and its absence
+// makes the fork handler answer 409 snapshots_disabled.
+func runAPI(ctx context.Context, cfg *config.Config, logger *slog.Logger, options Options, openStore StoreOpener, shutdownTimeout time.Duration, objectStore bool) error {
 	store, err := openStore(ctx, config.RoleAPI)
 	if err != nil {
 		return err
@@ -59,18 +66,25 @@ func runAPI(ctx context.Context, cfg *config.Config, logger *slog.Logger, option
 		return err
 	}
 	factory := nodegateway.NewClientFactory(cfg.Node.GatewayDial, cfg.Node.GatewayToken, gatewayTLS)
-	placer, err := scheduler.New(scheduler.Options{
+	schedOpts := scheduler.Options{
 		Store:   store,
 		Dial:    gatewaySchedulerDial(factory),
 		Log:     logger,
 		Restore: snapshotRestoreResolver{store: store},
-	})
+	}
+	// with an object store, an archived sandbox whose disk node
+	// cannot take it resumes on another node from its last generation.
+	if objectStore {
+		schedOpts.ResumeElsewhere = store
+	}
+	placer, err := scheduler.New(schedOpts)
 	if err != nil {
 		return err
 	}
 	core, err := api.NewCoreHandlers(api.CoreOptions{
 		Store:     store,
-		Admission: apiAdmission{placer: placer},
+		Admission: apiAdmission{placer: placer, batches: placer},
+		Batch:     apiAdmission{placer: placer, batches: placer},
 		Logger:    logger,
 	})
 	if err != nil {
@@ -85,6 +99,14 @@ func runAPI(ctx context.Context, cfg *config.Config, logger *slog.Logger, option
 		return err
 	}
 	saved, err := api.NewSavedSnapshotHandlers(api.SavedSnapshotOptions{Store: store, Logger: logger})
+	if err != nil {
+		return err
+	}
+	snapshotShares, err := api.NewSnapshotShareHandlers(api.SnapshotShareOptions{Store: store, Logger: logger})
+	if err != nil {
+		return err
+	}
+	snapshotListings, err := api.NewGenerationHandlers(api.GenerationOptions{Store: store, Logger: logger})
 	if err != nil {
 		return err
 	}
@@ -129,6 +151,25 @@ func runAPI(ctx context.Context, cfg *config.Config, logger *slog.Logger, option
 	if err != nil {
 		return err
 	}
+	recoverSandbox, err := api.NewRecoverHandler(api.RecoverOptions{
+		Store:   store,
+		Clients: clients,
+		Logger:  logger,
+	})
+	if err != nil {
+		return err
+	}
+	// A fork is admitted through placement and the store; without an object
+	// store the handler refuses it (409 snapshots_disabled).
+	forkSandbox, err := api.NewForkHandler(api.ForkOptions{
+		Store:       store,
+		Admission:   apiForkAdmission{placer: placer, store: store},
+		ObjectStore: objectStore,
+		Logger:      logger,
+	})
+	if err != nil {
+		return err
+	}
 	info, err := api.NewInfoHandler(api.InfoOptions{
 		Version:          version.Version,
 		StreamMaxSeconds: cfg.Commands.StreamMaxSeconds,
@@ -149,7 +190,11 @@ func runAPI(ctx context.Context, cfg *config.Config, logger *slog.Logger, option
 	protected := http.NewServeMux()
 	api.Register(protected, core)
 	api.Register(protected, lifecycleRoutes)
+	api.Register(protected, api.Handlers{RecoverSandbox: recoverSandbox})
+	api.Register(protected, api.Handlers{ForkSandbox: forkSandbox})
 	api.RegisterSavedSnapshots(protected, saved)
+	api.RegisterSnapshotShares(protected, snapshotShares)
+	api.Register(protected, snapshotListings)
 	protected.HandleFunc("POST "+api.CommandsPath, commands.ServeHTTP)
 	protected.HandleFunc("GET "+api.ProcessStatusPath, status.ServeHTTP)
 	protected.HandleFunc("GET "+api.CommandAttachPath, attach.ServeHTTP)
@@ -230,7 +275,7 @@ func runAPI(ctx context.Context, cfg *config.Config, logger *slog.Logger, option
 // gateway dialer. Handlers are fixed at construction: the saved-snapshot
 // plugin supplies its map and the snapshot reconciler runs beside the workers
 // under the same role context.
-func runLifecycle(ctx context.Context, cfg *config.Config, logger *slog.Logger, openStore StoreOpener) error {
+func runLifecycle(ctx context.Context, cfg *config.Config, logger *slog.Logger, openStore StoreOpener, objects objstore.Store) error {
 	store, err := openStore(ctx, config.RoleLifecycle)
 	if err != nil {
 		return err
@@ -243,11 +288,19 @@ func runLifecycle(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 	}
 	factory := nodegateway.NewClientFactory(cfg.Node.GatewayDial, cfg.Node.GatewayToken, gatewayTLS)
 	dial := gatewayLifecycleDial(factory)
-	plugin, err := snapshotsplugin.New(snapshotsplugin.Options{
+	// The plugin exists before the worker (it supplies the handler map); a
+	// generation-backed save reaches the worker's CutGeneration through this
+	// late-bound adapter. Without an object store the node-local path stays.
+	cutter := &snapshotCutter{}
+	pluginOptions := snapshotsplugin.Options{
 		Store:  store,
 		Dial:   dial,
 		Logger: logger,
-	})
+	}
+	if objects != nil {
+		pluginOptions.Cutter = cutter
+	}
+	plugin, err := snapshotsplugin.New(pluginOptions)
 	if err != nil {
 		return err
 	}
@@ -255,6 +308,16 @@ func runLifecycle(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 		Store:  store,
 		Dial:   dial,
 		Logger: logger,
+	})
+	if err != nil {
+		return err
+	}
+	// the provision job re-places a manifest restore refused by a
+	// node without an object store, through the same gateway factory.
+	placer, err := scheduler.New(scheduler.Options{
+		Store: store,
+		Dial:  gatewaySchedulerDial(factory),
+		Log:   logger,
 	})
 	if err != nil {
 		return err
@@ -267,19 +330,51 @@ func runLifecycle(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 		JobPoll:          seconds(cfg.Lifecycle.JobPollSeconds),
 		ReaperInterval:   seconds(cfg.Lifecycle.ReaperSeconds),
 		StoppedRetention: cfg.Lifecycle.StoppedRetentionOption(),
+		DataRetention:    cfg.Lifecycle.DataRetentionOption(),
 		Handlers:         plugin.Handlers(),
+		ObjectStore:      objects,
+		SnapshotInterval: seconds(cfg.Lifecycle.SnapshotIntervalSeconds),
+		SnapshotTimeout:  seconds(cfg.Lifecycle.SnapshotTimeoutSeconds),
+		Placer:           placer,
+		NodeLostAfter:    seconds(cfg.Lifecycle.NodeLostSeconds),
+		DiskLowPercent:   cfg.Lifecycle.DiskLowPercent,
 	})
 	if err != nil {
 		return err
 	}
+	cutter.worker = worker
+
+	// The chunk collector runs only with an object store: without one no
+	// generation exists to collect.
+	runners := 2
+	var collector *gc.Collector
+	if objects != nil {
+		collector, err = gc.New(gc.Options{
+			Store:           store,
+			Objects:         objects,
+			Logger:          logger,
+			Interval:        seconds(cmp.Or(cfg.GC.IntervalSeconds, config.DefaultGCIntervalSeconds)),
+			Grace:           seconds(cmp.Or(cfg.GC.GraceSeconds, config.DefaultGCGraceSeconds)),
+			History:         seconds(cmp.Or(cfg.GC.HistorySeconds, config.DefaultGCHistorySeconds)),
+			Batch:           cmp.Or(cfg.GC.Batch, config.DefaultGCBatch),
+			SnapshotTimeout: seconds(cfg.Lifecycle.SnapshotTimeoutSeconds),
+		})
+		if err != nil {
+			return err
+		}
+		runners++
+	}
 
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	errCh := make(chan error, 2)
+	errCh := make(chan error, runners)
 	go func() { errCh <- worker.Run(runCtx) }()
 	go func() { errCh <- reconciler.Run(runCtx) }()
+	if collector != nil {
+		go func() { errCh <- collector.Run(runCtx) }()
+	}
 	var first error
-	for range 2 {
+	for range runners {
 		if err := <-errCh; err != nil && first == nil {
 			first = err
 			cancel(err)

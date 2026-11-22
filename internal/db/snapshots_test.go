@@ -1351,6 +1351,11 @@ func TestSnapshotMigrationDownRefusesActivePin(t *testing.T) {
 	if err := snapshotMigrateDownTo(t, s, 2); err == nil || !strings.Contains(err.Error(), "restore pin") {
 		t.Fatalf("down with active pin: %v", err)
 	}
+	// The refused Down still rolled the later migrations back before 00003
+	// refused; migrate up again before reading through the modern store.
+	if err := s.Migrate(t.Context()); err != nil {
+		t.Fatalf("migrate up after refused down: %v", err)
+	}
 	got, err := s.SavedSnapshot(t.Context(), own, snap.ID)
 	if err != nil || got.Pins != 1 {
 		t.Fatalf("pin lost after refused down: %v %+v", err, got)

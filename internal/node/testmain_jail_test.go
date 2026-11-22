@@ -18,6 +18,7 @@ import (
 func TestMain(m *testing.M) {
 	jailer.RunHelperIfSelected()
 	if os.Getenv(jailArgvHelperEnv) == "1" {
+		maintQMPHelper()
 		jailArgvHelper()
 		os.Exit(0)
 	}

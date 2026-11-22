@@ -99,7 +99,8 @@ invalid usage. Cancellation is transport-specific: a foreground `exec`
 | Command | Purpose |
 |---|---|
 | `login --key-stdin` | Verify and save an API key. |
-| `new [--type small\|default\|large\|xlarge] [--ttl N] [--name NAME] [--from SNAPSHOT]` | Create a sandbox or restore a saved snapshot. |
+| `new [--type small\|default\|large\|xlarge] [--ttl N] [--name NAME] [--from NAME\|CODE] [--fail-fast]` | Create a sandbox, or restore a saved snapshot or share code (`bsh_...`). |
+| `new --from NAME\|CODE --count N [...]` | Create `N` sandboxes (`1` to `1000`) from a saved snapshot or share code in one batch and print each id without waiting; cannot be combined with `--fail-fast`. |
 | `list [--all] [--json]` | List owner-scoped sandboxes. |
 | `info ID` | Show one sandbox, including `ttlSeconds`, `archiveAfter`, `stoppedAt`, stop metadata and `sshEndpoint` when known. |
 | `rename ID NAME` | PATCH the display name. |
@@ -107,6 +108,8 @@ invalid usage. Cancellation is transport-specific: a foreground `exec`
 | `stop ID [--force]` | Stop a sandbox, keep its disk and return the stop operation. |
 | `stop ID --status STOP_ID` | Read one stop operation. |
 | `resume ID [--no-wait] [--fail-fast] [--type T] [--ttl N \| --no-auto-stop] [--env K=V ...]` | Boot the retained disk on its node. |
+| `fork ID [--type T] [-e K=V ...] [--ttl N \| --no-auto-stop] [--fail-fast] [--label K=V ...] [--wait]` | Fork a sandbox into a new sandbox (a ready source is snapshotted first, a stopped one uses its last snapshot); `--wait` polls until ready. |
+| `recover ID` | Power-cycle an unresponsive running sandbox without modifying its disk. |
 | `exec ID [COMMAND...]` | Run a command; see transports below. |
 | `exec ID --detach COMMAND` | Start a detached command and print its process id. |
 | `exec ID --status PID` | Read a detached process state and log tails. |
@@ -116,6 +119,11 @@ invalid usage. Cancellation is transport-specific: a foreground `exec`
 | `push ID DIR [--to PATH]` | Upload a directory as a tar archive to the sandbox. |
 | `snapshot ID NAME` | Save a snapshot of the sandbox and poll until it is ready. |
 | `snapshot rm NAME` | Delete a saved snapshot name. |
+| `snapshot share NAME` | Create a share code (`bsh_...`) for a saved snapshot; the full code is printed once. |
+| `snapshot shares NAME` | List share codes for a saved snapshot with their prefix, status, uses and timestamps. |
+| `snapshot unshare NAME SHARE_ID` | Revoke one share code of a saved snapshot. |
+| `snapshot latest SANDBOX_ID` | Show the newest captured snapshot of a sandbox, or say it has none. |
+| `snapshots [SANDBOX_ID] [--all] [--limit N]` | List captured snapshot generations for the account or one sandbox; `--all` follows pagination to the last page. |
 | `ssh [-t] ID [COMMAND...]` | Open an SSH session or run one remote command. |
 | `scp [-r] SRC... DST` | Copy files to or from a sandbox. |
 | `delete ID --yes --wait` | Delete a sandbox and wait for the durable operation. |
@@ -183,7 +191,7 @@ the node and guest.
 
 ## Known limits
 
-- No fork/recover, dashboard panel (Phase 1b), command history, process list,
+- No dashboard panel (Phase 1b), command history, process list,
   file search or find/replace. Detached commands are exposed through status,
   attach and stop only.
 - File reads and writes are limited to 5 MiB inline; use the signed download

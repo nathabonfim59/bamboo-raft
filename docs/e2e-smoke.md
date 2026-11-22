@@ -165,3 +165,125 @@ real inventory or host details.
 The fake-node test above covers the CLI/control-plane contract. The KVM smoke
 is the remaining acceptance step for real guest execution, real snapshots and
 real capacity.
+
+## Two-node end-to-end with the object store
+
+`deploy/dev/e2e-p2.sh` is the real-node counterpart for snapshots in the
+object store, node loss and moving sandboxes between nodes. Run it on one
+large throwaway KVM VM (`/dev/kvm`, `/dev/vhost-vsock`, `sudo -n`, QEMU,
+Postgres, `openssh-client`, the pinned `garage` binary in `PATH`) from the
+repository root, on a branch whose node has object-store support, the
+`bbraft_node` role's S3 variables and the `-node.vsock-cid-range` flag:
+
+```sh
+BBRAFT_TEST_DATABASE_URL=postgres://... bash deploy/dev/e2e-p2.sh
+```
+
+It builds everything and the pinned image, starts Garage (bucket and key
+created by the script, the secret only in `0600` files), a fresh Postgres
+database and `bbraft-server -roles all` with the object store and short
+lifecycle intervals (snapshot interval 10 s, node-lost grace 60 s, reaper
+5 s), then two nodes:
+
+- **node a** is the production path of `e2e-p1.sh`: the root supervisor under
+  the unit the `bbraft_node` role renders, jailed QEMU, TAP networking and SSH
+  ingress. It offers one running small sandbox and two small disks, so
+  capacity decides every placement in the script.
+- **node b** is a plain process of the calling user in
+  `-node.network-mode=user` (QEMU unjailed, no guest networking). It offers
+  ten small sandboxes' worth (20 vCPU, 40960 MiB, 510 GiB), so `count 10`
+  puts nine of them on b. The script kills it with `SIGKILL` and restarts it.
+
+Node b is user-mode because two real tap nodes on one host collide on the
+nft tables, the bridge, the guest subnet and the SSH ingress (per-node network
+naming is a later item). Guest networking is therefore checked on node a (ssh
+through the SSH ingress, and an address inside the node a guest prefix) whenever a sandbox
+lands there; on node b only the data is checked. Both nodes share the host's
+vsock CID space, so node b gets its own range through
+`E2E_NODEB_EXTRA_FLAGS` (default `-node.vsock-cid-range 1000000-1999999`); the
+build stage fails with a clear message when the node binary does not know the
+flag.
+
+Node b is sized from the host at run time: `nproc`, `MemTotal` and the free
+disk, minus node a's offer (2 vCPU, 4096 MiB) and 1 GiB of memory for the
+host. The node refuses an explicit capacity above the detected host times its
+overcommit factor, so b gets its own `-node.cpu-overcommit`,
+`-node.memory-overcommit` and `-node.disk-overcommit`, computed so the offer
+fits with a 25% margin (disk: 100%, since free space shrinks as guests write)
+and printed by the preflight. Node a keeps its 110 GiB offer and gets only a
+disk overcommit, through the role variable `bbraft_node_disk_overcommit`,
+computed from the free space under `/var/lib`. On an 8 vCPU / 16 GiB VM with
+about 97 GiB free on one filesystem this gives b 4.17 / 4.71 / 10.52 and a
+2.27 for disk. Offers are promises; what must be real is free space, so the
+preflight refuses a host with less than 30 GiB actually free under either data
+directory (a shared filesystem counts once), and also when even the ceilings
+(cpu 8, memory 8, disk 20) cannot fit ten small sandboxes across both nodes,
+for example on a 2 vCPU host. Overcommit is fine for this test: the guests
+idle, a small idle guest touches a few hundred MiB of the 4 GiB it reserves,
+and the disks are thin.
+
+The guest prefix of node a is `10.88.0.0/16` (gateway `10.88.0.1`), set once
+in `e2e-p1-node.sh` and exported as `E2E_NODE_GUEST_PREFIX` /
+`E2E_NODE_GUEST_GATEWAY`; the tap check derives its expected address pattern
+from it. The preflight refuses a host that holds an address inside the prefix
+(the disposable VM may itself be a sandbox on a private prefix: a guest would
+be handed the host's own address and SSH would reach the host), naming the
+address.
+
+Every `/api/v1` response goes through a recording proxy and is validated
+against `api/bbraft-v1.yaml` by `internal/compat`, as in `e2e-p1.sh`. One
+`PASS`/`FAIL` line per stage; logs are dumped redacted on failure; the
+teardown deletes every sandbox, stops both nodes and Garage, drops the
+database, proves nothing leaked and restores `net.ipv4.ip_forward`; `E2E PASS`
+is printed only after that.
+
+| Stage | What it proves |
+|---|---|
+| `write-snapshot` | a sandbox created while only node b exists (its disk is written on b) takes a file; a snapshot generation captured after the write appears within the interval |
+| `node-a` | node a starts through the role with the object store and registers |
+| `node-loss` | `kill -9` of node b: within the grace (plus inventory polls) the sandbox is ready on node a with the file, guest networking works there, at most one interval of writes is lost (a write right before the kill is reported, not required), the stale VM copy on b has an eviction row |
+| `node-returns` | b restarts: its stale copy is deleted, no QEMU of it runs, the API shows one sandbox |
+| `stop-resume-lost-disk-node` | a sandbox stopped on b whose node is then lost resumes on node a with its file (guest networking checked) |
+| `stop-resume-a-to-b` | a sandbox stopped on a, with a made unable to run it (a filler sandbox takes its one running slot while b is stopped cleanly), resumes on node b with both files |
+| `fork` | fork of a ready sandbox is ready, has the file, the source is unchanged and does not see the fork's writes |
+| `saved-count` | the sandbox saved as `e2e-base`; creating 10 from it gives 10 ready sandboxes on both nodes, each with the file |
+
+The image stage builds the pinned image when `images/out/<version>` is
+absent. When it is present it is reused only if `images/verify.sh` passes
+(manifest, sha256 and size of every artifact) and the manifest records the
+pinned id, Ubuntu snapshot (no mirror override), Go and Node versions; any
+other image there is refused with the reason (a published version is never
+overwritten, so remove it by hand). `E2E_REUSE_IMAGE=1` forces reuse and never
+builds.
+
+Expected wall time: about 25 minutes with the image already present, about
+35-45 minutes with the image build. The two node
+losses dominate (each at least the 60 s grace plus up to two 30 s inventory
+polls, then a restore), then ten sandboxes boot at the end.
+
+Debugging a failed run: `E2E2_DIAG_ON_FAIL=1` makes a failing stage collect,
+before the teardown, what tells where guest networking or the SSH path broke,
+for the sandboxes the stage touched: `bbraft info` and the raw API view (with
+`sshEndpoint`), node a's nft ruleset and the DNAT lines for the endpoint
+port, its journal, the VM directory and serial console, probes run inside the
+guest through exec (not ssh: kernel command line, addresses and routes,
+netplan, `networkctl`, the network units, cloud-init status, authorized keys),
+one `ssh -vvv` attempt with the CLI's own endpoint and key, and a fresh control
+sandbox on node a when its one running slot is free. The text is printed and
+saved under `$E2E_OUT/diag-<run>/`. Nothing secret is collected: every text
+goes through the same redaction as the rest of the script, and cloud-init data
+is only listed, never read. Without the variable nothing changes.
+
+Self-test, no VM, server, node or network (stage order, teardown after a
+failing stage, redaction, distinct names for the two node instances, node b's
+capacity from the host, the pinned-image check, the diagnostics hook with its no-secret check, the guest prefix):
+
+```sh
+E2E_SELFTEST=1 bash deploy/dev/e2e-p2.sh
+```
+
+The script sources `e2e-p1.sh` as a library (`E2E_HELPERS_ONLY=1`) and the
+node driver `e2e-p1-node.sh`, which gained one optional input,
+`E2E_NODE_EXTRA_VARS_FILE` (a JSON file of extra role variables, here the
+object-store files and node a's capacity); unset, the driver behaves as
+before.

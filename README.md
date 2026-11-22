@@ -5,7 +5,8 @@ as a jailed QEMU/KVM virtual machine and gives agents an HTTP API and a CLI to
 create sandboxes, run commands, move files, SSH in, stop, resume and snapshot
 them.
 
-**Status: 0.1.0, single-node.** One control plane and one KVM node. See
+**Status: 0.2.0, several nodes.** One control plane, any number of KVM
+nodes, and an S3-compatible object store for snapshots. See
 [What works](#what-works) and [Not yet](#not-yet).
 
 ## Components
@@ -39,6 +40,8 @@ built from the Markdown below, read in place:
 
 - [docs/server.md](docs/server.md): running `bbraft-server`
 - [docs/node.md](docs/node.md): running `bbraft-node` on a KVM host
+- [docs/deploy.md](docs/deploy.md): several nodes, the node link (SSH
+  tunnel, Tailscale or a private network), tokens, backups
 - [docs/guest-image.md](docs/guest-image.md): the guest image
 - [docs/cli.md](docs/cli.md): the `bbraft` CLI
 - [docs/api.md](docs/api.md): API behavior; the schemas are
@@ -51,18 +54,33 @@ built from the Markdown below, read in place:
 
 ## What works
 
-- **Sandboxes on one KVM node**: create from the base image or a saved
-  snapshot, list (filters, cursor), info, rename, extend, delete, auto-stop.
-- **Stop and resume** on the same node, with the disk kept and grown on
-  resume. Stopped sandboxes free their CPU and memory.
+- **Sandboxes on several KVM nodes**: create from the base image, a saved
+  snapshot or a share code, list (filters, cursor), info, rename, extend,
+  delete, auto-stop. `new --from <snapshot> --count <n>` creates a batch
+  spread over the nodes. Placement ranks nodes by free capacity and disk.
+- **Stop and resume**: the disk is kept on its node and grown on resume.
+  With an object store, a resume restores the last snapshot on another node
+  when the disk's node is full or gone. Stopped sandboxes free their CPU and
+  memory.
+- **Object-store snapshots**: running sandboxes snapshot periodically into an
+  S3-compatible store (Garage has an Ansible role), deduplicated in 4 MiB
+  chunks; a stop writes a final snapshot. Snapshot lists in the API and CLI.
+- **Fork and recover**: fork a running or stopped sandbox into a new one;
+  power-cycle a sandbox whose guest agent stopped answering, keeping its disk.
+- **Node loss**: the sandboxes of a node unreachable past a grace period move
+  to other nodes from their last snapshot.
+- **Retention and cleanup**: stored data of archived sandboxes expires after a
+  configurable period, unreachable chunks are garbage collected, and a node
+  low on disk evicts stopped disks that are safe in the store.
 - **Commands**: synchronous, streamed and detached (status, attach with
   heartbeats and reconnect, kill).
 - **Files**: read/write (5 MiB inline), list, info, mkdir, move, chmod,
   delete, signed upload and download URLs, `bbraft push`.
 - **SSH**: `bbraft ssh` and `bbraft scp`, with a managed key and a pinned host
   key.
-- **Saved snapshots**: save, list, get, delete, create from a snapshot; local
-  to the node that holds them.
+- **Saved snapshots**: save, list, get, delete, create from a snapshot, and
+  share codes another account can deploy (`bbraft snapshot share`). With an
+  object store they restore on any node.
 - **`bbraft run --push . -- <cmd>`**: a fresh VM per run.
 - **Isolation**: every VM runs jailed (own uid, no capabilities,
   no_new_privs, seccomp, private mount/PID/IPC namespaces, read-only chroot,
@@ -72,8 +90,8 @@ built from the Markdown below, read in place:
 ## Not yet
 
 - A web panel.
-- Several nodes, object-store snapshots, fork and recover, resume on another
-  node.
+- Lazy restore (a restore on another node copies the whole disk before the
+  sandbox boots), TLS on the node link, a node-side self-fence.
 - Edge proxy and hosted ports, port forwarding, desktop, webhooks and events,
   quotas.
 - Environments and secrets, command history.

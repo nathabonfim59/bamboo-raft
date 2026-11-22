@@ -71,6 +71,9 @@ func (m *Manager) reconcile(ctx context.Context) error {
 			return err
 		}
 	}
+	// Every record's fate is decided: settle the live-cut markers no
+	// adoption recovered (phase2_launch.go).
+	m.recoverCutsWithoutQEMU()
 	return m.jailRefuseOrphans()
 }
 
@@ -78,6 +81,11 @@ func (m *Manager) reconcile(ctx context.Context) error {
 func (m *Manager) recoverVM(ctx context.Context, meta storage.VMMeta, bootID string) error {
 	if m.jail != nil {
 		return m.recoverJailed(ctx, meta, bootID)
+	}
+	if m.recoverMaintenance(ctx, meta, bootID) {
+		// A maintenance QEMU is never booted or adopted (it runs before
+		// any verifyQMPAt path, which would continue it).
+		return nil
 	}
 	if meta.QEMU == nil {
 		if meta.Stopped() {
@@ -117,7 +125,9 @@ func (m *Manager) recoverVM(ctx context.Context, meta storage.VMMeta, bootID str
 	if meta.QEMU.BootID != bootID {
 		// The recorded process belongs to a previous host boot and is gone;
 		// a start that never reached READY returns to STOPPED, anything
-		// else is a FAILED VM with its disk kept.
+		// else is a FAILED VM with its disk kept. The dead QEMU's socket
+		// would refuse the next start.
+		m.removeStaleQMPSocket(meta.SandboxID)
 		if meta.StoppedAtUnixMs > 0 {
 			m.recoverStoppedAfterInterrupt(meta, "node restarted during a start")
 		} else {
@@ -132,6 +142,8 @@ func (m *Manager) recoverVM(ctx context.Context, meta storage.VMMeta, bootID str
 		return nil
 	}
 	if pinned == nil {
+		// No owned process remains: the recorded QEMU is proven gone.
+		m.removeStaleQMPSocket(meta.SandboxID)
 		if meta.StoppedAtUnixMs > 0 {
 			m.recoverStoppedAfterInterrupt(meta, "the VM process exited while the node was down")
 		} else {
@@ -326,8 +338,7 @@ func (m *Manager) adoptRef(ctx context.Context, meta storage.VMMeta, pinned *pin
 		return
 	}
 	v.state = nodev1.VMState_VM_STATE_READY
-	v.meta.StartedAtUnixMs = startedAt
-	v.meta.StoppedAtUnixMs = 0
+	v.readyCommitted(startedAt)
 	close(v.bootDone)
 	v.mu.Unlock()
 	m.log.Info("node: recovered running vm", "sandbox", meta.SandboxID, "pid", pinned.pid)

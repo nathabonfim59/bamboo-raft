@@ -1042,8 +1042,8 @@ func TestCommandMigrationEmptyRoundTrip(t *testing.T) {
 	if _, err := provider.Up(t.Context()); err != nil {
 		t.Fatalf("re-apply later migrations: %v", err)
 	}
-	if got := phase1SchemaVersion(t, s); got != 6 {
-		t.Fatalf("schema version after later migrations = %d, want 6", got)
+	if got, want := phase1SchemaVersion(t, s), phase2LatestMigration(t); got != want {
+		t.Fatalf("schema version after later migrations = %d, want %d", got, want)
 	}
 	own, sandboxID := commandReady(t, s)
 	rec := commandAllocate(t, s, own, sandboxID, "fresh schema")

@@ -222,3 +222,11 @@ func TestRestoreFailFastBudgetCoversResolution(t *testing.T) {
 		t.Fatalf("created %d sandboxes after budget expiry", len(store.created))
 	}
 }
+
+func (s *restoreStoreFake) CreateSandboxes(context.Context, []db.CreateSandboxParams) ([]db.CreateSandboxResult, error) {
+	return nil, errors.New("restoreStoreFake: batch create not used")
+}
+
+func (s *restoreStoreFake) ReplayCreateSandboxBatch(context.Context, uuid.UUID, string, []byte) ([]db.CreateSandboxResult, bool, error) {
+	return nil, false, nil
+}

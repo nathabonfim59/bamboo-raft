@@ -18,6 +18,10 @@
     bbraft_node_jail_uid_range: "{{ kt_jail_uid_range }}"
     bbraft_node_jail_io_device: "{{ kt_io_device }}"
     bbraft_node_jail_io_write_bps: "{{ kt_io_write_bps }}"
+    # Set on every pass (set_fact persists across the loop): only the
+    # kt_s3_attempts units get an object store.
+    bbraft_node_s3: "{{ kt_s3 if kt_name in kt_s3_attempts else {} }}"
+    bbraft_node_s3_secret_access_key: "{{ kt_s3_secret_access_key if kt_name in kt_s3_attempts else '' }}"
 
 # public: the role defaults and validate's normalized facts stay visible to
 # the template task below.

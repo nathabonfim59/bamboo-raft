@@ -24,6 +24,7 @@ func (w *Worker) deleteVM(ctx context.Context, job db.Job, lease *Lease) error {
 		return permanent("invalid delete payload")
 	}
 	owner, sandboxID := job.OwnerID, *job.SandboxID
+	w.precondWarned.forget(sandboxID) // a deleted sandbox never snapshots again
 
 	sbx, err := w.store.SandboxAny(ctx, owner, sandboxID)
 	if errors.Is(err, db.ErrNotFound) {

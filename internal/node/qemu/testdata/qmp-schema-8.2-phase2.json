@@ -1,0 +1,1128 @@
+[
+ {
+  "name": "str",
+  "meta-type": "builtin",
+  "json-type": "string"
+ },
+ {
+  "name": "int",
+  "meta-type": "builtin",
+  "json-type": "int"
+ },
+ {
+  "name": "bool",
+  "meta-type": "builtin",
+  "json-type": "boolean"
+ },
+ {
+  "name": "any",
+  "meta-type": "builtin",
+  "json-type": "value"
+ },
+ {
+  "name": "null",
+  "meta-type": "builtin",
+  "json-type": "null"
+ },
+ {
+  "meta-type": "object",
+  "members": [],
+  "name": "0"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "name",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "count",
+    "type": "int"
+   },
+   {
+    "name": "granularity",
+    "type": "int"
+   },
+   {
+    "name": "recording",
+    "type": "bool"
+   },
+   {
+    "name": "busy",
+    "type": "bool"
+   },
+   {
+    "name": "persistent",
+    "type": "bool"
+   },
+   {
+    "name": "inconsistent",
+    "type": "bool",
+    "default": null
+   }
+  ],
+  "name": "1"
+ },
+ {
+  "meta-type": "array",
+  "element-type": "1",
+  "name": "2"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "file",
+    "type": "str"
+   },
+   {
+    "name": "node-name",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "ro",
+    "type": "bool"
+   },
+   {
+    "name": "drv",
+    "type": "str"
+   },
+   {
+    "name": "dirty-bitmaps",
+    "type": "2",
+    "default": null
+   }
+  ],
+  "name": "3"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "flat",
+    "type": "bool",
+    "default": null
+   }
+  ],
+  "name": "4"
+ },
+ {
+  "meta-type": "array",
+  "element-type": "3",
+  "name": "5"
+ },
+ {
+  "name": "query-named-block-nodes",
+  "meta-type": "command",
+  "arg-type": "4",
+  "ret-type": "5"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "node",
+    "type": "str"
+   },
+   {
+    "name": "name",
+    "type": "str"
+   },
+   {
+    "name": "granularity",
+    "type": "int",
+    "default": null
+   },
+   {
+    "name": "persistent",
+    "type": "bool",
+    "default": null
+   },
+   {
+    "name": "disabled",
+    "type": "bool",
+    "default": null
+   }
+  ],
+  "name": "6"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "node",
+    "type": "str"
+   },
+   {
+    "name": "name",
+    "type": "str"
+   }
+  ],
+  "name": "7"
+ },
+ {
+  "meta-type": "alternate",
+  "members": [
+   {
+    "type": "str"
+   },
+   {
+    "type": "7"
+   }
+  ],
+  "name": "8"
+ },
+ {
+  "meta-type": "array",
+  "element-type": "8",
+  "name": "9"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "node",
+    "type": "str"
+   },
+   {
+    "name": "target",
+    "type": "str"
+   },
+   {
+    "name": "bitmaps",
+    "type": "9"
+   }
+  ],
+  "name": "10"
+ },
+ {
+  "name": "block-dirty-bitmap-add",
+  "meta-type": "command",
+  "arg-type": "6",
+  "ret-type": "0"
+ },
+ {
+  "name": "block-dirty-bitmap-remove",
+  "meta-type": "command",
+  "arg-type": "7",
+  "ret-type": "0"
+ },
+ {
+  "name": "block-dirty-bitmap-clear",
+  "meta-type": "command",
+  "arg-type": "7",
+  "ret-type": "0"
+ },
+ {
+  "name": "block-dirty-bitmap-enable",
+  "meta-type": "command",
+  "arg-type": "7",
+  "ret-type": "0"
+ },
+ {
+  "name": "block-dirty-bitmap-disable",
+  "meta-type": "command",
+  "arg-type": "7",
+  "ret-type": "0"
+ },
+ {
+  "name": "block-dirty-bitmap-merge",
+  "meta-type": "command",
+  "arg-type": "10",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "top",
+   "full",
+   "none",
+   "incremental",
+   "bitmap"
+  ],
+  "members": [
+   {
+    "name": "top"
+   },
+   {
+    "name": "full"
+   },
+   {
+    "name": "none"
+   },
+   {
+    "name": "incremental"
+   },
+   {
+    "name": "bitmap"
+   }
+  ],
+  "name": "11"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "job-id",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "device",
+    "type": "str"
+   },
+   {
+    "name": "sync",
+    "type": "11"
+   },
+   {
+    "name": "speed",
+    "type": "int",
+    "default": null
+   },
+   {
+    "name": "bitmap",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "filter-node-name",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "auto-finalize",
+    "type": "bool",
+    "default": null
+   },
+   {
+    "name": "auto-dismiss",
+    "type": "bool",
+    "default": null
+   },
+   {
+    "name": "target",
+    "type": "str"
+   }
+  ],
+  "name": "12"
+ },
+ {
+  "name": "blockdev-backup",
+  "meta-type": "command",
+  "arg-type": "12",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "abort",
+   "block-dirty-bitmap-add",
+   "block-dirty-bitmap-remove",
+   "block-dirty-bitmap-clear",
+   "block-dirty-bitmap-enable",
+   "block-dirty-bitmap-disable",
+   "block-dirty-bitmap-merge",
+   "blockdev-backup",
+   "blockdev-snapshot",
+   "blockdev-snapshot-internal-sync",
+   "blockdev-snapshot-sync",
+   "drive-backup"
+  ],
+  "members": [
+   {
+    "name": "abort"
+   },
+   {
+    "name": "block-dirty-bitmap-add"
+   },
+   {
+    "name": "block-dirty-bitmap-remove"
+   },
+   {
+    "name": "block-dirty-bitmap-clear"
+   },
+   {
+    "name": "block-dirty-bitmap-enable"
+   },
+   {
+    "name": "block-dirty-bitmap-disable"
+   },
+   {
+    "name": "block-dirty-bitmap-merge"
+   },
+   {
+    "name": "blockdev-backup"
+   },
+   {
+    "name": "blockdev-snapshot"
+   },
+   {
+    "name": "blockdev-snapshot-internal-sync"
+   },
+   {
+    "name": "blockdev-snapshot-sync"
+   },
+   {
+    "name": "drive-backup"
+   }
+  ],
+  "name": "13"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "data",
+    "type": "7"
+   }
+  ],
+  "name": "14"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "data",
+    "type": "6"
+   }
+  ],
+  "name": "15"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "data",
+    "type": "10"
+   }
+  ],
+  "name": "16"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "data",
+    "type": "12"
+   }
+  ],
+  "name": "17"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "type",
+    "type": "13"
+   }
+  ],
+  "tag": "type",
+  "variants": [
+   {
+    "case": "abort",
+    "type": "14"
+   },
+   {
+    "case": "block-dirty-bitmap-add",
+    "type": "15"
+   },
+   {
+    "case": "block-dirty-bitmap-remove",
+    "type": "14"
+   },
+   {
+    "case": "block-dirty-bitmap-clear",
+    "type": "14"
+   },
+   {
+    "case": "block-dirty-bitmap-enable",
+    "type": "14"
+   },
+   {
+    "case": "block-dirty-bitmap-disable",
+    "type": "14"
+   },
+   {
+    "case": "block-dirty-bitmap-merge",
+    "type": "16"
+   },
+   {
+    "case": "blockdev-backup",
+    "type": "17"
+   },
+   {
+    "case": "blockdev-snapshot",
+    "type": "14"
+   },
+   {
+    "case": "blockdev-snapshot-internal-sync",
+    "type": "14"
+   },
+   {
+    "case": "blockdev-snapshot-sync",
+    "type": "14"
+   },
+   {
+    "case": "drive-backup",
+    "type": "14"
+   }
+  ],
+  "name": "18"
+ },
+ {
+  "meta-type": "array",
+  "element-type": "18",
+  "name": "19"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "individual",
+   "grouped"
+  ],
+  "members": [
+   {
+    "name": "individual"
+   },
+   {
+    "name": "grouped"
+   }
+  ],
+  "name": "20"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "completion-mode",
+    "type": "20",
+    "default": null
+   }
+  ],
+  "name": "21"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "actions",
+    "type": "19"
+   },
+   {
+    "name": "properties",
+    "type": "21",
+    "default": null
+   }
+  ],
+  "name": "22"
+ },
+ {
+  "name": "transaction",
+  "meta-type": "command",
+  "arg-type": "22",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "fdset-id",
+    "type": "int",
+    "default": null
+   },
+   {
+    "name": "opaque",
+    "type": "str",
+    "default": null
+   }
+  ],
+  "name": "23"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "fdset-id",
+    "type": "int"
+   },
+   {
+    "name": "fd",
+    "type": "int"
+   }
+  ],
+  "name": "24"
+ },
+ {
+  "name": "add-fd",
+  "meta-type": "command",
+  "arg-type": "23",
+  "ret-type": "24"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "fdset-id",
+    "type": "int"
+   },
+   {
+    "name": "fd",
+    "type": "int",
+    "default": null
+   }
+  ],
+  "name": "25"
+ },
+ {
+  "name": "remove-fd",
+  "meta-type": "command",
+  "arg-type": "25",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "fdname",
+    "type": "str"
+   }
+  ],
+  "name": "26"
+ },
+ {
+  "name": "getfd",
+  "meta-type": "command",
+  "arg-type": "26",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "file",
+   "qcow2",
+   "raw",
+   "copy-before-write",
+   "snapshot-access"
+  ],
+  "members": [
+   {
+    "name": "file"
+   },
+   {
+    "name": "qcow2"
+   },
+   {
+    "name": "raw"
+   },
+   {
+    "name": "copy-before-write"
+   },
+   {
+    "name": "snapshot-access"
+   }
+  ],
+  "name": "27"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "filename",
+    "type": "str"
+   }
+  ],
+  "name": "28"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "file",
+    "type": "str"
+   },
+   {
+    "name": "backing",
+    "type": "str",
+    "default": null
+   }
+  ],
+  "name": "29"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "driver",
+    "type": "27"
+   },
+   {
+    "name": "node-name",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "read-only",
+    "type": "bool",
+    "default": null
+   }
+  ],
+  "tag": "driver",
+  "variants": [
+   {
+    "case": "file",
+    "type": "28"
+   },
+   {
+    "case": "qcow2",
+    "type": "29"
+   }
+  ],
+  "name": "30"
+ },
+ {
+  "name": "blockdev-add",
+  "meta-type": "command",
+  "arg-type": "30",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "node-name",
+    "type": "str"
+   }
+  ],
+  "name": "31"
+ },
+ {
+  "name": "blockdev-del",
+  "meta-type": "command",
+  "arg-type": "31",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "inet",
+   "unix",
+   "vsock",
+   "fd"
+  ],
+  "members": [
+   {
+    "name": "inet"
+   },
+   {
+    "name": "unix"
+   },
+   {
+    "name": "vsock"
+   },
+   {
+    "name": "fd"
+   }
+  ],
+  "name": "32"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "path",
+    "type": "str"
+   }
+  ],
+  "name": "33"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "data",
+    "type": "33"
+   }
+  ],
+  "name": "34"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "type",
+    "type": "32"
+   }
+  ],
+  "tag": "type",
+  "variants": [
+   {
+    "case": "unix",
+    "type": "34"
+   }
+  ],
+  "name": "35"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "addr",
+    "type": "35"
+   },
+   {
+    "name": "tls-creds",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "tls-authz",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "max-connections",
+    "type": "int",
+    "default": null
+   }
+  ],
+  "name": "36"
+ },
+ {
+  "name": "nbd-server-start",
+  "meta-type": "command",
+  "arg-type": "36",
+  "ret-type": "0"
+ },
+ {
+  "name": "nbd-server-stop",
+  "meta-type": "command",
+  "arg-type": "0",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "nbd",
+   "vhost-user-blk",
+   "fuse",
+   "vduse-blk"
+  ],
+  "members": [
+   {
+    "name": "nbd"
+   },
+   {
+    "name": "vhost-user-blk"
+   },
+   {
+    "name": "fuse"
+   },
+   {
+    "name": "vduse-blk"
+   }
+  ],
+  "name": "37"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "name",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "description",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "bitmaps",
+    "type": "9",
+    "default": null
+   },
+   {
+    "name": "allocation-depth",
+    "type": "bool",
+    "default": null
+   }
+  ],
+  "name": "38"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "type",
+    "type": "37"
+   },
+   {
+    "name": "id",
+    "type": "str"
+   },
+   {
+    "name": "fixed-iothread",
+    "type": "bool",
+    "default": null
+   },
+   {
+    "name": "iothread",
+    "type": "str",
+    "default": null
+   },
+   {
+    "name": "node-name",
+    "type": "str"
+   },
+   {
+    "name": "writable",
+    "type": "bool",
+    "default": null
+   },
+   {
+    "name": "writethrough",
+    "type": "bool",
+    "default": null
+   }
+  ],
+  "tag": "type",
+  "variants": [
+   {
+    "case": "nbd",
+    "type": "38"
+   }
+  ],
+  "name": "39"
+ },
+ {
+  "name": "block-export-add",
+  "meta-type": "command",
+  "arg-type": "39",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "safe",
+   "hard"
+  ],
+  "members": [
+   {
+    "name": "safe"
+   },
+   {
+    "name": "hard"
+   }
+  ],
+  "name": "40"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "id",
+    "type": "str"
+   },
+   {
+    "name": "mode",
+    "type": "40",
+    "default": null
+   }
+  ],
+  "name": "41"
+ },
+ {
+  "name": "block-export-del",
+  "meta-type": "command",
+  "arg-type": "41",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "device",
+    "type": "str"
+   },
+   {
+    "name": "force",
+    "type": "bool",
+    "default": null
+   }
+  ],
+  "name": "42"
+ },
+ {
+  "name": "block-job-cancel",
+  "meta-type": "command",
+  "arg-type": "42",
+  "ret-type": "0"
+ },
+ {
+  "name": "query-jobs",
+  "meta-type": "command",
+  "arg-type": "0",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "reset",
+   "shutdown"
+  ],
+  "members": [
+   {
+    "name": "reset"
+   },
+   {
+    "name": "shutdown"
+   }
+  ],
+  "name": "43"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "poweroff",
+   "pause"
+  ],
+  "members": [
+   {
+    "name": "poweroff"
+   },
+   {
+    "name": "pause"
+   }
+  ],
+  "name": "44"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "pause",
+   "shutdown",
+   "exit-failure",
+   "none"
+  ],
+  "members": [
+   {
+    "name": "pause"
+   },
+   {
+    "name": "shutdown"
+   },
+   {
+    "name": "exit-failure"
+   },
+   {
+    "name": "none"
+   }
+  ],
+  "name": "45"
+ },
+ {
+  "meta-type": "enum",
+  "values": [
+   "reset",
+   "shutdown",
+   "poweroff",
+   "pause",
+   "debug",
+   "none",
+   "inject-nmi"
+  ],
+  "members": [
+   {
+    "name": "reset"
+   },
+   {
+    "name": "shutdown"
+   },
+   {
+    "name": "poweroff"
+   },
+   {
+    "name": "pause"
+   },
+   {
+    "name": "debug"
+   },
+   {
+    "name": "none"
+   },
+   {
+    "name": "inject-nmi"
+   }
+  ],
+  "name": "46"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "reboot",
+    "type": "43",
+    "default": null
+   },
+   {
+    "name": "shutdown",
+    "type": "44",
+    "default": null
+   },
+   {
+    "name": "panic",
+    "type": "45",
+    "default": null
+   },
+   {
+    "name": "watchdog",
+    "type": "46",
+    "default": null
+   }
+  ],
+  "name": "47"
+ },
+ {
+  "name": "set-action",
+  "meta-type": "command",
+  "arg-type": "47",
+  "ret-type": "0"
+ },
+ {
+  "name": "system_reset",
+  "meta-type": "command",
+  "arg-type": "0",
+  "ret-type": "0"
+ },
+ {
+  "name": "cont",
+  "meta-type": "command",
+  "arg-type": "0",
+  "ret-type": "0"
+ },
+ {
+  "name": "query-status",
+  "meta-type": "command",
+  "arg-type": "0",
+  "ret-type": "0"
+ },
+ {
+  "meta-type": "object",
+  "members": [
+   {
+    "name": "id",
+    "type": "str"
+   }
+  ],
+  "name": "48"
+ },
+ {
+  "name": "BLOCK_EXPORT_DELETED",
+  "meta-type": "event",
+  "arg-type": "48"
+ }
+]

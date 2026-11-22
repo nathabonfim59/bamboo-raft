@@ -147,6 +147,13 @@ func (h *lifecycleHandlers) resumeSandbox(w http.ResponseWriter, r *http.Request
 		apierr.WriteError(w, r, sandboxNotReady())
 		return
 	}
+	// A sandbox with snapshots off has its disk erased by its stop,
+	// so a stopping or stopped one has nothing to resume; the flag never
+	// changes, so this check cannot race the stop.
+	if !row.SnapshotsEnabled && (row.State == db.StateArchiving || row.State == db.StateArchived) {
+		apierr.WriteError(w, r, snapshotsDisabledResume())
+		return
+	}
 	supersede := ""
 	if row.State == db.StateArchiving {
 		if row.StopOperationID == nil || *row.StopOperationID == "" {

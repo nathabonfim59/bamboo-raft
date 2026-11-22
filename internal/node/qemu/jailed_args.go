@@ -47,6 +47,7 @@ func fdArg(fd int) string { return "/proc/self/fd/" + strconv.Itoa(fd) }
 // a stored backing filename), the control paths are the chroot ones and the
 // virtio-net option ROM is disabled: direct-kernel boot needs none and no
 // distribution firmware has to be staged for it. TAP networking is required.
+// Like Args, it starts QEMU paused (-S).
 func (c Config) JailedArgs() ([]string, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -73,6 +74,9 @@ func (c Config) JailedArgs() ([]string, error) {
 		"-nodefaults",
 		"-no-user-config",
 		"-no-reboot",
+		// Paused launch (D2): the node prepares the dirty bitmap over QMP
+		// and only then sends cont, so no guest write predates it.
+		"-S",
 		"-m", strconv.FormatUint(c.MemoryMiB, 10) + "M",
 		"-smp", strconv.FormatUint(uint64(c.VCPUs), 10),
 		"-kernel", fdArg(KernelFD),

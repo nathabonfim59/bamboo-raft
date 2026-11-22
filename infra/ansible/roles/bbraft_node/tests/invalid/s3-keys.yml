@@ -1,0 +1,9 @@
+# A typo in a remote-mode key must fail instead of silently leaving a value
+# unset.
+bbraft_node_s3:
+  endpoint: http://203.0.113.20:3900
+  region: garage
+  bucket: bbraft
+  path_style: true
+  access_key: GKinvalid
+bbraft_node_s3_secret_access_key: placeholder-remote-secret-not-real

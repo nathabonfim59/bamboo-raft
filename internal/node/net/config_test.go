@@ -96,6 +96,12 @@ func TestConfigValidate(t *testing.T) {
 		{name: "ingress inside guest prefix", change: func(c *Config) {
 			c.IngressAddr = netip.MustParseAddr("10.42.0.9")
 		}, wantErr: "inside the guest prefix"},
+		{name: "ingress is the first guest address (the host-sshd e2e case)", change: func(c *Config) {
+			c.IngressAddr = netip.MustParseAddr("10.42.0.2")
+		}, wantErr: "ingress address 10.42.0.2 is inside the guest prefix"},
+		{name: "ingress is the gateway", change: func(c *Config) {
+			c.IngressAddr = c.Gateway
+		}, wantErr: "inside the guest prefix"},
 		{name: "ingress inside management is the tailnet case", change: func(c *Config) {
 			c.IngressAddr = netip.MustParseAddr("192.0.2.9")
 		}},

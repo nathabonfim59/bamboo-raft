@@ -23,6 +23,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore/s3"
 )
 
 // Config is the validated server configuration.
@@ -34,7 +36,12 @@ type Config struct {
 	Node      Node
 	Commands  Commands
 	Lifecycle Lifecycle
+	GC        GC
 	Secrets   Secrets
+	// ObjectStore is the S3-compatible object store (the shared -s3.* flags
+	// and BBRAFT_S3_* variables), or nil when no bucket is configured: Phase
+	// 1 mode, with no snapshot uploads and no fork or cross-node resume.
+	ObjectStore *s3.Config
 }
 
 // Server holds the public HTTP API listener.
@@ -131,9 +138,52 @@ type Lifecycle struct {
 	JobPollSeconds int
 	// StoppedRetentionSeconds is how long an archived sandbox keeps its
 	// retained disk before the reaper deletes the sandbox through the normal
-	// deletion path (-lifecycle.stopped-retention-seconds). The default is
-	// seven days; zero disables retention deletion.
+	// deletion path (-lifecycle.stopped-retention-seconds). Without an
+	// object store the default is seven days; with one the default is zero
+	// (off), because the data itself expires and only an explicit deletion
+	// removes the row. Zero disables retention deletion.
 	StoppedRetentionSeconds int
+
+	// DataRetentionSeconds is how long an archived sandbox's stored data is
+	// kept before the reaper expires it
+	// (-lifecycle.data-retention-seconds, default fourteen days). Zero never
+	// expires data. It applies only when an object store is configured.
+	DataRetentionSeconds int
+
+	// SnapshotIntervalSeconds is the period between generations of one
+	// ready sandbox (-lifecycle.snapshot-interval-seconds, default 60).
+	SnapshotIntervalSeconds int
+	// SnapshotTimeoutSeconds bounds one SnapshotVM call
+	// (-lifecycle.snapshot-timeout-seconds, default 600).
+	SnapshotTimeoutSeconds int
+
+	// NodeLostSeconds is how long a node may go without a connected
+	// inventory observation before the lifecycle role treats it as lost and
+	// moves its sandboxes (-lifecycle.node-lost-seconds, default 120). Zero
+	// disables node loss; otherwise it is at least MinNodeLostSeconds.
+	NodeLostSeconds int
+
+	// DiskLowPercent is the share of a node's total disk below which the
+	// lifecycle role evicts the retained disks of archived sandboxes on it
+	// (-lifecycle.disk-low-percent, default 10). Zero disables
+	// disk-pressure eviction; otherwise it is 1..90. It applies only when
+	// an object store is configured.
+	DiskLowPercent int
+}
+
+// GC holds the chunk collector's settings; it runs in the lifecycle role and
+// only with an object store.
+type GC struct {
+	// IntervalSeconds is the time between rounds (-gc.interval-seconds).
+	IntervalSeconds int
+	// GraceSeconds is how old an object must be before it can be deleted
+	// (-gc.grace-seconds).
+	GraceSeconds int
+	// HistorySeconds is how long completed generations other than a chain's
+	// latest stay live (-gc.history-seconds).
+	HistorySeconds int
+	// Batch is the number of objects deleted per fenced batch (-gc.batch).
+	Batch int
 }
 
 // Defaults, overridable by flags and BBRAFT_* environment.
@@ -147,9 +197,36 @@ const (
 	DefaultRetrySeconds     = 5
 	DefaultReaperSeconds    = 60
 	DefaultJobPollSeconds   = 15
-	// DefaultStoppedRetentionSeconds is the stopped-disk retention: seven
-	// days.
+	// DefaultStoppedRetentionSeconds is the stopped-disk retention without an
+	// object store: seven days. With an object store the stopped row is kept
+	// and only its data expires, so the default is zero (off).
 	DefaultStoppedRetentionSeconds = 604800
+	// DefaultDataRetentionSeconds is how long a stopped sandbox's stored data
+	// is kept before it expires: fourteen days.
+	DefaultDataRetentionSeconds = 1209600
+
+	// DefaultSnapshotIntervalSeconds and DefaultSnapshotTimeoutSeconds are
+	// the snapshot worker's period and per-call bound.
+	DefaultSnapshotIntervalSeconds = 60
+	DefaultSnapshotTimeoutSeconds  = 600
+
+	// DefaultNodeLostSeconds is the node-loss grace. MinNodeLostSeconds is
+	// the smallest one accepted: two inventory polls (30 s each), so a
+	// healthy node is never older than the grace between two observations.
+	DefaultNodeLostSeconds = 120
+	MinNodeLostSeconds     = 60
+
+	// DefaultDiskLowPercent is the free-disk share below which a node's
+	// retained stopped disks are evicted; 0 disables the eviction and it is
+	// never configured above 90.
+	DefaultDiskLowPercent = 10
+	MaxDiskLowPercent     = 90
+	// The chunk collector's defaults: a round every six hours, objects must
+	// be a day old before deletion, a day of history, 1000 objects a batch.
+	DefaultGCIntervalSeconds = 21600
+	DefaultGCGraceSeconds    = 86400
+	DefaultGCHistorySeconds  = 86400
+	DefaultGCBatch           = 1000
 )
 
 // Env names of secrets that have no flag: they arrive through the
@@ -182,6 +259,7 @@ func Load(ctx context.Context, args []string, env func(string) (string, bool)) (
 	}
 	fs := flag.NewFlagSet("bbraft-server", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	s3Flags := s3.RegisterFlags(fs)
 
 	str := func(name, def string) *string {
 		if v, ok := env(envName(name)); ok {
@@ -237,6 +315,15 @@ func Load(ctx context.Context, args []string, env func(string) (string, bool)) (
 	reaper := num("lifecycle.reaper-seconds", DefaultReaperSeconds)
 	jobPoll := num("lifecycle.job-poll-seconds", DefaultJobPollSeconds)
 	stoppedRetention := num("lifecycle.stopped-retention-seconds", DefaultStoppedRetentionSeconds)
+	dataRetention := num("lifecycle.data-retention-seconds", DefaultDataRetentionSeconds)
+	snapshotInterval := num("lifecycle.snapshot-interval-seconds", DefaultSnapshotIntervalSeconds)
+	snapshotTimeout := num("lifecycle.snapshot-timeout-seconds", DefaultSnapshotTimeoutSeconds)
+	nodeLost := num("lifecycle.node-lost-seconds", DefaultNodeLostSeconds)
+	diskLow := num("lifecycle.disk-low-percent", DefaultDiskLowPercent)
+	gcInterval := num("gc.interval-seconds", DefaultGCIntervalSeconds)
+	gcGrace := num("gc.grace-seconds", DefaultGCGraceSeconds)
+	gcHistory := num("gc.history-seconds", DefaultGCHistorySeconds)
+	gcBatch := num("gc.batch", DefaultGCBatch)
 	masterKeyFile := str("secrets.master-key-file", "")
 	allowEphemeral := boolean("secrets.allow-ephemeral", false)
 
@@ -254,6 +341,17 @@ func Load(ctx context.Context, args []string, env func(string) (string, bool)) (
 		if !set[name] {
 			return nil, err
 		}
+	}
+	objects, objectsConfigured, err := s3Flags.Config(env)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	// With an object store a stopped sandbox's data expires and its row is
+	// kept, so row deletion is off unless the operator asked for it
+	// explicitly. Without one, today's seven-day stopped-disk deletion stays
+	// the default: there is no stored data to expire instead.
+	if objectsConfigured && !explicit(set, env, "lifecycle.stopped-retention-seconds") {
+		*stoppedRetention = 0
 	}
 
 	parsed, err := ParseRoles(*roles)
@@ -292,11 +390,25 @@ func Load(ctx context.Context, args []string, env func(string) (string, bool)) (
 			ReaperSeconds:           *reaper,
 			JobPollSeconds:          *jobPoll,
 			StoppedRetentionSeconds: *stoppedRetention,
+			DataRetentionSeconds:    *dataRetention,
+			SnapshotIntervalSeconds: *snapshotInterval,
+			SnapshotTimeoutSeconds:  *snapshotTimeout,
+			NodeLostSeconds:         *nodeLost,
+			DiskLowPercent:          *diskLow,
+		},
+		GC: GC{
+			IntervalSeconds: *gcInterval,
+			GraceSeconds:    *gcGrace,
+			HistorySeconds:  *gcHistory,
+			Batch:           *gcBatch,
 		},
 		Secrets: Secrets{
 			MasterKeyFile:  *masterKeyFile,
 			AllowEphemeral: *allowEphemeral,
 		},
+	}
+	if objectsConfigured {
+		c.ObjectStore = &objects
 	}
 	if err := c.resolve(ctx, env); err != nil {
 		return nil, err
@@ -305,6 +417,16 @@ func Load(ctx context.Context, args []string, env func(string) (string, bool)) (
 		return nil, err
 	}
 	return c, nil
+}
+
+// explicit reports whether a setting came from the command line or its
+// BBRAFT_* environment fallback, rather than keeping its default.
+func explicit(set map[string]bool, env func(string) (string, bool), name string) bool {
+	if set[name] {
+		return true
+	}
+	_, ok := env(envName(name))
+	return ok
 }
 
 // resolve fills the secret fields from their file or environment source
@@ -538,6 +660,55 @@ func (c *Config) Validate() error {
 	if c.Lifecycle.StoppedRetentionSeconds > maxRetentionSeconds {
 		return errors.New("config: lifecycle.stopped-retention-seconds is too large")
 	}
+	if c.Lifecycle.DataRetentionSeconds < 0 {
+		return errors.New("config: lifecycle.data-retention-seconds must not be negative")
+	}
+	if c.Lifecycle.DataRetentionSeconds > maxRetentionSeconds {
+		return errors.New("config: lifecycle.data-retention-seconds is too large")
+	}
+	// The snapshot interval and timeout are at least 1 s and fit a duration.
+	for _, iv := range []struct {
+		name string
+		n    int
+	}{
+		{"lifecycle.snapshot-interval-seconds", c.Lifecycle.SnapshotIntervalSeconds},
+		{"lifecycle.snapshot-timeout-seconds", c.Lifecycle.SnapshotTimeoutSeconds},
+	} {
+		if iv.n < 1 {
+			return fmt.Errorf("config: %s must be at least 1", iv.name)
+		}
+		if iv.n > maxRetentionSeconds {
+			return fmt.Errorf("config: %s is too large", iv.name)
+		}
+	}
+	// Node loss: off, or a grace that spans two inventory polls.
+	if n := c.Lifecycle.NodeLostSeconds; n != 0 && (n < MinNodeLostSeconds || n > maxRetentionSeconds) {
+		return fmt.Errorf("config: lifecycle.node-lost-seconds must be 0 or between %d and %d", MinNodeLostSeconds, maxRetentionSeconds)
+	}
+	// Disk pressure: off, or a percentage between 1 and 90.
+	if n := c.Lifecycle.DiskLowPercent; n != 0 && (n < 1 || n > MaxDiskLowPercent) {
+		return fmt.Errorf("config: lifecycle.disk-low-percent must be 0 or between 1 and %d", MaxDiskLowPercent)
+	}
+	// The chunk collector: every setting is positive. A grace of zero would
+	// delete a chunk an attempt has just uploaded and not yet committed.
+	for _, iv := range []struct {
+		name string
+		n    int
+	}{
+		{"gc.interval-seconds", c.GC.IntervalSeconds},
+		{"gc.grace-seconds", c.GC.GraceSeconds},
+		{"gc.history-seconds", c.GC.HistorySeconds},
+	} {
+		if iv.n < 1 {
+			return fmt.Errorf("config: %s must be at least 1", iv.name)
+		}
+		if iv.n > maxRetentionSeconds {
+			return fmt.Errorf("config: %s is too large", iv.name)
+		}
+	}
+	if c.GC.Batch < 1 {
+		return errors.New("config: gc.batch must be at least 1")
+	}
 	return nil
 }
 
@@ -547,10 +718,19 @@ const maxRetentionSeconds = int(math.MaxInt64 / int64(time.Second))
 
 // StoppedRetentionOption converts the configured stopped-retention into the
 // lifecycle worker's optional duration. The config always carries an explicit
-// value (the flag default), so the result is never nil: the default becomes
-// seven days and an explicit zero disables retention deletion.
+// value (the flag default), so the result is never nil: without an object
+// store the default becomes seven days, with one it becomes zero, and an
+// explicit zero disables retention deletion.
 func (l Lifecycle) StoppedRetentionOption() *time.Duration {
 	return new(time.Duration(l.StoppedRetentionSeconds) * time.Second)
+}
+
+// DataRetentionOption converts the configured data retention into the
+// lifecycle worker's optional duration. The config always carries an explicit
+// value (the flag default), so the result is never nil: the default becomes
+// fourteen days and an explicit zero never expires data.
+func (l Lifecycle) DataRetentionOption() *time.Duration {
+	return new(time.Duration(l.DataRetentionSeconds) * time.Second)
 }
 
 // listenAddr checks a host:port value: a numeric port and a host that is

@@ -17,6 +17,8 @@ import (
 //   - a VM for a soft-deleted sandbox is cleaned up idempotently;
 //   - a ready-ish sandbox whose VM is missing or FAILED becomes error, its
 //     VM is deleted and its reservation is released after confirmed cleanup;
+//   - an evicted copy (an open vm_evictions row: the sandbox moved to
+//     another node) is deleted before anything else, and its row closed;
 //   - an unknown VM id is preserved and logged, never deleted on a guess;
 //   - a live provisioning sandbox is left to its job.
 //
@@ -45,6 +47,12 @@ func (w *Worker) reconcileNodeVMs(ctx context.Context, nodeID string) {
 		// touch anything. The next poll retries.
 		return
 	}
+	// Evicted copies go first: they are deleted before anything
+	// else looks at this node's inventory, and the VM pass skips them.
+	evicted, ok := w.reconcileEvictions(ctx, nodeID)
+	if !ok {
+		return
+	}
 	rows, err := w.store.SandboxesOnNode(ctx, nodeID)
 	if err != nil {
 		w.log.Warn("VM reconciliation sandbox list failed", "node", nodeID, "reason", classify(err))
@@ -59,6 +67,9 @@ func (w *Worker) reconcileNodeVMs(ctx context.Context, nodeID string) {
 		id := vm.GetSandboxId()
 		if id == "" {
 			continue
+		}
+		if evicted[id] {
+			continue // an orphaned copy, never this node's sandbox VM
 		}
 		seen[id] = true
 		sbx, ok := byID[id]

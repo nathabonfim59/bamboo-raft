@@ -29,6 +29,9 @@ import (
 // lazy-refcounts=off on the qcow2 node. The virtio-blk device reports a write
 // cache, so the guest sees writeback semantics. See the package documentation
 // for the snapshot contract this supports.
+//
+// QEMU starts paused (-S, status prelaunch): the caller prepares the dirty
+// bitmap (EnsureDirtyBitmap) and then resumes the guest with Resume.
 func (c Config) Args() ([]string, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -57,6 +60,9 @@ func (c Config) Args() ([]string, error) {
 		"-nodefaults",
 		"-no-user-config",
 		"-no-reboot",
+		// Paused launch (D2): the node prepares the dirty bitmap over QMP
+		// and only then sends cont, so no guest write predates it.
+		"-S",
 		"-m", strconv.FormatUint(c.MemoryMiB, 10) + "M",
 		"-smp", strconv.FormatUint(uint64(c.VCPUs), 10),
 		"-kernel", kernel,

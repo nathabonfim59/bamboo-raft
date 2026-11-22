@@ -129,7 +129,12 @@ type jailKVMAttempt struct {
 	// /proc/<pid>/exe is this inode.
 	mainExe jailKVMIdentity
 	hub     *jailKVMHub
-	client  nodev1.NodeClient
+	// s3fwd is the object store forwarder listening inside nodeNS
+	// (startS3Forwarder); closed by the teardown after the unit stopped.
+	s3fwd *jailKVMForwarder
+	// s3secret is the object store secret, kept only to redact it from logs.
+	s3secret string
+	client   nodev1.NodeClient
 	// lastDone is the Done of the newest link this attempt used; the next
 	// link must be a different one (jailKVMWaitNewLink).
 	lastDone <-chan struct{}
@@ -711,6 +716,14 @@ func (a *jailKVMAttempt) teardown() {
 		case <-hub.done:
 		case <-time.After(30 * time.Second):
 			td.WorkersDone = errors.New("the hub did not stop within 30s")
+		}
+	}
+	a.mu.Lock()
+	s3fwd := a.s3fwd
+	a.mu.Unlock()
+	if s3fwd != nil {
+		if err := s3fwd.Close(15 * time.Second); err != nil {
+			td.WorkersDone = errors.Join(td.WorkersDone, err)
 		}
 	}
 	for _, w := range workers {

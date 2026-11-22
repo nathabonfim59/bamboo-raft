@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nathabonfim59/bamboo-raft/internal/api"
+	"github.com/nathabonfim59/bamboo-raft/internal/compat"
 )
 
 func TestNewWaitsForReadyAndEmitsJSONLines(t *testing.T) {
@@ -109,6 +110,14 @@ func TestNewRejectsInvalidFlagsBeforeRequest(t *testing.T) {
 		{name: "ttl high", args: []string{"new", "--ttl", "2592001"}},
 		{name: "env no equals", args: []string{"new", "--env", "SUPER_SECRET_VALUE"}},
 		{name: "env empty key", args: []string{"new", "--env", "=value"}},
+		{name: "empty from", args: []string{"new", "--from", ""}},
+		{name: "count without from", args: []string{"new", "--count", "2"}},
+		{name: "count one without from", args: []string{"new", "--count", "1"}},
+		{name: "count with fail-fast", args: []string{"new", "--from", cliTestSnapshotName, "--count", "2", "--fail-fast"}},
+		{name: "count one with fail-fast", args: []string{"new", "--from", cliTestSnapshotName, "--count", "1", "--fail-fast"}},
+		{name: "count low", args: []string{"new", "--from", cliTestSnapshotName, "--count", "0"}},
+		{name: "count negative", args: []string{"new", "--from", cliTestSnapshotName, "--count", "-1"}},
+		{name: "count high", args: []string{"new", "--from", cliTestSnapshotName, "--count", "1001"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -501,6 +510,155 @@ func TestNewAmbiguousCreate(t *testing.T) {
 		message := unconfirmed(env, t, "sentinel transport failure")
 		if strings.Contains(message, "sentinel transport failure") {
 			t.Fatal("transport sentinel leaked into the event")
+		}
+	})
+}
+
+func TestNewFromShareCodeAndFailFast(t *testing.T) {
+	shareCode := "bsh_" + strings.Repeat("c", 52)
+	env := cliTestNew(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != api.PathSandboxes {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var body api.CreateSandboxRequest
+		if err := json.UnmarshalRead(r.Body, &body); err != nil {
+			t.Errorf("decode body: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if body.From == nil || *body.From != shareCode {
+			t.Errorf("from = %v, want %q", body.From, shareCode)
+		}
+		if body.FailFast == nil || !*body.FailFast {
+			t.Errorf("failFast = %v, want true", body.FailFast)
+		}
+		if body.Count != nil {
+			t.Errorf("count = %v, want nil", body.Count)
+		}
+		cliTestWriteJSON(t, w, http.StatusAccepted, api.NewCreateSandboxResponse(
+			api.CreateReady, new(3600), cliTestSandbox(cliTestSandboxID, api.StateReady),
+		))
+	}, nil)
+	if status := env.run(t, "new", "--from", shareCode, "--fail-fast"); status != 0 {
+		t.Fatalf("exit status = %d, stderr = %s", status, env.stderr)
+	}
+	lines := cliTestJSONLines(t, env.stdout)
+	if len(lines) != 3 || lines[2]["event"] != "ready" {
+		t.Fatalf("lines = %v, want created/state/ready", lines)
+	}
+}
+
+func TestNewCountBatchHumanAndJSON(t *testing.T) {
+	const cliTestSandboxID3 = "bx_34567892"
+	batch := []api.Sandbox{
+		cliTestSandbox(cliTestSandboxID, api.StateProvisioning),
+		cliTestSandbox(cliTestSandboxID2, api.StateProvisioning),
+		cliTestSandbox(cliTestSandboxID3, api.StateProvisioning),
+	}
+
+	t.Run("human prints one id per line without polling", func(t *testing.T) {
+		shareCode := "bsh_" + strings.Repeat("d", 52)
+		var requests atomic.Int64
+		env := cliTestNew(t, func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			if r.Method != http.MethodPost || r.URL.Path != api.PathSandboxes {
+				t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			var body api.CreateSandboxRequest
+			if err := json.UnmarshalRead(r.Body, &body); err != nil {
+				t.Errorf("decode body: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if body.From == nil || *body.From != shareCode {
+				t.Errorf("from = %v, want %q", body.From, shareCode)
+			}
+			if body.Count == nil || *body.Count != 3 {
+				t.Errorf("count = %v, want 3", body.Count)
+			}
+			cliTestWriteJSON(t, w, http.StatusAccepted, api.NewCreateSandboxBatchResponse(
+				api.CreateProvisioning, new(3600), batch,
+			))
+		}, func(opts *Options) {
+			opts.IsTTY = func(io.Writer) bool { return true }
+		})
+		if status := env.run(t, "new", "--from", shareCode, "--count", "3"); status != 0 {
+			t.Fatalf("exit status = %d, stderr = %s", status, env.stderr)
+		}
+		if requests.Load() != 1 {
+			t.Fatalf("requests = %d, want 1 (no polling)", requests.Load())
+		}
+		want := strings.Join([]string{cliTestSandboxID, cliTestSandboxID2, cliTestSandboxID3}, "\n") + "\n"
+		if env.stdout.String() != want {
+			t.Fatalf("stdout = %q, want %q", env.stdout.String(), want)
+		}
+	})
+
+	t.Run("json prints full batch response matching v1 API schema", func(t *testing.T) {
+		validator := compat.Load(t)
+		env := cliTestNew(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			}
+			cliTestWriteJSON(t, w, http.StatusAccepted, api.NewCreateSandboxBatchResponse(
+				api.CreateProvisioning, new(3600), batch,
+			))
+		}, func(opts *Options) {
+			opts.IsTTY = func(io.Writer) bool { return true }
+		})
+		if status := env.run(t, "new", "--from", cliTestSnapshotName, "--count", "3", "--json"); status != 0 {
+			t.Fatalf("exit status = %d, stderr = %s", status, env.stderr)
+		}
+		raw := strings.TrimSpace(env.stdout.String())
+		lifecycleTestValidate(t, validator, "create", http.StatusAccepted, []byte(raw))
+		lines := cliTestJSONLines(t, env.stdout)
+		if len(lines) != 1 || lines[0]["type"] != api.TypeSandboxCreated {
+			t.Fatalf("lines = %v", lines)
+		}
+		sandboxes, ok := lines[0]["sandboxes"].([]any)
+		if !ok || len(sandboxes) != 3 {
+			t.Fatalf("sandboxes = %v, want 3 entries", lines[0]["sandboxes"])
+		}
+	})
+
+	t.Run("count one waits like single create", func(t *testing.T) {
+		env := cliTestNew(t, func(w http.ResponseWriter, r *http.Request) {
+			var body api.CreateSandboxRequest
+			if err := json.UnmarshalRead(r.Body, &body); err != nil {
+				t.Errorf("decode body: %v", err)
+			}
+			if body.Count == nil || *body.Count != 1 {
+				t.Errorf("count = %v, want 1", body.Count)
+			}
+			cliTestWriteJSON(t, w, http.StatusAccepted, api.NewCreateSandboxResponse(
+				api.CreateReady, new(3600), cliTestSandbox(cliTestSandboxID, api.StateReady),
+			))
+		}, nil)
+		if status := env.run(t, "new", "--from", cliTestSnapshotName, "--count", "1"); status != 0 {
+			t.Fatalf("exit status = %d, stderr = %s", status, env.stderr)
+		}
+		lines := cliTestJSONLines(t, env.stdout)
+		if len(lines) != 3 || lines[2]["event"] != "ready" {
+			t.Fatalf("lines = %v, want created/state/ready", lines)
+		}
+	})
+
+	t.Run("incomplete batch response is create_ambiguous", func(t *testing.T) {
+		env := cliTestNew(t, func(w http.ResponseWriter, _ *http.Request) {
+			cliTestWriteJSON(t, w, http.StatusAccepted, api.NewCreateSandboxBatchResponse(
+				api.CreateProvisioning, new(3600), batch[:2],
+			))
+		}, nil)
+		if status := env.run(t, "new", "--from", cliTestSnapshotName, "--count", "3"); status != 1 {
+			t.Fatalf("exit status = %d, want 1", status)
+		}
+		lines := cliTestJSONLines(t, env.stdout)
+		if len(lines) != 1 || lines[0]["code"] != "create_ambiguous" {
+			t.Fatalf("lines = %v, want create_ambiguous", lines)
 		}
 	})
 }

@@ -15,6 +15,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"uuid"
+
 	"github.com/nathabonfim59/bamboo-raft/internal/apierr"
 	"github.com/nathabonfim59/bamboo-raft/internal/db"
 	"github.com/nathabonfim59/bamboo-raft/internal/ids"
@@ -35,6 +37,9 @@ const coreMaxEnvVars = 100
 
 // coreMaxNameRunes is the pinned display-name length.
 const coreMaxNameRunes = 120
+
+// coreMaxCount is the pinned create count maximum.
+const coreMaxCount = 1000
 
 // coreEnvKeyPattern is the pinned env key syntax.
 var coreEnvKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
@@ -262,20 +267,25 @@ func (h *coreHandlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		apierr.WriteError(w, r, apiErr)
 		return
 	}
+	if input.count > 1 {
+		h.createBatchSandboxes(w, r, owner, input)
+		return
+	}
 	result, err := h.admission.Admit(r.Context(), AdmissionRequest{
-		Owner:          owner,
-		SandboxID:      coreNewSandboxID(),
-		MachineType:    input.machine.Name,
-		Resources:      input.resources(),
-		From:           input.from,
-		TypeExplicit:   input.typeExplicit,
-		Name:           input.displayName(h.now()),
-		Labels:         input.labels,
-		Env:            input.env,
-		TTLSeconds:     input.ttl,
-		FailFast:       input.failFast,
-		IdempotencyKey: input.idempotencyKey,
-		RequestSHA256:  input.requestSHA256,
+		Owner:            owner,
+		SandboxID:        coreNewSandboxID(),
+		MachineType:      input.machine.Name,
+		Resources:        input.resources(),
+		From:             input.from,
+		TypeExplicit:     input.typeExplicit,
+		Name:             input.displayName(h.now()),
+		Labels:           input.labels,
+		Env:              input.env,
+		TTLSeconds:       input.ttl,
+		FailFast:         input.failFast,
+		IdempotencyKey:   input.idempotencyKey,
+		RequestSHA256:    input.requestSHA256,
+		SnapshotsEnabled: input.snapshots,
 	})
 	if err != nil {
 		if apiErr := h.admissionFailure(r.Context(), input.failFast, err); apiErr != nil {
@@ -290,6 +300,64 @@ func (h *coreHandlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := NewCreateSandboxResponse(createStatus(result), configuredTTL(result.Sandbox), sandboxFromRow(result.Sandbox))
+	apierr.Write(w, http.StatusAccepted, TypeSandboxCreated, response)
+}
+
+// createBatchSandboxes serves a create whose count is above one. The batch is
+// all-or-nothing: a placement or capacity refusal creates nothing.
+func (h *coreHandlers) createBatchSandboxes(w http.ResponseWriter, r *http.Request, owner uuid.UUID, input coreCreateInput) {
+	if h.batch == nil {
+		if apiErr := h.storeFailure(r.Context(), "batch create admission", errors.New("batch admission is not configured")); apiErr != nil {
+			apierr.WriteError(w, r, apiErr)
+		}
+		return
+	}
+	requests := make([]AdmissionRequest, input.count)
+	for i := range requests {
+		requests[i] = AdmissionRequest{
+			Owner:            owner,
+			SandboxID:        coreNewSandboxID(),
+			MachineType:      input.machine.Name,
+			Resources:        input.resources(),
+			From:             input.from,
+			TypeExplicit:     input.typeExplicit,
+			Name:             input.displayName(h.now()),
+			Labels:           input.labels,
+			Env:              input.env,
+			TTLSeconds:       input.ttl,
+			FailFast:         false,
+			SnapshotsEnabled: input.snapshots,
+		}
+	}
+	// Only the first request keys the whole batch; every sandbox created by
+	// it replays together.
+	requests[0].IdempotencyKey = input.idempotencyKey
+	requests[0].RequestSHA256 = input.requestSHA256
+
+	results, err := h.batch.AdmitBatch(r.Context(), requests)
+	if err != nil {
+		if apiErr := h.admissionFailure(r.Context(), false, err); apiErr != nil {
+			apierr.WriteError(w, r, apiErr)
+		}
+		return
+	}
+	if len(results) != len(requests) {
+		if apiErr := h.storeFailure(r.Context(), "batch create admission result", errors.New("admission returned the wrong number of sandboxes")); apiErr != nil {
+			apierr.WriteError(w, r, apiErr)
+		}
+		return
+	}
+	views := make([]Sandbox, len(results))
+	for i, result := range results {
+		if result.Sandbox.ID == "" || result.Sandbox.OwnerID != owner {
+			if apiErr := h.storeFailure(r.Context(), "batch create admission result", errors.New("admission returned a malformed or foreign sandbox")); apiErr != nil {
+				apierr.WriteError(w, r, apiErr)
+			}
+			return
+		}
+		views[i] = sandboxFromRow(result.Sandbox)
+	}
+	response := NewCreateSandboxBatchResponse(createStatus(results[0]), configuredTTL(results[0].Sandbox), views)
 	apierr.Write(w, http.StatusAccepted, TypeSandboxCreated, response)
 }
 
@@ -360,8 +428,10 @@ type coreCreateInput struct {
 	labels         map[string]string
 	env            map[string]string
 	failFast       bool
+	count          int
 	idempotencyKey string
 	requestSHA256  [sha256.Size]byte
+	snapshots      *bool
 }
 
 // coreDefaultNameLayout is the pinned display-name form: "Sandbox" plus the
@@ -369,10 +439,15 @@ type coreCreateInput struct {
 const coreDefaultNameLayout = "2006-01-02 15:04"
 
 // displayName returns the explicit name, including an explicit empty one, or
-// the generated default when the request omitted name.
+// the generated default when the request omitted name. A create from a saved
+// snapshot with no name is named after the snapshot by admission, which is
+// where the resolved name is known.
 func (i coreCreateInput) displayName(now time.Time) string {
 	if i.nameSet {
 		return i.name
+	}
+	if i.from != "" {
+		return ""
 	}
 	return "Sandbox " + now.UTC().Format(coreDefaultNameLayout)
 }
@@ -482,6 +557,22 @@ func (h *coreHandlers) parseCreateSandbox(r *http.Request) (coreCreateInput, *ap
 	if apiErr := coreValidateUnsupportedCreate(request); apiErr != nil {
 		return coreCreateInput{}, apiErr
 	}
+	count := 1
+	countSet := request.Count != nil
+	if countSet {
+		count = *request.Count
+		if count < 1 || count > coreMaxCount {
+			return coreCreateInput{}, coreInvalidJSON("count must be an integer from 1 to 1000")
+		}
+		if from == "" {
+			return coreCreateInput{}, apierr.New(http.StatusBadRequest, apierr.CodeCountRequiresFrom,
+				"count requires from")
+		}
+		if request.FailFast != nil && *request.FailFast {
+			return coreCreateInput{}, apierr.New(http.StatusBadRequest, apierr.CodeCountWithFailFast,
+				"count cannot be combined with failFast")
+		}
+	}
 	key, keyErr := ReadIdempotencyKey(r)
 	if keyErr != nil {
 		return coreCreateInput{}, coreInvalidJSON("Idempotency-Key must be at most 255 characters")
@@ -496,8 +587,10 @@ func (h *coreHandlers) parseCreateSandbox(r *http.Request) (coreCreateInput, *ap
 		labels:         request.Labels,
 		env:            request.Env,
 		failFast:       request.FailFast != nil && *request.FailFast,
+		count:          count,
 		idempotencyKey: key,
 		requestSHA256:  hash,
+		snapshots:      request.Snapshots,
 	}, nil
 }
 
@@ -699,8 +792,9 @@ func coreValidateEnv(env map[string]string) *apierr.Error {
 }
 
 // coreValidateUnsupportedCreate refuses every pinned member whose behavior
-// Phase 0.5 cannot durably provide. Explicit snapshots and monitoring are
-// rejected even when false because both set a durable per-sandbox policy; an
+// Phase 0.5 cannot durably provide. An explicit monitoring member is rejected
+// even when false because it sets a durable per-sandbox policy (snapshots is
+// supported and stored with the sandbox); an
 // explicit count is rejected because no batch/from create exists. noEnv is
 // effective as-is: Phase 0.5 never injects account or platform credentials.
 // Empty scripts and arrays request nothing extra and are accepted.
@@ -708,14 +802,8 @@ func coreValidateUnsupportedCreate(request CreateSandboxRequest) *apierr.Error {
 	if request.Environment != nil && *request.Environment != "base" {
 		return coreUnknownEnvironment()
 	}
-	if request.Snapshots != nil {
-		return coreInvalidJSON("snapshots is not supported in Phase 0.5")
-	}
 	if request.Monitoring != nil {
 		return coreInvalidJSON("monitoring is not supported in Phase 0.5")
-	}
-	if request.Count != nil {
-		return coreInvalidJSON("count is not supported in Phase 0.5")
 	}
 	if request.SetupScript != nil && *request.SetupScript != "" {
 		return coreInvalidJSON("setupScript is not supported in Phase 0.5")

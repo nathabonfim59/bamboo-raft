@@ -101,6 +101,11 @@ func (m *Manager) hasImage(id string) bool {
 // live process passed every identity check (pinned is its pidfd); a nil client
 // means the attempt is unresolved (pinned, when non-nil, is kept for proof).
 func (m *Manager) recoverClaimedJail(ctx context.Context, meta storage.VMMeta, rec jailer.Record, bootID string) (gone bool, pinned *pinnedProc, client *qmp.Client) {
+	if handled, released, kept := m.recoverMaintenanceJailed(ctx, meta, rec, bootID); handled {
+		// A maintenance QEMU is quit and released, never adopted: this runs
+		// before verifyJailed, whose QMP verification would continue it.
+		return released, kept, nil
+	}
 	release := func() bool {
 		if err := m.jail.ReleaseAttempt(ctx, rec.Ref()); err != nil {
 			m.log.Warn("node: recovered jail reservation retained", "sandbox", rec.SandboxID, "attempt", rec.Attempt, "error", err)

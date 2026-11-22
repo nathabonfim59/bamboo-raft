@@ -34,6 +34,39 @@ bbraft_server_api_keys: []
 # nodehub role runs (and for the default roles: all).
 bbraft_server_node_tokens: []
 
+# --- Object store (optional; S3-compatible, shared with bbraft-node) --------
+#
+# With bbraft_server_s3_enabled true the role writes an environment file with
+# the non-secret BBRAFT_S3_* settings and a separate 0600 file holding only
+# the secret access key. The unit passes the environment file to systemd and
+# the secret through LoadCredential, so no secret value reaches ExecStart.
+# Values come from the private inventory; there is no repository default that
+# names a real host or bucket.
+bbraft_server_s3_enabled: false
+bbraft_server_s3_endpoint: ""       # http(s)://host[:port]; empty means AWS S3
+bbraft_server_s3_region: ""
+bbraft_server_s3_bucket: ""
+bbraft_server_s3_path_style: false
+bbraft_server_s3_access_key_id: ""
+# The secret access key; supply it from the vault or the gitignored inventory.
+bbraft_server_s3_secret_access_key: ""
+
+# s3.env and s3-secret-access-key live in this directory. It is separate from
+# bbraft_server_config_dir because a colocated garage/node deployment shares
+# the same two files.
+bbraft_server_s3_dir: /etc/bbraft
+bbraft_server_s3_env_file: "{{ bbraft_server_s3_dir }}/s3.env"
+bbraft_server_s3_secret_file: "{{ bbraft_server_s3_dir }}/s3-secret-access-key"
+# root:root 0750 matches the colocated garage role's directory, so the two
+# roles can share /etc/bbraft without fighting over its attributes.
+bbraft_server_s3_dir_owner: root
+bbraft_server_s3_dir_group: root
+bbraft_server_s3_dir_mode: "0750"
+bbraft_server_s3_env_mode: "0600"
+bbraft_server_s3_secret_mode: "0600"
+bbraft_server_s3_secret_owner: root
+bbraft_server_s3_secret_group: root
+
 # --- Identity, paths and ownership -----------------------------------------
 
 bbraft_server_user: bbraft-server
@@ -112,3 +145,16 @@ bbraft_server_stream_max_seconds: 7200
 bbraft_server_retry_seconds: 5
 bbraft_server_reaper_seconds: 60
 bbraft_server_job_poll_seconds: 15
+
+# Snapshot, node-loss and retention settings (internal/server/config). These
+# apply only when an object store is configured, except the snapshot worker
+# interval, which is dormant without one.
+bbraft_server_snapshot_interval_seconds: 60
+bbraft_server_snapshot_timeout_seconds: 600
+# 0 disables node loss; any other value must be at least 60 (two inventory
+# polls). The binary ignores it without an object store.
+bbraft_server_node_lost_seconds: 120
+# 0 never expires stored data. Default fourteen days.
+bbraft_server_data_retention_seconds: 1209600
+# 0 disables disk-pressure eviction; otherwise 1-90.
+bbraft_server_disk_low_percent: 10

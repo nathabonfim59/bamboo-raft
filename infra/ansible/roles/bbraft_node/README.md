@@ -70,6 +70,10 @@ or the inventory example.
 | `/etc/systemd/system/<service>.service` | `0644` root:root | hardened unit; `bbraft_node_unit_path` must be named `<bbraft_node_service>.service` |
 | `/etc/udev/rules.d/60-bbraft-kvm.rules` | `0644` root:root | Debian's `kvm` group and `0660` on `/dev/kvm` and `/dev/vhost-vsock` (not relied on by the root supervisor) |
 | `/etc/modules-load.d/bbraft-vhost-vsock.conf` | `0644` root:root | loads `tun`, `vhost_net` and `vhost_vsock` at boot |
+| `/etc/bbraft/s3.env` | `0600` root:root | colocated Garage's non-secret S3 settings (written by the `garage` role) |
+| `/etc/bbraft/s3-secret-access-key` | `0600` root:root | colocated Garage's secret; systemd copies it as a credential |
+| `/etc/bbraft-node-v1/s3.env` | `0600` root:root | remote-mode non-secret S3 settings (written by this role) |
+| `/etc/bbraft-node-v1/s3-secret-access-key` | `0600` root:root | remote-mode secret (written by this role, `no_log`) |
 
 An image version directory contains exactly `kernel`, `initrd`, `root.qcow2`,
 `packages.json` and `manifest.json`. Each first install uses a unique hidden
@@ -127,6 +131,45 @@ data dir itself when it exists, else its existing configured parent) is not
 each firmware file are root-owned regular files only root can write. The
 binary re-proves each at startup and fails closed.
 
+## Object store (Phase 2, optional)
+
+Snapshots need an S3-compatible store. The role is off by default and turns
+the object store on in exactly one of two ways:
+
+| Mode | Variables | Files |
+|---|---|---|
+| colocated Garage | `bbraft_node_s3_env_file: "{{ garage_credentials_file }}"` (default `/etc/bbraft/s3.env`); `bbraft_node_s3_secret_file` (`/etc/bbraft/s3-secret-access-key`) | the `garage` role writes both: an env file with exactly `BBRAFT_S3_ENDPOINT`, `_REGION`, `_BUCKET`, `_PATH_STYLE` and `_ACCESS_KEY_ID`, and a separate secret file. If the inventory overrides `garage_secret_file`, set `bbraft_node_s3_secret_file` to the same path |
+| remote S3 | `bbraft_node_s3: {endpoint, region, bucket, path_style, access_key_id}` plus `bbraft_node_s3_secret_access_key` (inventory/vault) | the role writes `/etc/bbraft-node-v1/s3.env` and `/etc/bbraft-node-v1/s3-secret-access-key` (`bbraft_node_s3_managed_{env,secret}_file`), never logging the secret |
+
+Setting both modes, setting `bbraft_node_s3_secret_access_key` in colocated
+mode, or leaving the remote secret empty is a validation error. The endpoint
+must be an `http(s)` URL without userinfo or a query; the bucket is a
+lowercase S3 name; the region and access key id are nonempty tokens; the
+secret is one nonempty line of at most 8192 bytes without surrounding
+whitespace. In both modes the configured env and secret files must already be
+regular files owned by the service (root on a host), mode `0600` or `0400`, or
+the play refuses before the unit is written.
+
+The unit then renders, in this order:
+
+```ini
+EnvironmentFile=<env file>
+LoadCredential=s3-secret-access-key:<secret file>
+Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE=%d/s3-secret-access-key
+```
+
+`Environment=` comes after `EnvironmentFile=` so the credential path wins.
+systemd copies the secret to the unit's credential directory as a `0400`
+file owned by the service, which is the only form the node's
+`BBRAFT_S3_SECRET_ACCESS_KEY_FILE` opens: a regular file, mode `0600` or
+stricter, no symlink. No secret value is ever placed in an environment file,
+the unit, or a log.
+
+`bbraft_node_chunk_cache_bytes` (default `8589934592`, 8 GiB; binary default)
+renders `-node.chunk-cache-bytes` only when the object store is configured;
+`0` disables the local chunk cache under the data dir. Phase 2 off renders
+none of these directives or the flag, keeping Phase 1's unit unchanged.
+
 ## Unit and flags
 
 `ExecStart` contains only the exact typed flags from
@@ -171,6 +214,7 @@ binary re-proves each at startup and fails closed.
 | `-node.jail-library-dirs` | `BBRAFT_NODE_JAIL_LIBRARY_DIRS` | empty (omitted) | trusted library dirs |
 | `-node.jail-io-device` | `BBRAFT_NODE_JAIL_IO_DEVICE` | required | whole disk `MAJ:MIN` |
 | `-node.jail-io-{read,write}-{bps,iops}` | `BBRAFT_NODE_JAIL_IO_*` | `0` (omitted) | per-VM `io.max`; at least one positive |
+| `-node.chunk-cache-bytes` | `BBRAFT_NODE_CHUNK_CACHE_BYTES` | `8589934592` (omitted unless S3 is configured) | local chunk cache cap under the data dir; `0` disables it |
 
 `bbraft_node_cpu_features` (default `[]`) renders `-node.cpu-features` as a
 comma-joined list of `+name`/`-name` QEMU feature toggles; `vmx`/`svm` are
@@ -298,6 +342,16 @@ hardening_vm_bridge_interfaces: ["{{ bbraft_node_network_bridge }}"]
 # bbraft_node_capacity_vcpus: 12
 # bbraft_node_capacity_memory_mib: 49152
 # bbraft_node_network_management: ["100.64.0.0/10"]
+# Phase 2 object store, colocated Garage (run --tags garage first):
+# bbraft_node_s3_env_file: "{{ garage_credentials_file }}"
+# Phase 2 object store, remote service:
+# bbraft_node_s3:
+#   endpoint: http://203.0.113.20:3900   # documentation address
+#   region: garage
+#   bucket: bbraft
+#   path_style: true
+#   access_key_id: GK<access key id>
+# bbraft_node_s3_secret_access_key: "{{ lookup('file', bbraft_secrets + '/s3-secret') }}"
 ```
 
 ## Tests
@@ -313,7 +367,11 @@ mise exec -- sh roles/bbraft_node/tests/run.sh
 mise exec -- sh roles/bbraft_node/tests/run-a10.sh
 ```
 
-`tests/test_forward_guard.py` unit-tests the forward guard filter and
+The `garage` role has its own render test for the two credential files:
+`cd infra/ansible && mise exec -- sh roles/garage/tests/run.sh`. The
+`bbraft_node` render test covers Phase 2 off, colocated Garage and remote S3,
+including the directive order and that no secret reaches the unit, env file or
+verbose output. `tests/test_forward_guard.py` unit-tests the forward guard filter and
 `tests/ip-forward.sh` drives `tasks/ip-forward.yml` with fake `nft` and
 `sysctl` programs first in `PATH` and a temporary conf (fresh, idempotent,
 runtime drift, conf and mode drift, check mode, every refusal leaving a prior

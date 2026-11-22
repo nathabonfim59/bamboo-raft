@@ -463,7 +463,13 @@ func findOwnedPID(meta storage.VMMeta, imageDir, workDir, diskPath, expectedExe 
 // the QEMU for meta. It rechecks the peer credential and the guest name, then
 // returns the connected client. A failure is not proof the process is
 // unrelated, so callers never kill on it.
-func (m *Manager) verifyQMPAt(ctx context.Context, pinned *pinnedProc, meta storage.VMMeta, qmpPath string) (*qmp.Client, error) {
+//
+// adopt is set for a node restart's adoption: QEMU may then also be in
+// prelaunch (the node died between the paused launch and cont), and the
+// Phase 2 step (adoptPhase2: interrupted cut recovery, dirty bitmap, cont)
+// runs before the client is returned. Without adopt (a snapshot rescue of a
+// VM this node runs) a paused QEMU is only resumed, as in Phase 1.
+func (m *Manager) verifyQMPAt(ctx context.Context, pinned *pinnedProc, meta storage.VMMeta, qmpPath string, adopt bool) (*qmp.Client, error) {
 	if pinned.info.bootID != meta.QEMU.BootID {
 		return nil, fmt.Errorf("node: vm %s: process belongs to a previous host boot", meta.SandboxID)
 	}
@@ -504,7 +510,7 @@ func (m *Manager) verifyQMPAt(ctx context.Context, pinned *pinnedProc, meta stor
 		client.Close()
 		return nil, fmt.Errorf("node: vm %s: query-status: %w", meta.SandboxID, err)
 	}
-	if status.Status != "running" && status.Status != "paused" {
+	if status.Status != "running" && status.Status != "paused" && (!adopt || status.Status != "prelaunch") {
 		client.Close()
 		return nil, fmt.Errorf("node: vm %s: qmp status %q", meta.SandboxID, status.Status)
 	}
@@ -513,6 +519,13 @@ func (m *Manager) verifyQMPAt(ctx context.Context, pinned *pinnedProc, meta stor
 	if err := pinned.confirm(); err != nil {
 		client.Close()
 		return nil, fmt.Errorf("node: vm %s: %w", meta.SandboxID, err)
+	}
+	if adopt {
+		if err := m.adoptPhase2(ctx, client, meta.SandboxID, status.Status); err != nil {
+			client.Close()
+			return nil, fmt.Errorf("node: vm %s: %w", meta.SandboxID, err)
+		}
+		return client, nil
 	}
 	if status.Status == "paused" {
 		if err := resumePaused(ctx, client); err != nil {
@@ -598,10 +611,11 @@ func findOwnedQEMU(id, workDir, diskPath, expectedExe string) (*pinnedProc, erro
 
 // verifyQMP proves the pinned process owns its VM's fixed QMP socket.
 func (m *Manager) verifyQMP(ctx context.Context, pinned *pinnedProc, meta storage.VMMeta) (*qmp.Client, error) {
-	return m.verifyQMPAt(ctx, pinned, meta, filepath.Join(m.store.VMDir(meta.SandboxID), qemu.QMPFilename))
+	return m.verifyQMPAt(ctx, pinned, meta, filepath.Join(m.store.VMDir(meta.SandboxID), qemu.QMPFilename), true)
 }
 
-// resumePaused safely resumes a VM found paused after a restart. A guest
+// resumePaused safely resumes a VM found paused (or, with -S, still in
+// prelaunch) after a restart. A guest
 // frozen by QMP cannot answer Ping, so recovery would otherwise wait for the
 // whole probe deadline and then stop a healthy VM.
 func resumePaused(ctx context.Context, client *qmp.Client) error {

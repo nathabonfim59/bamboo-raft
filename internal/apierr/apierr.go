@@ -42,6 +42,7 @@ const (
 	CodeSandboxRunningStopFirst = "sandbox_running_stop_first"
 	CodeSnapshotsDisabled       = "snapshots_disabled"
 	CodeSnapshotDataExpired     = "snapshot_data_expired"
+	CodeResumeFailed            = "resume_failed"
 	CodeSnapshotCompacted       = "snapshot_compacted"
 	CodeIdempotencyInProgress   = "idempotency_in_progress"
 	CodeIdempotencyKeyReused    = "idempotency_key_reused"
@@ -60,6 +61,12 @@ const (
 	// CodeSaveInProgress reports a concurrent save of the same snapshot
 	// name; the snapshot worker uses it.
 	CodeSaveInProgress = "save_in_progress"
+	// CodeCountRequiresFrom reports a create `count` above one without
+	// `from`. The pinned spec answers 400.
+	CodeCountRequiresFrom = "count_requires_from"
+	// CodeCountWithFailFast reports `count` together with `failFast`. The
+	// pinned spec answers 400.
+	CodeCountWithFailFast = "count_with_fail_fast"
 )
 
 // Error is a v1 API error. The wire form repeats Code, Message and Status

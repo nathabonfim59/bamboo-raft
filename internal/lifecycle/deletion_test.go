@@ -67,7 +67,17 @@ func TestTTLDuringBlockedBootCannotCompleteOrReleaseBeforeGuard(t *testing.T) {
 	// While the boot claim is still live, the stop worker retries without
 	// the guard and nothing completes or releases: the full reservation
 	// (compute and disk) stays on the node and the VM keeps booting.
-	stopWorker := e.worker(t, lifecycle.Options{Lease: 300 * time.Millisecond})
+	//
+	// The stop worker also runs the redelivered boot, so it keeps the
+	// production lease: only the first attempt's claim is meant to expire.
+	// With a short lease, a lease renewal slower than its third of the lease
+	// (a loaded database, simulated by the slow store) loses each
+	// redelivered claim without requeueing it; once the boot's attempts are
+	// spent it stays running with an expired lease that no claim takes and
+	// only the reaper fails, so the stop retries "initial boot in flight"
+	// until its own attempts are gone.
+	slow := &ttlSlowRenewStore{Store: e.store, delay: 150 * time.Millisecond}
+	stopWorker := e.workerWithStore(t, slow, lifecycle.Options{})
 	if !mustProcess(t, stopWorker) {
 		t.Fatal("stop attempt was not claimed")
 	}
@@ -133,6 +143,25 @@ func TestTTLDuringBlockedBootCannotCompleteOrReleaseBeforeGuard(t *testing.T) {
 	if deletes := n.deleteCalls(); len(deletes) != 0 {
 		t.Fatalf("auto-stop deleted the first disk: %v", deletes)
 	}
+}
+
+// ttlSlowRenewStore answers every lease renewal after delay, the latency of
+// a loaded database. A renewal whose deadline ends first fails as the slow
+// round trip would, and the worker treats its claim as lost.
+type ttlSlowRenewStore struct {
+	*db.Store
+	delay time.Duration
+}
+
+func (s *ttlSlowRenewStore) RenewJobLease(ctx context.Context, jobID uuid.UUID, worker string, token uuid.UUID, lease time.Duration) error {
+	t := time.NewTimer(s.delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+	}
+	return s.Store.RenewJobLease(ctx, jobID, worker, token, lease)
 }
 
 // TestDeleteVMFencesEarlierCreateVMThroughGateway exercises the accepted

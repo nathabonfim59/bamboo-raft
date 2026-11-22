@@ -197,6 +197,38 @@ service Node {
   // one valid public key line (no options, no newlines). UNAVAILABLE while the
   // guest's host key does not exist yet.
   rpc AddSSHKey(AddSSHKeyRequest) returns (SSHAccess);
+
+  // --- Phase 2: snapshots in the object store, reset -------------------------
+  //
+  // The node and the server share one object store (internal/objstore). Keys
+  // and the manifest format are internal/snapformat's: chunks/<sha256> and
+  // manifests/<chain_id>/<generation>.json.zst. A manifest describes the WHOLE
+  // disk over the base image (not a delta): restoring needs only it, the base
+  // image and the chunks it names. Nodes put and get objects, never delete
+  // them (the server's GC does).
+
+  // SnapshotVM writes the VM's disk as it is now to the object store as one
+  // manifest, under manifests/<chain_id>/<generation>.json.zst, uploading only
+  // chunks the store does not hold yet. A READY VM keeps running (its file
+  // systems are frozen for a moment); a STOPPED VM's kept disk is read
+  // offline. Any other state is FAILED_PRECONDITION.
+  //
+  // Blocks until the manifest is written; the caller sets the deadline. A
+  // failed or cancelled call loses nothing: the next SnapshotVM includes every
+  // change since the last one that succeeded. Calls for one VM are
+  // serialized. ALREADY_EXISTS when that manifest key already exists (the
+  // server picks a new generation); INVALID_ARGUMENT for an empty chain_id or
+  // a bad key part. Idempotence is the server's: it never reuses a
+  // (chain_id, generation).
+  rpc SnapshotVM(SnapshotVMRequest) returns (Generation);
+
+  // ResetVM power-cycles a READY or FAILED VM whose QEMU process is still
+  // running (hardware reset, the disk untouched) and returns once its guest
+  // agent answers again (READY), with CreateVM's blocking rules. Detached
+  // processes report LOST afterwards. FAILED_PRECONDITION for BOOTING,
+  // STOPPING, STOPPED, or a FAILED VM without a QEMU process; NOT_FOUND for
+  // an unknown VM.
+  rpc ResetVM(ResetVMRequest) returns (VM);
 }
 
 message InfoRequest {}
@@ -243,6 +275,13 @@ message CreateVMRequest {
   string from_snapshot = 4;  // empty: a fresh disk from the image
   map<string, string> env = 5;  // set for every Exec (Exec's own env wins)
   string hostname = 6;
+  // Phase 2: an object-store manifest key (snapformat.ManifestKey) to restore
+  // the disk from, on the manifest's image (image must then be empty or the
+  // same, else INVALID_ARGUMENT). Exclusive with from_snapshot
+  // (INVALID_ARGUMENT). NOT_FOUND when the manifest does not exist,
+  // FAILED_PRECONDITION when its image is not on this node. resources.disk_gib
+  // smaller than the manifest's disk is INVALID_ARGUMENT; larger grows it.
+  string from_manifest = 7;
 }
 
 message VM {
@@ -255,6 +294,18 @@ message VM {
   string error = 7;  // why FAILED
   // When the VM last became READY (CreateVM or StartVM); 0 if never.
   int64 started_at_unix_ms = 8;
+  string from_manifest = 9;  // Phase 2: as in CreateVMRequest
+  // Phase 2: whether the disk is fully local. Always set. A VM not created
+  // from a manifest is hydrated from the start. In Phase 2a restores are
+  // eager, so a READY VM is always hydrated; Phase 2b makes them lazy.
+  Hydration hydration = 10;
+}
+
+message Hydration {
+  bool hydrated = 1;
+  int64 hydrated_at_unix_ms = 2;  // 0 while not hydrated
+  uint64 chunks_done = 3;         // of the manifest's chunks, local so far
+  uint64 chunks_total = 4;
 }
 
 message GetVMRequest { string sandbox_id = 1; }
@@ -537,3 +588,33 @@ message SSHAccess {
   uint32 port = 3;
   string host_key = 4;  // the guest's ed25519 host public key, OpenSSH format
 }
+
+// --- Phase 2 messages ---------------------------------------------------------
+
+message SnapshotVMRequest {
+  string sandbox_id = 1;
+  // The chain this generation belongs to (a UUID string chosen by the
+  // server) and its position in it (0 = the chain's base).
+  string chain_id = 2;
+  uint32 generation = 3;
+  // Freeze the guest's file systems for the cut (default). false: crash
+  // consistent only, for a guest that does not answer.
+  optional bool freeze = 4;
+}
+
+// Generation describes one written manifest.
+message Generation {
+  string manifest_key = 1;   // snapformat.ManifestKey(chain_id, generation)
+  string chain_id = 2;
+  uint32 generation = 3;
+  string image = 4;          // the base image the manifest sits on
+  uint64 disk_bytes = 5;     // virtual disk size
+  uint64 chunks = 6;         // chunks the manifest lists (zero chunks included)
+  uint64 chunks_uploaded = 7;  // chunks this call put (not already in the store)
+  uint64 bytes_uploaded = 8;   // compressed bytes this call put, manifest included
+  uint64 content_bytes = 9;    // uncompressed bytes of the listed non-zero chunks
+  int64 created_at_unix_ms = 10;  // the cut (freeze) time
+  bool frozen = 11;          // the guest's file systems were frozen for the cut
+}
+
+message ResetVMRequest { string sandbox_id = 1; }

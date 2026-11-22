@@ -69,6 +69,7 @@ type pluginStore struct {
 	acquireGuard  func(context.Context, uuid.UUID, string) (*db.SandboxGuard, error)
 	completeSave  func(context.Context, db.CompleteSnapshotSaveParams) (db.SavedSnapshot, bool, error)
 	failSave      func(context.Context, db.FailSnapshotSaveParams) (db.SavedSnapshot, bool, error)
+	latest        func(context.Context, uuid.UUID, string) (db.Generation, bool, error)
 }
 
 func (s *pluginStore) SavedSnapshot(ctx context.Context, owner uuid.UUID, id uuid.UUID) (db.SavedSnapshot, error) {
@@ -104,6 +105,13 @@ func (s *pluginStore) FailSnapshotSave(ctx context.Context, p db.FailSnapshotSav
 		return db.SavedSnapshot{}, false, db.ErrJobNotLeased
 	}
 	return s.failSave(ctx, p)
+}
+
+func (s *pluginStore) LatestGeneration(ctx context.Context, owner uuid.UUID, sandboxID string) (db.Generation, bool, error) {
+	if s.latest == nil {
+		return db.Generation{}, false, nil
+	}
+	return s.latest(ctx, owner, sandboxID)
 }
 
 func (s *pluginStore) ReconcileSnapshotSaveFailure(ctx context.Context, p db.ReconcileSnapshotSaveFailureParams) (db.SavedSnapshot, bool, error) {
@@ -242,6 +250,46 @@ func TestDialNodeNilAndCloserSafety(t *testing.T) {
 			closeFn()
 			if tc.closer != nil && tc.closer.closed != tc.wantClose {
 				t.Fatalf("closes = %d, want %d", tc.closer.closed, tc.wantClose)
+			}
+		})
+	}
+}
+
+func TestValidateGenerationSaveBinding(t *testing.T) {
+	owner := uuid.NewV7()
+	sandboxID := "bx_23456789"
+	snapID := uuid.NewV7()
+	artifact := "snap-" + strings.Repeat("a", 32)
+	job := db.Job{ID: uuid.NewV7(), Kind: db.JobSaveSnapshot, OwnerID: owner,
+		SnapshotID: &snapID, SandboxID: &sandboxID}
+	payload := db.SaveSnapshotPayload{SnapshotID: snapID, VMID: sandboxID,
+		ArtifactID: artifact, Generation: 2}
+	row := db.SavedSnapshot{ID: snapID, OwnerID: owner, SandboxID: sandboxID,
+		ArtifactID: artifact, Generation: 2}
+	if err := validateGenerationSaveJob(job, payload, row); err != nil {
+		t.Fatalf("canonical binding rejected: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*db.Job, *db.SaveSnapshotPayload, *db.SavedSnapshot)
+	}{
+		{"bad artifact", func(_ *db.Job, p *db.SaveSnapshotPayload, _ *db.SavedSnapshot) { p.ArtifactID = "nope" }},
+		{"foreign owner", func(_ *db.Job, _ *db.SaveSnapshotPayload, s *db.SavedSnapshot) {
+			s.OwnerID = uuid.NewV7()
+		}},
+		{"wrong job snapshot", func(j *db.Job, _ *db.SaveSnapshotPayload, _ *db.SavedSnapshot) {
+			other := uuid.NewV7()
+			j.SnapshotID = &other
+		}},
+		{"wrong sandbox", func(_ *db.Job, p *db.SaveSnapshotPayload, _ *db.SavedSnapshot) { p.VMID = "bx_other" }},
+		{"stale generation", func(_ *db.Job, _ *db.SaveSnapshotPayload, s *db.SavedSnapshot) { s.Generation = 1 }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			j, p, s := job, payload, row
+			tc.mutate(&j, &p, &s)
+			if err := validateGenerationSaveJob(j, p, s); err == nil {
+				t.Fatal("non-canonical binding accepted")
 			}
 		})
 	}

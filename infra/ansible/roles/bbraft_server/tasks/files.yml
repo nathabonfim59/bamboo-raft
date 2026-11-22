@@ -83,6 +83,45 @@
   notify: Restart bbraft-server
   when: bbraft_server_node_tokens | length > 0
 
+# The object store is optional. s3.env carries only non-secret settings; the
+# secret access key is written alone to its own root-only file and reaches the
+# service through LoadCredential, never through ExecStart or the environment
+# file.
+- name: Create the object-store configuration directory
+  ansible.builtin.file:
+    path: "{{ bbraft_server_s3_dir }}"
+    state: directory
+    owner: "{{ bbraft_server_s3_dir_owner }}"
+    group: "{{ bbraft_server_s3_dir_group }}"
+    mode: "{{ bbraft_server_s3_dir_mode }}"
+  when: bbraft_server_s3_enabled | bool
+
+- name: Write the non-secret object-store settings
+  ansible.builtin.copy:
+    dest: "{{ bbraft_server_s3_env_file }}"
+    content: |
+      BBRAFT_S3_ENDPOINT={{ bbraft_server_s3_endpoint }}
+      BBRAFT_S3_REGION={{ bbraft_server_s3_region }}
+      BBRAFT_S3_BUCKET={{ bbraft_server_s3_bucket }}
+      BBRAFT_S3_PATH_STYLE={{ 'true' if bbraft_server_s3_path_style | bool else 'false' }}
+      BBRAFT_S3_ACCESS_KEY_ID={{ bbraft_server_s3_access_key_id }}
+    owner: "{{ bbraft_server_s3_dir_owner }}"
+    group: "{{ bbraft_server_s3_dir_group }}"
+    mode: "{{ bbraft_server_s3_env_mode }}"
+  notify: Restart bbraft-server
+  when: bbraft_server_s3_enabled | bool
+
+- name: Write the object-store secret access key
+  ansible.builtin.copy:
+    dest: "{{ bbraft_server_s3_secret_file }}"
+    content: "{{ bbraft_server_s3_secret_access_key }}\n"
+    owner: "{{ bbraft_server_s3_secret_owner }}"
+    group: "{{ bbraft_server_s3_secret_group }}"
+    mode: "{{ bbraft_server_s3_secret_mode }}"
+  no_log: true
+  notify: Restart bbraft-server
+  when: bbraft_server_s3_enabled | bool
+
 - name: Write the hardened systemd unit
   ansible.builtin.template:
     src: bbraft-server.service.j2

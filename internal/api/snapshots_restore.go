@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"uuid"
 
@@ -22,6 +23,17 @@ import (
 type SnapshotRestoreResolver interface {
 	SnapshotRestoreSource(ctx context.Context, owner uuid.UUID, name string) (db.SnapshotSource, error)
 }
+
+// SnapshotShareResolver resolves a share code to the sharer's current
+// generation. *db.Store implements it; a resolver that does not leaves share
+// codes not found.
+type SnapshotShareResolver interface {
+	SnapshotShareSource(ctx context.Context, code string) (db.SnapshotSource, error)
+}
+
+// ShareCodePrefix is the public prefix of a saved-snapshot share code. A
+// create `from` starting with it is a share, never a name.
+const ShareCodePrefix = "bsh_"
 
 // RestoreTarget is the accepted create-from policy: the immutable source plus
 // the machine shape the request asked for.
@@ -43,15 +55,42 @@ func ResolveSnapshotRestore(ctx context.Context, resolver SnapshotRestoreResolve
 	if resolver == nil || owner == uuid.Nil() || name == "" {
 		return RestoreTarget{}, snapshotNotFound()
 	}
-	source, err := resolver.SnapshotRestoreSource(ctx, owner, name)
+	share := strings.HasPrefix(name, ShareCodePrefix)
+	var (
+		source db.SnapshotSource
+		err    error
+	)
+	if share {
+		shares, ok := resolver.(SnapshotShareResolver)
+		if !ok {
+			return RestoreTarget{}, snapshotNotFound()
+		}
+		source, err = shares.SnapshotShareSource(ctx, name)
+	} else {
+		source, err = resolver.SnapshotRestoreSource(ctx, owner, name)
+	}
 	switch {
 	case errors.Is(err, db.ErrSnapshotNotFound), errors.Is(err, db.ErrSnapshotDiskUnknown):
 		return RestoreTarget{}, snapshotNotFound()
 	case err != nil:
 		return RestoreTarget{}, coreInternal()
 	}
-	if source.DiskGiB == 0 || source.OwnerID != owner || source.Name != name ||
-		!db.ValidSnapshotArtifactID(source.ArtifactID) || source.NodeID == "" {
+	if source.DiskGiB == 0 || source.OwnerID == uuid.Nil() || source.Name == "" ||
+		!db.ValidSnapshotArtifactID(source.ArtifactID) {
+		return RestoreTarget{}, snapshotNotFound()
+	}
+	if share {
+		if source.ShareID == "" || !db.ValidSnapshotShareID(source.ShareID) {
+			return RestoreTarget{}, snapshotNotFound()
+		}
+	} else if source.OwnerID != owner || source.Name != name {
+		return RestoreTarget{}, snapshotNotFound()
+	}
+	if source.GenerationBacked() {
+		if source.ManifestKey == "" || source.Image == "" || source.DiskBytes == 0 {
+			return RestoreTarget{}, snapshotNotFound()
+		}
+	} else if source.NodeID == "" {
 		return RestoreTarget{}, snapshotNotFound()
 	}
 

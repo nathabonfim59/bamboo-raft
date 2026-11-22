@@ -28,6 +28,8 @@ tags:
     description: SSH access to a running sandbox.
   - name: 'Saved snapshots'
     description: Disk snapshots that new sandboxes can start from.
+  - name: Snapshots
+    description: The snapshot generations a sandbox has captured.
 components:
   securitySchemes:
     BearerAuth:
@@ -280,6 +282,15 @@ components:
             type: { type: string, const: stop.status }
             id: { type: string }
             stop: { $ref: '#/components/schemas/StopOperation' }
+    RecoverResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [status, message]
+          properties:
+            type: { type: string, const: sandbox.recovering }
+            status: { type: string, enum: [recovering] }
+            message: { type: string }
     UpdateSandboxRequest:
       type: object
       additionalProperties: false
@@ -330,6 +341,54 @@ components:
               maximum: 2592000
             - type: 'null'
           description: Omitted keeps the configured TTL; null disables auto-stop.
+    ForkRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        labels:
+          type: object
+          additionalProperties: { type: string }
+          maxProperties: 20
+          description: Labels of the fork. The fork never takes the source's labels.
+        failFast:
+          type: boolean
+          default: false
+          description: >-
+            Fork only if a machine is ready right now. Otherwise a fork that
+            cannot be placed answers 503 no_ready_machine with nothing
+            created.
+        monitoring:
+          type: boolean
+          description: Not stored in this phase; any explicit value answers 400 invalid_json.
+        env:
+          type: object
+          additionalProperties: { type: string }
+          maxProperties: 100
+          description: >-
+            Replaces the env the fork would otherwise inherit from the source.
+            Omitted inherits the source's env (which is never exposed); an empty
+            object means no env.
+        environment:
+          type: string
+          description: Only base is supported; other names answer 400 unknown_environment.
+        noEnv: { type: boolean, default: false }
+        type:
+          type: string
+          enum: [small, default, large, xlarge]
+          description: >-
+            Machine size for the fork. Omitted inherits the source's type. A
+            type whose disk is smaller than the source's data answers 409
+            type_too_small; the fork's disk never shrinks below the source's.
+        ttlSeconds:
+          oneOf:
+            - type: integer
+              minimum: 1
+              maximum: 2592000
+            - type: 'null'
+          default: 3600
+          description: >-
+            Auto-stop for the fork. Omitted gives the one-hour default; the fork
+            never inherits the source's TTL. null disables auto-stop.
     SshKeyRequest:
       type: object
       required: [key]
@@ -394,10 +453,15 @@ components:
         from:
           type: string
           description: >-
-            Create from a saved snapshot name. Omitted type inherits the
-            snapshot's type; disk may stay the same or grow. The sandbox boots
-            only on the node that holds the immutable artifact. Missing or
-            foreign names answer 404 snapshot_not_found.
+            Create from a saved snapshot name, or from a share code (`bsh_...`)
+            another account created with
+            `POST /saved-snapshots/{name}/shares`. Omitted type inherits the
+            snapshot's type; disk may stay the same or grow. A generation-backed
+            saved snapshot boots on any node with the object store; a legacy
+            node-local one boots only on the node that holds its artifact.
+            Missing, foreign, wrong and revoked codes answer 404
+            snapshot_not_found. The new sandbox belongs to the caller and never
+            inherits the source sandbox's env.
         teamId: { type: string }
     HostedPortRequest:
       type: object
@@ -650,6 +714,10 @@ components:
       enum: [saving, ready, failed]
     SavedSnapshot:
       type: object
+      description: >-
+        One named saved snapshot. With an object store it pins a completed disk
+        generation and restores on any node; a legacy row keeps its node-local
+        artifact until deleted.
       required: [name, status, sourceSandboxId, createdAt]
       properties:
         name:
@@ -721,6 +789,136 @@ components:
             type: { type: string, const: snapshot.saved.deleted }
             name: { type: string }
             status: { type: string, const: deleted }
+    NamedSnapshotShare:
+      type: object
+      description: >-
+        A share code for a saved snapshot. The code itself is shown only in the
+        response that creates it; only its hash is stored.
+      required: [id, codePrefix, status, useCount, lastUsedAt, revokedAt, createdAt]
+      properties:
+        id:
+          type: string
+          pattern: '^shr_[a-f0-9]{32}$'
+        codePrefix:
+          type: string
+          description: The stored first characters of the code, for example `bsh_xxxxxxxx`.
+        status: { type: string, enum: [active, revoked] }
+        useCount: { type: integer, minimum: 0 }
+        lastUsedAt: { type: [string, 'null'], format: date-time }
+        revokedAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+    NamedSnapshotShareCreatedResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [name, shareCode, share]
+          properties:
+            type: { type: string, const: snapshot.share.created }
+            name: { type: string }
+            shareCode:
+              type: string
+              description: The full `bsh_...` code, shown only in this response.
+            share: { $ref: '#/components/schemas/NamedSnapshotShare' }
+    NamedSnapshotShareListResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [name, shares]
+          properties:
+            type: { type: string, const: snapshot.share.list }
+            name: { type: string }
+            shares:
+              type: array
+              items: { $ref: '#/components/schemas/NamedSnapshotShare' }
+    NamedSnapshotShareRevokedResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [name, share]
+          properties:
+            type: { type: string, const: snapshot.share.revoked }
+            name: { type: string }
+            share: { $ref: '#/components/schemas/NamedSnapshotShare' }
+    SnapshotStatus:
+      type: string
+      enum: [completed]
+    SnapshotSummary:
+      type: object
+      description: >-
+        One completed snapshot generation of a sandbox disk. Failed and pending
+        attempts never appear.
+      required: [id, sandboxId, status, kind, generation, chainId, createdAt, completedAt, sizeBytes, fileCount, contentSizeBytes, contentFileCount, origin]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Immutable snapshot id.
+        sandboxId:
+          type: string
+          description: Public id of the sandbox this snapshot belongs to.
+        status: { $ref: '#/components/schemas/SnapshotStatus' }
+        kind:
+          type: [string, 'null']
+          enum: [base, incremental, null]
+          description: >-
+            `base` for the first generation of a chain, `incremental` for each
+            later one. This server always sets it.
+        generation:
+          type: [integer, 'null']
+          description: Position in the chain; 0 is the base generation.
+        chainId:
+          type: [string, 'null']
+          format: uuid
+          description: Identifier of the chain this generation belongs to.
+        createdAt:
+          type: string
+          format: date-time
+          description: When the sandbox disk was captured.
+        completedAt:
+          type: [string, 'null']
+          format: date-time
+          description: When the snapshot finished uploading.
+        sizeBytes:
+          type: [integer, 'null']
+          description: Bytes this generation added to the chain, not the full restored size.
+        fileCount:
+          type: [integer, 'null']
+          description: Always null; these snapshots carry no file inventory.
+        contentSizeBytes:
+          type: [integer, 'null']
+          description: Bytes of the sandbox's own data this snapshot restores, base image excluded.
+        contentFileCount:
+          type: [integer, 'null']
+          description: Always null, for the same reason as `fileCount`.
+        origin:
+          type: string
+          enum: [captured, template]
+          description: >-
+            `captured` for a generation this sandbox took itself. This server
+            always returns captured.
+    SnapshotListResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [snapshots, pageInfo]
+          properties:
+            type: { type: string, const: snapshot.list }
+            snapshots:
+              type: array
+              items: { $ref: '#/components/schemas/SnapshotSummary' }
+            pageInfo: { $ref: '#/components/schemas/PageInfo' }
+    SnapshotLatestResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessBase'
+        - type: object
+          required: [snapshot]
+          properties:
+            type: { type: string, const: snapshot.latest }
+            snapshot:
+              description: The newest completed generation, or null when the sandbox has none.
+              oneOf:
+                - $ref: '#/components/schemas/SnapshotSummary'
+                - type: 'null'
     FileEncoding:
       type: string
       enum: [utf8, base64]
@@ -1029,7 +1227,13 @@ paths:
         and ttlSeconds are applied; environment accepts only base, and noEnv is
         refused. Shrinking below the retained disk answers 409
         type_too_small; a resume that cannot take over an in-flight stop answers
-        409 sandbox_stopping.
+        409 sandbox_stopping. A sandbox created with snapshots off has its disk
+        erased by its stop and answers 409 snapshots_disabled once stopping or
+        stopped. With an object store configured, a stopped sandbox whose node
+        is full or unreachable, or whose disk is no longer on any node, resumes
+        on another node from its last completed snapshot; its data having
+        expired answers 409 snapshot_data_expired, and having neither a local
+        disk nor a snapshot answers 409 resume_failed.
       operationId: resume
       requestBody:
         required: false
@@ -1048,6 +1252,68 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalServerError' }
         '503': { $ref: '#/components/responses/NoReadyMachine' }
+  /sandboxes/{sandboxId}/fork:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      tags: [Lifecycle]
+      summary: Fork sandbox
+      description: >-
+        Create a new sandbox from an existing one on a fresh snapshot chain. A
+        ready source is snapshotted under its own guard first, so the fork sees
+        every file written before the call; a stopped source restores its
+        latest completed snapshot. The source keeps running and is never
+        modified. The fork inherits the source's type and env unless the request
+        replaces them, and never inherits the source's labels or TTL. A source
+        created with snapshots off answers 409 snapshots_disabled (also when
+        the installation has no object store), one whose stored data expired
+        409 snapshot_data_expired, and a starting or stopping one 409
+        sandbox_resuming or sandbox_stopping. Send an Idempotency-Key header to
+        make the call safe to retry after a lost response.
+      operationId: fork
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ForkRequest' }
+      responses:
+        '202':
+          description: Fork started; the response id is the new forked sandbox id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SandboxActionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+        '503': { $ref: '#/components/responses/NoReadyMachine' }
+  /sandboxes/{sandboxId}/recover:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      tags: [Lifecycle]
+      summary: Recover an unresponsive sandbox
+      description: >-
+        Power-cycle the virtual machine of a sandbox whose guest agent stopped
+        answering, keeping its disk intact. Refused with 409 when the sandbox
+        has no running machine (no_machine), was recovered within the last 10
+        minutes (too_soon), answers a reachability probe
+        (sandbox_is_reachable), sits on an unreachable node
+        (recover_unsupported), or failed to reset (reset_failed).
+      operationId: recover
+      responses:
+        '200':
+          description: Recovery accepted; the virtual machine is being power-cycled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecoverResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
   /sandboxes/{sandboxId}/sshkey:
     parameters:
       - $ref: '#/components/parameters/SandboxId'
@@ -1513,3 +1779,119 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalServerError' }
+  /saved-snapshots/{name}/shares:
+    parameters:
+      - $ref: '#/components/parameters/SnapshotName'
+    get:
+      tags: ['Saved snapshots']
+      summary: List share codes of a saved snapshot
+      operationId: listSnapshotShares
+      responses:
+        '200':
+          description: The snapshot's share codes, active and revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NamedSnapshotShareListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    post:
+      tags: ['Saved snapshots']
+      summary: Share a saved snapshot
+      operationId: createSnapshotShare
+      responses:
+        '201':
+          description: Code created; the full code is only in this response.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NamedSnapshotShareCreatedResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /saved-snapshots/{name}/shares/{shareId}:
+    parameters:
+      - $ref: '#/components/parameters/SnapshotName'
+      - name: shareId
+        in: path
+        required: true
+        schema: { type: string, pattern: '^shr_[a-f0-9]{32}$' }
+    delete:
+      tags: ['Saved snapshots']
+      summary: Revoke a share code
+      operationId: revokeSnapshotShare
+      responses:
+        '200':
+          description: Revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NamedSnapshotShareRevokedResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+  /snapshots:
+    get:
+      tags: [Snapshots]
+      summary: List snapshots
+      description: >-
+        List the completed snapshot generations of the account's live sandboxes.
+        Each generation is one position in a sandbox's chain: generation 0 is
+        the base and every later one adds a delta. Pending and failed attempts
+        are never listed, and neither is a generation whose stored data has
+        been purged. Follow `pageInfo.nextCursor` to walk the whole history.
+        An unknown query parameter answers `400 invalid_query` and names it.
+      operationId: listSnapshots
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Sort'
+      responses:
+        '200':
+          description: Completed snapshot generations owned by the authenticated account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SnapshotListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /sandboxes/{sandboxId}/snapshots:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    get:
+      tags: [Snapshots]
+      summary: List a sandbox's snapshots
+      description: >-
+        List the completed snapshot generations of one sandbox, newest first
+        unless `sort=asc`, with the same cursor pagination as `GET /snapshots`.
+        A missing or foreign sandbox answers `404`.
+      operationId: listSandboxSnapshots
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Sort'
+      responses:
+        '200':
+          description: Completed snapshot generations of this sandbox.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SnapshotListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /sandboxes/{sandboxId}/snapshots/latest:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    get:
+      tags: [Snapshots]
+      summary: Get a sandbox's latest snapshot
+      description: >-
+        Return the most recent completed snapshot generation of one sandbox, or
+        an explicit null when it has none. A missing or foreign sandbox answers
+        `404`.
+      operationId: getLatestSandboxSnapshot
+      responses:
+        '200':
+          description: The newest completed generation, or an explicit null.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SnapshotLatestResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }

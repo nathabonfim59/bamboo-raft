@@ -43,9 +43,13 @@ func (m *Manager) StopVM(ctx context.Context, req *nodev1.StopVMRequest) (*nodev
 		}
 		switch v.state {
 		case nodev1.VMState_VM_STATE_STOPPED:
-			out := v.cloneVM()
-			v.mu.Unlock()
-			return out, nil
+			// A record whose restart recovery could not prove ownership is
+			// never vouched for: it takes the gate and resolves first.
+			if !v.ownershipUnresolved {
+				out := v.cloneVM()
+				v.mu.Unlock()
+				return out, nil
+			}
 		case nodev1.VMState_VM_STATE_BOOTING:
 			// CreateVM or StartVM is in flight; the frozen contract makes
 			// the caller retry after the boot ends.
@@ -64,7 +68,8 @@ func (m *Manager) StopVM(ctx context.Context, req *nodev1.StopVMRequest) (*nodev
 			continue
 		}
 		v.mu.Unlock()
-		// READY or FAILED: serialize with snapshots, starts and deletes.
+		// READY, FAILED or a STOPPED-looking record whose ownership is
+		// unresolved: serialize with snapshots, starts and deletes.
 		if err := acquireVMOperation(ctx, v); err != nil {
 			return nil, err
 		}
@@ -78,6 +83,12 @@ func (m *Manager) StopVM(ctx context.Context, req *nodev1.StopVMRequest) (*nodev
 // state is re-checked after the gate: a stop, start or save may have finished
 // while this caller waited for it.
 func (m *Manager) ownStop(v *vm, grace time.Duration) (*nodev1.VM, error) {
+	// An unresolved record stops only after its QEMU is proven gone or owned;
+	// otherwise a nil process would commit STOPPED while that QEMU may still
+	// be writing the disk.
+	if err := m.requireResolved(v); err != nil {
+		return nil, err
+	}
 	v.mu.Lock()
 	switch {
 	case v.deleting:
@@ -335,6 +346,13 @@ func (m *Manager) StartVM(ctx context.Context, req *nodev1.StartVMRequest) (*nod
 			m.beforeStartGate()
 		}
 		if err := acquireVMOperation(ctx, v); err != nil {
+			return nil, err
+		}
+		// A STOPPED-looking record whose restart recovery could not prove
+		// ownership must resolve first: booting it could put a second QEMU
+		// on the same disk.
+		if err := m.requireResolved(v); err != nil {
+			releaseVMOperation(v)
 			return nil, err
 		}
 		out, claimGen, err := m.ownStart(v, req)

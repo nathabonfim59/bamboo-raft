@@ -64,11 +64,24 @@ type Store interface {
 	NodesWithCapacity(ctx context.Context, need db.Resources, freshWithin time.Duration) ([]db.Node, error)
 	CreateSandbox(ctx context.Context, p db.CreateSandboxParams) (db.CreateSandboxResult, error)
 	ReplayCreateSandbox(ctx context.Context, owner uuid.UUID, key string, requestSHA256 []byte) (db.CreateSandboxResult, bool, error)
+	// CreateSandboxes and ReplayCreateSandboxBatch are the all-or-nothing
+	// batch create and its keyed replay (AdmitBatch).
+	CreateSandboxes(ctx context.Context, ps []db.CreateSandboxParams) ([]db.CreateSandboxResult, error)
+	ReplayCreateSandboxBatch(ctx context.Context, owner uuid.UUID, key string, requestSHA256 []byte) ([]db.CreateSandboxResult, bool, error)
 	// Sandbox reads one owner-visible sandbox row; resume admission uses it
 	// to find the node that holds the retained disk.
 	Sandbox(ctx context.Context, owner uuid.UUID, id string) (db.Sandbox, error)
 	// AcceptSandboxResume performs the atomic same-node resume admission.
 	AcceptSandboxResume(ctx context.Context, p db.ResumeParams) (db.ResumeAcceptance, error)
+}
+
+// ResumeElsewhereStore is the database surface of resuming an archived
+// sandbox on another node from its last completed generation.
+// *db.Store implements it.
+type ResumeElsewhereStore interface {
+	LatestGeneration(ctx context.Context, owner uuid.UUID, sandboxID string) (db.Generation, bool, error)
+	OpenEvictionNodes(ctx context.Context, owner uuid.UUID, sandboxID string) ([]string, error)
+	AcceptSandboxResumeElsewhere(ctx context.Context, p db.ResumeElsewhereParams) (db.ResumeAcceptance, error)
 }
 
 // NodeClient is the narrow node surface placement probes. The accepted
@@ -98,6 +111,11 @@ type Options struct {
 	FreshWithin    time.Duration // DefaultFreshWithin when zero
 	ProbeTimeout   time.Duration // DefaultProbeTimeout when zero
 	FailFastBudget time.Duration // DefaultFailFastBudget when zero
+
+	// ResumeElsewhere enables resume on another node; set it only
+	// when an object store is configured. Nil keeps resume same-node only
+	// (Phase 1 behaviour).
+	ResumeElsewhere ResumeElsewhereStore
 }
 
 // Scheduler performs placement and atomic admission. It is safe for
@@ -110,6 +128,7 @@ type Scheduler struct {
 	freshWithin    time.Duration
 	probeTimeout   time.Duration
 	failFastBudget time.Duration
+	elsewhere      ResumeElsewhereStore
 }
 
 // New validates opts and returns a scheduler.
@@ -134,6 +153,7 @@ func New(opts Options) (*Scheduler, error) {
 		freshWithin:    cmp.Or(opts.FreshWithin, DefaultFreshWithin),
 		probeTimeout:   cmp.Or(opts.ProbeTimeout, DefaultProbeTimeout),
 		failFastBudget: cmp.Or(opts.FailFastBudget, DefaultFailFastBudget),
+		elsewhere:      opts.ResumeElsewhere,
 	}, nil
 }
 
@@ -174,6 +194,21 @@ type AdmitRequest struct {
 	// did not, the resolver inherits the snapshot's canonical type.
 	From         string
 	TypeExplicit bool
+
+	// SnapshotsEnabled is the create's snapshots member; nil means on.
+	SnapshotsEnabled *bool
+
+	// Source, when set, restores the disk from one completed object-store
+	// generation on any placed node (exclusive with Restore and From): the
+	// disk reservation is grown to the generation's disk, placement keeps
+	// only nodes with its image and a usable object store and ranks
+	// Source.Prefer first, and the sandbox gets a new chain.
+	Source *GenerationSource
+
+	// ShareID is the snapshot_shares row that authorized a cross-account
+	// restore (empty for an own-name restore). It travels with the create
+	// so the same transaction records the use, never the resolution.
+	ShareID string
 }
 
 // Admit places and atomically creates one sandbox. The idempotency replay is
@@ -252,52 +287,48 @@ func (s *Scheduler) Admit(ctx context.Context, req AdmitRequest) (db.CreateSandb
 		req.Restore = &source
 		req.MachineType = machine
 		req.Reserve = reserve
+		req.ShareID = source.ShareID
+		if req.Name == "" {
+			req.Name = source.Name
+		}
+		// A generation-backed saved snapshot restores from the object store
+		// on any placed node; only a legacy node-local artifact stays pinned
+		// to its recorded node.
+		if source.GenerationBacked() {
+			req.Source = generationSourceFromSnapshot(source)
+			req.Restore = nil
+			req.Reserve = sourceReserve(req)
+		}
 	}
 
 	if req.Restore != nil {
+		if req.Source != nil {
+			return db.CreateSandboxResult{}, errors.New("scheduler: admit takes a saved snapshot or a generation, not both")
+		}
 		return s.admitRestore(ctx, callerCtx, req)
 	}
 
-	nodes, err := s.store.NodesWithCapacity(ctx, req.Reserve, s.freshWithin)
-	if err != nil {
-		if req.IdempotencyKey != "" {
-			if res, found, rerr := s.finalReplay(callerCtx, ctx, req); rerr == nil && found {
-				return res, nil
-			}
-		}
-		return db.CreateSandboxResult{}, fmt.Errorf("scheduler: list nodes: %w", err)
+	place := PlaceRequest{Reserve: req.Reserve}
+	if req.Source != nil {
+		req.Reserve = sourceReserve(req)
+		place = sourcePlacement(req)
 	}
-
-	var probed int
-	for _, node := range nodes {
-		if ctx.Err() != nil {
-			break // failFast budget spent; do not start another probe
+	cands, err := s.Place(ctx, place)
+	if err != nil {
+		// A duplicate may have committed while placement ran; replay
+		// before answering capacity or connectivity failure. When a
+		// failFast deadline already fired, this last check gets its own
+		// small budget: hiding a replay behind the admission deadline
+		// would create a second sandbox on a client retry.
+		if res, found, rerr := s.finalReplay(callerCtx, ctx, req); rerr == nil && found {
+			return res, nil
+		} else if rerr != nil && (errors.Is(err, ErrNoCapacity) || errors.Is(err, ErrNoNode)) {
+			return db.CreateSandboxResult{}, rerr
 		}
-		info, err := s.probe(ctx, node.ID)
-		if err != nil {
-			s.log.Warn("placement probe failed", "node", node.ID, "reason", probeReason(err))
-			continue
-		}
-		probed++
-		if !fits(info, req.Reserve) {
-			s.logNoRoom("placement", node.ID, capacityShortfalls(info, req.Reserve))
-			continue
-		}
-		res, err := s.store.CreateSandbox(ctx, db.CreateSandboxParams{
-			ID:             req.ID,
-			Owner:          req.Owner,
-			MachineType:    req.MachineType,
-			Name:           req.Name,
-			Labels:         req.Labels,
-			Env:            req.Env,
-			ExpiresAt:      req.ExpiresAt,
-			TTLSeconds:     req.TTLSeconds,
-			NodeID:         node.ID,
-			Reserve:        req.Reserve,
-			MaxAttempts:    req.MaxAttempts,
-			IdempotencyKey: req.IdempotencyKey,
-			RequestSHA256:  req.RequestSHA256,
-		})
+		return db.CreateSandboxResult{}, err
+	}
+	for _, c := range cands {
+		res, err := s.store.CreateSandbox(ctx, createParams(req, c.Node.ID))
 		if err == nil {
 			return res, nil
 		}
@@ -306,27 +337,12 @@ func (s *Scheduler) Admit(ctx context.Context, req AdmitRequest) (db.CreateSandb
 		}
 		// Another create won this node's last slot (or the node row
 		// vanished). Try the next candidate.
-		s.log.Warn("reservation lost", "node", node.ID, "reason", probeReason(err))
+		s.log.Warn("reservation lost", "node", c.Node.ID, "reason", probeReason(err))
 	}
-
-	// A duplicate may have committed while placement ran; replay before
-	// answering capacity or connectivity failure. When a failFast deadline
-	// already fired, this last check gets its own small budget: hiding a
-	// replay behind the admission deadline would create a second sandbox
-	// on a client retry.
 	if res, found, err := s.finalReplay(callerCtx, ctx, req); err != nil {
 		return db.CreateSandboxResult{}, err
 	} else if found {
 		return res, nil
-	}
-	if len(nodes) == 0 {
-		return db.CreateSandboxResult{}, ErrNoCapacity
-	}
-	if probed == 0 {
-		if ctx.Err() != nil {
-			return db.CreateSandboxResult{}, errors.Join(ErrNoNode, ctx.Err())
-		}
-		return db.CreateSandboxResult{}, ErrNoNode
 	}
 	return db.CreateSandboxResult{}, ErrNoCapacity
 }
@@ -363,20 +379,22 @@ func (s *Scheduler) admitRestore(ctx, callerCtx context.Context, req AdmitReques
 		return db.CreateSandboxResult{}, ErrNoCapacity
 	}
 	res, err := s.store.CreateSandbox(ctx, db.CreateSandboxParams{
-		ID:             req.ID,
-		Owner:          req.Owner,
-		MachineType:    req.MachineType,
-		Name:           req.Name,
-		Labels:         req.Labels,
-		Env:            req.Env,
-		ExpiresAt:      req.ExpiresAt,
-		TTLSeconds:     req.TTLSeconds,
-		NodeID:         source.NodeID,
-		Reserve:        req.Reserve,
-		MaxAttempts:    req.MaxAttempts,
-		IdempotencyKey: req.IdempotencyKey,
-		RequestSHA256:  req.RequestSHA256,
-		Restore:        source,
+		ID:               req.ID,
+		Owner:            req.Owner,
+		MachineType:      req.MachineType,
+		Name:             req.Name,
+		Labels:           req.Labels,
+		Env:              req.Env,
+		ExpiresAt:        req.ExpiresAt,
+		TTLSeconds:       req.TTLSeconds,
+		NodeID:           source.NodeID,
+		Reserve:          req.Reserve,
+		MaxAttempts:      req.MaxAttempts,
+		IdempotencyKey:   req.IdempotencyKey,
+		RequestSHA256:    req.RequestSHA256,
+		Restore:          source,
+		SnapshotsEnabled: req.SnapshotsEnabled,
+		ShareID:          source.ShareID,
 	})
 	switch {
 	case err == nil:

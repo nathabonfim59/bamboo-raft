@@ -68,6 +68,8 @@ const (
 	Node_MoveFile_FullMethodName       = "/bbraft.node.v1.Node/MoveFile"
 	Node_ChmodFile_FullMethodName      = "/bbraft.node.v1.Node/ChmodFile"
 	Node_AddSSHKey_FullMethodName      = "/bbraft.node.v1.Node/AddSSHKey"
+	Node_SnapshotVM_FullMethodName     = "/bbraft.node.v1.Node/SnapshotVM"
+	Node_ResetVM_FullMethodName        = "/bbraft.node.v1.Node/ResetVM"
 )
 
 // NodeClient is the client API for Node service.
@@ -189,6 +191,27 @@ type NodeClient interface {
 	// one valid public key line (no options, no newlines). UNAVAILABLE while the
 	// guest's host key does not exist yet.
 	AddSSHKey(ctx context.Context, in *AddSSHKeyRequest, opts ...grpc.CallOption) (*SSHAccess, error)
+	// SnapshotVM writes the VM's disk as it is now to the object store as one
+	// manifest, under manifests/<chain_id>/<generation>.json.zst, uploading only
+	// chunks the store does not hold yet. A READY VM keeps running (its file
+	// systems are frozen for a moment); a STOPPED VM's kept disk is read
+	// offline. Any other state is FAILED_PRECONDITION.
+	//
+	// Blocks until the manifest is written; the caller sets the deadline. A
+	// failed or cancelled call loses nothing: the next SnapshotVM includes every
+	// change since the last one that succeeded. Calls for one VM are
+	// serialized. ALREADY_EXISTS when that manifest key already exists (the
+	// server picks a new generation); INVALID_ARGUMENT for an empty chain_id or
+	// a bad key part. Idempotence is the server's: it never reuses a
+	// (chain_id, generation).
+	SnapshotVM(ctx context.Context, in *SnapshotVMRequest, opts ...grpc.CallOption) (*Generation, error)
+	// ResetVM power-cycles a READY or FAILED VM whose QEMU process is still
+	// running (hardware reset, the disk untouched) and returns once its guest
+	// agent answers again (READY), with CreateVM's blocking rules. Detached
+	// processes report LOST afterwards. FAILED_PRECONDITION for BOOTING,
+	// STOPPING, STOPPED, or a FAILED VM without a QEMU process; NOT_FOUND for
+	// an unknown VM.
+	ResetVM(ctx context.Context, in *ResetVMRequest, opts ...grpc.CallOption) (*VM, error)
 }
 
 type nodeClient struct {
@@ -459,6 +482,26 @@ func (c *nodeClient) AddSSHKey(ctx context.Context, in *AddSSHKeyRequest, opts .
 	return out, nil
 }
 
+func (c *nodeClient) SnapshotVM(ctx context.Context, in *SnapshotVMRequest, opts ...grpc.CallOption) (*Generation, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Generation)
+	err := c.cc.Invoke(ctx, Node_SnapshotVM_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeClient) ResetVM(ctx context.Context, in *ResetVMRequest, opts ...grpc.CallOption) (*VM, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VM)
+	err := c.cc.Invoke(ctx, Node_ResetVM_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeServer is the server API for Node service.
 // All implementations must embed UnimplementedNodeServer
 // for forward compatibility.
@@ -578,6 +621,27 @@ type NodeServer interface {
 	// one valid public key line (no options, no newlines). UNAVAILABLE while the
 	// guest's host key does not exist yet.
 	AddSSHKey(context.Context, *AddSSHKeyRequest) (*SSHAccess, error)
+	// SnapshotVM writes the VM's disk as it is now to the object store as one
+	// manifest, under manifests/<chain_id>/<generation>.json.zst, uploading only
+	// chunks the store does not hold yet. A READY VM keeps running (its file
+	// systems are frozen for a moment); a STOPPED VM's kept disk is read
+	// offline. Any other state is FAILED_PRECONDITION.
+	//
+	// Blocks until the manifest is written; the caller sets the deadline. A
+	// failed or cancelled call loses nothing: the next SnapshotVM includes every
+	// change since the last one that succeeded. Calls for one VM are
+	// serialized. ALREADY_EXISTS when that manifest key already exists (the
+	// server picks a new generation); INVALID_ARGUMENT for an empty chain_id or
+	// a bad key part. Idempotence is the server's: it never reuses a
+	// (chain_id, generation).
+	SnapshotVM(context.Context, *SnapshotVMRequest) (*Generation, error)
+	// ResetVM power-cycles a READY or FAILED VM whose QEMU process is still
+	// running (hardware reset, the disk untouched) and returns once its guest
+	// agent answers again (READY), with CreateVM's blocking rules. Detached
+	// processes report LOST afterwards. FAILED_PRECONDITION for BOOTING,
+	// STOPPING, STOPPED, or a FAILED VM without a QEMU process; NOT_FOUND for
+	// an unknown VM.
+	ResetVM(context.Context, *ResetVMRequest) (*VM, error)
 	mustEmbedUnimplementedNodeServer()
 }
 
@@ -656,6 +720,12 @@ func (UnimplementedNodeServer) ChmodFile(context.Context, *ChmodFileRequest) (*F
 }
 func (UnimplementedNodeServer) AddSSHKey(context.Context, *AddSSHKeyRequest) (*SSHAccess, error) {
 	return nil, status.Error(codes.Unimplemented, "method AddSSHKey not implemented")
+}
+func (UnimplementedNodeServer) SnapshotVM(context.Context, *SnapshotVMRequest) (*Generation, error) {
+	return nil, status.Error(codes.Unimplemented, "method SnapshotVM not implemented")
+}
+func (UnimplementedNodeServer) ResetVM(context.Context, *ResetVMRequest) (*VM, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResetVM not implemented")
 }
 func (UnimplementedNodeServer) mustEmbedUnimplementedNodeServer() {}
 func (UnimplementedNodeServer) testEmbeddedByValue()              {}
@@ -1060,6 +1130,42 @@ func _Node_AddSSHKey_Handler(srv interface{}, ctx context.Context, dec func(inte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Node_SnapshotVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SnapshotVMRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServer).SnapshotVM(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Node_SnapshotVM_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServer).SnapshotVM(ctx, req.(*SnapshotVMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Node_ResetVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResetVMRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServer).ResetVM(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Node_ResetVM_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServer).ResetVM(ctx, req.(*ResetVMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Node_ServiceDesc is the grpc.ServiceDesc for Node service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1142,6 +1248,14 @@ var Node_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AddSSHKey",
 			Handler:    _Node_AddSSHKey_Handler,
+		},
+		{
+			MethodName: "SnapshotVM",
+			Handler:    _Node_SnapshotVM_Handler,
+		},
+		{
+			MethodName: "ResetVM",
+			Handler:    _Node_ResetVM_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

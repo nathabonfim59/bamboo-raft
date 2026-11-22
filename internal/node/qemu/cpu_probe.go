@@ -52,6 +52,10 @@ type CPUProbeEvidence struct {
 	CPUs        int
 	QEMUVersion string
 	PID         int
+	// Phase2 is the probe QEMU's Phase 2 schema check (CheckPhase2Schema),
+	// nil when the schema could not be read: the node then checks on the
+	// first VM's QMP connection instead.
+	Phase2 *Phase2Support
 }
 
 // probeStatus is query-status's StatusInfo (QEMU qapi/run-state.json). Pointer
@@ -213,6 +217,16 @@ func ProbeCPU(ctx context.Context, option CPUOption, opts CPUProbeOptions) (CPUP
 		}
 	}
 
+	// The Phase 2 capability gate reads the same binary's schema here, so
+	// no extra QEMU is launched for it. A failed read is not a probe
+	// failure: it only defers the check.
+	var phase2 *Phase2Support
+	if err == nil {
+		if s, serr := CheckPhase2Schema(probeCtx, client); serr == nil {
+			phase2 = &s
+		}
+	}
+
 	// Only a verified peer receives quit.
 	var stopClient *qmp.Client
 	if peerVerified {
@@ -234,6 +248,7 @@ func ProbeCPU(ctx context.Context, option CPUOption, opts CPUProbeOptions) (CPUP
 		CPUs:        1,
 		QEMUVersion: client.Greeting().Version.String(),
 		PID:         cmd.Process.Pid,
+		Phase2:      phase2,
 	}, nil
 }
 

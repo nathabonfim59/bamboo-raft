@@ -1,0 +1,15 @@
+#!/bin/sh
+# Test double for the garage CLI. It answers the one read-only probe the
+# credentials task makes, so the render test never needs a real Garage.
+set -eu
+
+case "$*" in
+    *"key info"*--show-secret*)
+        printf 'Key ID: GKtestaccesskeyid\n'
+        printf 'Secret key: SENTINEL-garage-secret-7a1c\n'
+        ;;
+    *)
+        printf 'garage test double: unsupported arguments: %s\n' "$*" >&2
+        exit 2
+        ;;
+esac

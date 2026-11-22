@@ -40,6 +40,10 @@ type SavedSnapshot struct {
 	IsCurrent    bool
 	Pins         int
 	CleanupError string
+	// GenerationID is the object-store generation this row deploys; nil for a
+	// legacy node-local saved snapshot. A generation-backed row has no node
+	// artifact (NodeID is nil).
+	GenerationID *uuid.UUID
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	ReadyAt      *time.Time
@@ -51,6 +55,11 @@ type SavedSnapshot struct {
 // SnapshotSource is the immutable restore input resolved from a saved-snapshot
 // name. The create transaction revalidates every field against the locked row;
 // it is not trusted on its own.
+//
+// A legacy source names a node artifact (ArtifactID, NodeID) and restores only
+// on that node. A generation-backed source names one completed object-store
+// generation (GenerationID, ManifestKey, Image, DiskBytes) and restores on any
+// node with the object store; NodeID is then only the locality preference.
 type SnapshotSource struct {
 	RowID           uuid.UUID
 	OwnerID         uuid.UUID
@@ -62,18 +71,34 @@ type SnapshotSource struct {
 	DiskGiB         uint64
 	SizeBytes       *int64
 	Generation      int64
+
+	// GenerationID, ManifestKey, Image and DiskBytes describe a
+	// generation-backed source and are zero for a legacy one.
+	GenerationID *uuid.UUID
+	ManifestKey  string
+	Image        string
+	DiskBytes    uint64
+
+	// ShareID is the share-code row that authorized this restore when the
+	// caller is not the snapshot's owner. Empty for an own-name restore.
+	ShareID string
 }
+
+// GenerationBacked reports whether the source restores from an object-store
+// generation rather than one node-local artifact.
+func (s SnapshotSource) GenerationBacked() bool { return s.GenerationID != nil }
 
 const snapshotCols = `id, owner_id, name, sandbox_id, status, artifact_id, generation,
 	machine_type, disk_gib, size_bytes, error_reason, node_id, is_current, pins, cleanup_error,
-	created_at, updated_at, ready_at, retired_at, purged_at, deleted_at`
+	created_at, updated_at, ready_at, retired_at, purged_at, deleted_at, generation_id`
 
 func scanSnapshot(row scanner) (SavedSnapshot, error) {
 	var s SavedSnapshot
 	err := row.Scan(&s.ID, &s.OwnerID, &s.Name, &s.SandboxID, &s.Status, &s.ArtifactID,
 		&s.Generation, &s.MachineType, &s.DiskGiB, &s.SizeBytes, &s.ErrorReason, &s.NodeID,
 		&s.IsCurrent, &s.Pins, &s.CleanupError,
-		&s.CreatedAt, &s.UpdatedAt, &s.ReadyAt, &s.RetiredAt, &s.PurgedAt, &s.DeletedAt)
+		&s.CreatedAt, &s.UpdatedAt, &s.ReadyAt, &s.RetiredAt, &s.PurgedAt, &s.DeletedAt,
+		&s.GenerationID)
 	return s, err
 }
 

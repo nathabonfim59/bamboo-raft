@@ -145,7 +145,7 @@ func coreCompatAssert(t *testing.T, validators []*compat.Validator, operationID 
 	}
 	for _, validator := range validators {
 		if err := validator.Response(operationID, status, recorder.Header(), recorder.Body.Bytes()); err != nil {
-			t.Errorf("%s %d failed pinned/subset validation", operationID, status)
+			t.Errorf("%s %d failed pinned/subset validation: %v", operationID, status, err)
 		}
 	}
 }

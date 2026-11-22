@@ -1,0 +1,9 @@
+# YAML 1.1 unquoted on/off are not booleans here; a string must be refused
+# instead of being truthily coerced into -s3.path-style.
+bbraft_node_s3:
+  endpoint: http://203.0.113.20:3900
+  region: garage
+  bucket: bbraft
+  path_style: "true"
+  access_key_id: GKinvalid
+bbraft_node_s3_secret_access_key: placeholder-remote-secret-not-real

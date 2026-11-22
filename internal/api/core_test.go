@@ -99,6 +99,8 @@ func coreSandboxFromRequest(request AdmissionRequest, state db.SandboxState) db.
 		Labels:      request.Labels,
 		CreatedAt:   coreFixedNow,
 		UpdatedAt:   coreFixedNow,
+		// nil means on, as CreateSandbox stores it.
+		SnapshotsEnabled: request.SnapshotsEnabled == nil || *request.SnapshotsEnabled,
 	}
 	if request.TTLSeconds != nil {
 		expiresAt := coreFixedNow.Add(time.Duration(*request.TTLSeconds) * time.Second)
@@ -431,13 +433,15 @@ func TestCoreCreateValidation(t *testing.T) {
 		{name: "env NUL", body: `{"env":{"A":"x\u0000y"}}`, status: http.StatusBadRequest, code: apierr.CodeInvalidEnv},
 		{name: "env aggregate", body: coreBodyWithEnvBytes(4, 20<<10), status: http.StatusBadRequest, code: apierr.CodeInvalidEnv},
 		{name: "environment", body: `{"environment":"custom"}`, status: http.StatusBadRequest, code: apierr.CodeUnknownEnvironment},
-		{name: "snapshots true", body: `{"snapshots":true}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
-		{name: "snapshots false", body: `{"snapshots":false}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
+		{name: "snapshots null", body: `{"snapshots":null}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
+		{name: "snapshots string", body: `{"snapshots":"false"}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
 		{name: "monitoring true", body: `{"monitoring":true}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
 		{name: "monitoring false", body: `{"monitoring":false}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
-		{name: "count one", body: `{"count":1}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
+		{name: "count one", body: `{"count":1}`, status: http.StatusBadRequest, code: apierr.CodeCountRequiresFrom},
 		{name: "count zero", body: `{"count":0}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
-		{name: "count two", body: `{"count":2}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
+		{name: "count two", body: `{"count":2}`, status: http.StatusBadRequest, code: apierr.CodeCountRequiresFrom},
+		{name: "count over maximum", body: `{"count":1001,"from":"base"}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
+		{name: "count with failFast", body: `{"count":2,"from":"base","failFast":true}`, status: http.StatusBadRequest, code: apierr.CodeCountWithFailFast},
 		{name: "setup script", body: `{"setupScript":"true"}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
 		{name: "visibility", body: `{"visibility":"private"}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},
 		{name: "hosted ports", body: `{"hostedPorts":[{"port":8080}]}`, status: http.StatusBadRequest, code: apierr.CodeInvalidJSON},

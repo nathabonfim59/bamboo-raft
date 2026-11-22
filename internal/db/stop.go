@@ -370,6 +370,21 @@ type FinalizeStopParams struct {
 	SandboxID       string
 	StopID          string
 	ExpectedVersion int64
+
+	// DiskErased records that the worker deleted the VM and its disk after
+	// StopVM (a sandbox created with snapshots off): the finalization then
+	// releases the disk reservation too and clears disk_node_id, so nothing
+	// treats the sandbox as holding a disk on its node.
+	DiskErased bool
+
+	// DiskInStore records that the node held no disk to keep (a stop that
+	// took over a cross-node restore before anything existed on the new
+	// node) while the object store holds the chain's last completed
+	// generation: the finalization releases the whole reservation and leaves
+	// disk_node_id NULL, so the next resume restores from the store. The
+	// transaction rechecks both conditions and answers [ErrNoRestorableData]
+	// when either fails. It excludes DiskErased.
+	DiskInStore bool
 }
 
 // FinalizeSandboxStop completes an owner-scoped stop after the node
@@ -383,6 +398,9 @@ type FinalizeStopParams struct {
 func (s *Store) FinalizeSandboxStop(ctx context.Context, jobID uuid.UUID, worker string, token uuid.UUID, p FinalizeStopParams) (Sandbox, StopOperation, error) {
 	if p.Owner == uuid.Nil() {
 		return Sandbox{}, StopOperation{}, ErrNoOwner
+	}
+	if p.DiskErased && p.DiskInStore {
+		return Sandbox{}, StopOperation{}, errors.New("db: a stop cannot both erase the disk and keep it in the store")
 	}
 	var (
 		sbx Sandbox
@@ -426,19 +444,34 @@ func (s *Store) FinalizeSandboxStop(ctx context.Context, jobID uuid.UUID, worker
 		if p.ExpectedVersion != 0 && sbx.Version != p.ExpectedVersion {
 			return ErrConflict
 		}
-		if err := releaseSandboxComputeTx(ctx, tx, sbx); err != nil {
-			return err
+		if p.DiskInStore {
+			if err := requireDiskInStoreTx(ctx, tx, sbx); err != nil {
+				return err
+			}
 		}
+		// An erased disk, or one only in the object store, releases its
+		// disk reservation too.
+		release := releaseSandboxComputeTx(ctx, tx, sbx)
+		if p.DiskErased || p.DiskInStore {
+			release = s.releaseSandboxReservationTx(ctx, tx, p.Owner, p.SandboxID)
+		}
+		if release != nil {
+			return release
+		}
+		// A kept disk is local to the node StopVM ran on, which is node_id.
+		// It may differ from disk_node_id when the stop took over a resume
+		// that was restoring the disk on another node (disk_node_id NULL).
 		row := tx.QueryRow(ctx, `
 			UPDATE sandboxes SET
 				state = 'archived', version = version + 1,
 				reserved_vcpus = 0, reserved_memory_mib = 0,
+				disk_node_id = CASE WHEN $4 THEN NULL ELSE node_id END,
 				stopped_at = now(), error_reason = '',
 				ssh_endpoint = NULL, ssh_host_key = NULL, updated_at = now()
 			WHERE id = $1 AND owner_id = $2 AND version = $3 AND state = 'archiving'
 			  AND deleted_at IS NULL
 			RETURNING `+sandboxCols,
-			p.SandboxID, p.Owner, sbx.Version)
+			p.SandboxID, p.Owner, sbx.Version, p.DiskErased || p.DiskInStore)
 		sbx, err = scanSandbox(row)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrConflict
@@ -452,13 +485,39 @@ func (s *Store) FinalizeSandboxStop(ctx context.Context, jobID uuid.UUID, worker
 		}
 		return insertEventTx(ctx, tx, sbx, EventInput{
 			Type: "stop.completed",
-			Data: mustJSON(map[string]any{"operationId": op.ID, "forced": op.Forced}),
+			Data: mustJSON(stopCompletedData(op, p.DiskErased)),
 		})
 	})
 	if err != nil {
 		return Sandbox{}, StopOperation{}, err
 	}
 	return sbx, op, nil
+}
+
+// requireDiskInStoreTx checks, under the sandbox row lock, that the locked
+// sandbox keeps no local disk and that its chain has a completed, unpurged
+// generation to restore from; otherwise [ErrNoRestorableData].
+func requireDiskInStoreTx(ctx context.Context, tx pgx.Tx, sbx Sandbox) error {
+	if sbx.DiskNodeID != nil {
+		return ErrNoRestorableData
+	}
+	ok, err := hasCompletedGenerationTx(ctx, tx, sbx)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNoRestorableData
+	}
+	return nil
+}
+
+// stopCompletedData is the stop.completed event body; an erased disk says so.
+func stopCompletedData(op StopOperation, erased bool) map[string]any {
+	data := map[string]any{"operationId": op.ID, "forced": op.Forced}
+	if erased {
+		data["erased"] = true
+	}
+	return data
 }
 
 // completeStopTx turns a pending/failing operation into its terminal

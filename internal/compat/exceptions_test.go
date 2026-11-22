@@ -77,7 +77,7 @@ func TestApprovedUndocumentedErrorResponses(t *testing.T) {
 		}
 	})
 	t.Run("lifecycle 500 http_500", func(t *testing.T) {
-		for _, operationID := range []string{"update", "stop", "getStop", "resume"} {
+		for _, operationID := range []string{"update", "stop", "getStop", "resume", "fork"} {
 			t.Run(operationID, func(t *testing.T) {
 				body := errorEnvelopeBody(t, http.StatusInternalServerError, "http_500", nil)
 				if err := validator.Response(operationID, http.StatusInternalServerError, mediaType(jsonMediaType), body); err != nil {

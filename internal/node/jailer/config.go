@@ -239,7 +239,8 @@ type LaunchSpec struct {
 	// Files starts with TAPName and VhostNetName at fds 3 and 4. It must
 	// contain exactly those, KernelName, InitrdName, VhostVsockName and the
 	// Disks entries: an unreferenced descriptor would hand QEMU an
-	// undeclared host resource.
+	// undeclared host resource. A Maintenance spec has KernelName and
+	// InitrdName at fds 3 and 4, then the Disks entries, and nothing else.
 	Files []Descriptor
 	// Disks names entries in Files from the oldest backing file to the
 	// writable overlay. Args builds one explicit -blockdev per disk; stored
@@ -257,6 +258,13 @@ type LaunchSpec struct {
 	Limits    Limits
 	Stdout    io.Writer
 	Stderr    io.Writer
+	// Maintenance selects the maintenance form (see validateMaintenance in
+	// maintenance.go): a paused QEMU that only serves the VM's disk graph
+	// over QMP and its NBD server. Files are then KernelName, InitrdName
+	// and the Disks entries, with no TAP, vhost-net or vhost-vsock, and
+	// the argv must carry -S and no -netdev, -device or -object. It is an
+	// explicit mode: a VM spec never gets these looser descriptor rules.
+	Maintenance bool
 }
 
 // Validate checks the spec exactly as Start does before any reservation:
@@ -342,6 +350,9 @@ type descriptorKind struct {
 }
 
 func (s LaunchSpec) validateFiles() error {
+	if s.Maintenance {
+		return s.validateMaintenanceFiles()
+	}
 	if len(s.Files) < 6 {
 		return errors.New("jailer: TAP, vhost-net, kernel, initrd, vhost-vsock and disk descriptors are required")
 	}
@@ -358,6 +369,12 @@ func (s LaunchSpec) validateFiles() error {
 		KernelName:     {readOnly: true},
 		InitrdName:     {readOnly: true},
 	}
+	return s.checkDescriptors(kinds)
+}
+
+// checkDescriptors adds the Disks entries to the fixed kinds and requires
+// Files to hold exactly those names, each of its kind and access.
+func (s LaunchSpec) checkDescriptors(kinds map[string]descriptorKind) error {
 	if len(s.Disks) == 0 {
 		return errors.New("jailer: disk chain is empty")
 	}

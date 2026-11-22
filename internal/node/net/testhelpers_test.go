@@ -176,6 +176,10 @@ func (r *netTestRunner) Output(ctx context.Context, name string, args []string) 
 			return b.Bytes(), nil
 		}
 	}
+	if cmd.String() == "ip -j -4 addr show" {
+		// A host with no addresses at all: tests that care list their own.
+		return []byte("[]"), nil
+	}
 	return nil, fmt.Errorf("nodenet test: unexpected Output command %q", cmd.String())
 }
 

@@ -42,6 +42,8 @@ is nothing else to install.
 | `internal/nodelink/` | transport: the node dials the server; `Hub` (server side), `Serve` (node side) |
 | `internal/nodetest/` | conformance suite every `nodev1.Node` implementation passes |
 | `internal/nodefake/` | in-process `nodev1.Node` without VMs, for control-plane tests |
+| `internal/objstore/` | object store contract (`Store`), `memstore`, conformance suite `objstoretest`, `s3` |
+| `internal/snapformat/` | snapshot chunks, manifests and their object keys, shared by node and server |
 | `internal/ids/` | `bx_` sandbox ids |
 | `internal/machinetype/` | sandbox sizes (small/default/large/xlarge) |
 | `internal/version/` | build version |

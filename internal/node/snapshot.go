@@ -1,6 +1,7 @@
 package node
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -29,7 +30,11 @@ type snapshotOperation struct {
 // snapshotRun records every ambiguous side effect that cleanup may need to
 // resolve. In particular, Pause may have stopped vCPUs even when its RPC fails.
 type snapshotRun struct {
-	stage           *storage.SnapshotStage
+	// stage is the Phase 1 staged copy; nil for a Phase 2 cut.
+	stage *storage.SnapshotStage
+	// lease is the guest freeze lease to ask for; zero is
+	// Config.SnapshotLease.
+	lease           time.Duration
 	token           string
 	leaseChanged    bool
 	deadline        time.Time
@@ -133,6 +138,11 @@ func (m *Manager) SaveSnapshot(ctx context.Context, req *nodev1.SaveSnapshotRequ
 		return nil, err
 	}
 	defer releaseVMOperation(v)
+	// A record whose restart recovery could not prove ownership is resolved
+	// before its disk is copied; otherwise UNAVAILABLE with nothing copied.
+	if err := m.requireResolved(v); err != nil {
+		return nil, err
+	}
 	releaseSnapshot, err := m.acquireSnapshotID(opCtx, snapshotID)
 	if err != nil {
 		return nil, err
@@ -315,7 +325,7 @@ func (m *Manager) saveStoppedSnapshot(ctx context.Context, sandboxID, snapshotID
 func (m *Manager) freezeSnapshotAttempt(ctx context.Context, client guestv1.GuestClient, run *snapshotRun) error {
 	run.freezeAttempted = true
 	attemptStart := m.now()
-	resp, err := client.Freeze(ctx, &guestv1.FreezeRequest{LeaseMs: uint32(m.cfg.SnapshotLease / time.Millisecond)})
+	resp, err := client.Freeze(ctx, &guestv1.FreezeRequest{LeaseMs: m.freezeLeaseMs(run)})
 	if resp != nil {
 		if run.token != "" && resp.GetLeaseToken() != run.token {
 			run.leaseChanged = true
@@ -398,7 +408,7 @@ func (m *Manager) cleanupSnapshot(v *vm, proc VMProcess, controller VMController
 	if run.resumed || !run.pauseAttempted {
 		if !run.thawed && run.token == "" {
 			ctx, cancel := context.WithTimeout(context.Background(), m.cfg.SnapshotCleanupTimeout)
-			resp, err := client.Freeze(ctx, &guestv1.FreezeRequest{LeaseMs: uint32(m.cfg.SnapshotLease / time.Millisecond)})
+			resp, err := client.Freeze(ctx, &guestv1.FreezeRequest{LeaseMs: m.freezeLeaseMs(run)})
 			cancel()
 			if resp != nil {
 				run.token = resp.GetLeaseToken()
@@ -415,10 +425,17 @@ func (m *Manager) cleanupSnapshot(v *vm, proc VMProcess, controller VMController
 			}
 		}
 	}
-	if err := run.stage.Abort(); err != nil {
-		errs = append(errs, err)
+	if run.stage != nil {
+		if err := run.stage.Abort(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
+}
+
+// freezeLeaseMs is the lease a Freeze of run asks for.
+func (m *Manager) freezeLeaseMs(run *snapshotRun) uint32 {
+	return uint32(cmp.Or(run.lease, m.cfg.SnapshotLease) / time.Millisecond)
 }
 
 func (m *Manager) thawSnapshot(client guestv1.GuestClient, run *snapshotRun) error {
@@ -524,7 +541,7 @@ func (m *Manager) rescueResume(ctx context.Context, v *vm, proc VMProcess) error
 	if !ownedBy(pinned.info, meta, m.store.ImageDir(), m.store.VMDir(v.id), m.store.DiskPath(v.id), m.qemuExe) {
 		return errors.New("QMP rescue: pinned process does not own this VM's executable, image, workdir and disk")
 	}
-	client, err := m.verifyQMPAt(ctx, pinned, meta, filepath.Join(m.store.VMDir(v.id), qemu.QMPFilename))
+	client, err := m.verifyQMPAt(ctx, pinned, meta, filepath.Join(m.store.VMDir(v.id), qemu.QMPFilename), false)
 	if err != nil {
 		return fmt.Errorf("QMP rescue verify: %w", err)
 	}

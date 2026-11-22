@@ -1822,6 +1822,9 @@ type jailKVMDirectSettings struct {
 	Cgroup, QEMUBinary, ToolBinary                            string
 	Firmware, LibraryDirs                                     []string
 	IO                                                        jailer.IOLimits
+	// ChunkCacheBytes is the local chunk cache cap: the rendered flag, or
+	// bbraft-node's default (8 GiB) when the unit has no object store flag.
+	ChunkCacheBytes uint64
 }
 
 // jailKVMDirectFlags is every flag the role renders and what the Direct
@@ -1843,6 +1846,8 @@ func jailKVMDirectFlags() map[string]string {
 		"-node.jail-tool-binary": "required", "-node.jail-firmware": "optional", "-node.jail-library-dirs": "optional",
 		"-node.jail-io-device": "required", "-node.jail-io-read-bps": "optional", "-node.jail-io-write-bps": "optional",
 		"-node.jail-io-read-iops": "optional", "-node.jail-io-write-iops": "optional",
+		// Rendered only when the object store is configured (Phase 2).
+		"-node.chunk-cache-bytes": "optional",
 	}
 }
 
@@ -2037,6 +2042,15 @@ func jailKVMDirectPlan(cfg jailKVMDirectConfig, facts jailKVMHostFacts) (jailKVM
 	}
 	if s.IO.ReadBPS|s.IO.WriteBPS|s.IO.ReadIOPS|s.IO.WriteIOPS == 0 {
 		return s, errors.New("direct: at least one -node.jail-io-* rate is required")
+	}
+	s.ChunkCacheBytes = 8 << 30
+	if _, ok := f["-node.chunk-cache-bytes"]; ok {
+		if s.ChunkCacheBytes, err = u64("-node.chunk-cache-bytes"); err != nil {
+			return s, err
+		}
+		if s.ChunkCacheBytes > math.MaxInt64 {
+			return s, fmt.Errorf("direct: -node.chunk-cache-bytes %d exceeds %d", s.ChunkCacheBytes, int64(math.MaxInt64))
+		}
 	}
 	return s, nil
 }

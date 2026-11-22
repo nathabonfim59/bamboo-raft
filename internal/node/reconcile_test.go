@@ -371,7 +371,7 @@ func TestVerifyQMPRejectsWrongPeer(t *testing.T) {
 			StartTicks: mustProcStartTicks(t, cmd.Process.Pid),
 		},
 	}
-	if _, err := h.mg.verifyQMPAt(t.Context(), pinned, meta, srv.path); err == nil {
+	if _, err := h.mg.verifyQMPAt(t.Context(), pinned, meta, srv.path, true); err == nil {
 		t.Fatal("verifyQMP accepted a QMP peer that is not the pinned pid")
 	}
 }

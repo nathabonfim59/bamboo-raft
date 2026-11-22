@@ -75,20 +75,25 @@ func NewSnapshotArtifactID() (string, error) {
 func ValidSnapshotArtifactID(id string) bool { return snapshotArtifactPattern.MatchString(id) }
 
 // AcceptSnapshotSaveParams is one accepted save. ArtifactID is server-chosen;
-// an empty value is generated here.
+// an empty value is generated here. GenerationBacked marks a save that will
+// pin an object-store generation instead of a node artifact: it may start from
+// a stopped sandbox without a local node, and the completed row records no
+// node.
 type AcceptSnapshotSaveParams struct {
-	Owner       uuid.UUID
-	SandboxID   string
-	Name        string
-	ArtifactID  string
-	MaxAttempts int
+	Owner            uuid.UUID
+	SandboxID        string
+	Name             string
+	ArtifactID       string
+	MaxAttempts      int
+	GenerationBacked bool
 }
 
 // AcceptSnapshotSave atomically starts a new saved-snapshot generation. It
 // serializes same-name saves, rejects a save while the current generation is
-// saving, refuses a source that is not an own live ready/idle/running sandbox,
-// and enqueues the leased save job. The previous ready generation stays
-// untouched (non-current but ready) until the new one completes.
+// saving, refuses a source that is not an own live ready/idle/running sandbox
+// (or whose stored data expired), and enqueues the leased save job. The
+// previous ready generation stays untouched (non-current but ready) until the
+// new one completes.
 func (s *Store) AcceptSnapshotSave(ctx context.Context, p AcceptSnapshotSaveParams) (SavedSnapshot, error) {
 	if p.Owner == uuid.Nil() || p.SandboxID == "" {
 		return SavedSnapshot{}, errors.New("db: accept snapshot save requires owner and sandbox id")
@@ -117,16 +122,18 @@ func (s *Store) AcceptSnapshotSave(ctx context.Context, p AcceptSnapshotSavePara
 		}
 		// Fixed lock order: sandbox row first, then saved_snapshot rows.
 		var (
-			state       SandboxState
-			machineType string
-			diskGiB     int64
-			nodeID      *string
-			deletedAt   *time.Time
+			state         SandboxState
+			machineType   string
+			diskGiB       int64
+			nodeID        *string
+			deletedAt     *time.Time
+			enabled       bool
+			dataExpiredAt *time.Time
 		)
 		err := tx.QueryRow(ctx, `
-			SELECT state, machine_type, reserved_disk_gib, node_id, deleted_at
+			SELECT state, machine_type, reserved_disk_gib, node_id, deleted_at, snapshots_enabled, data_expired_at
 			FROM sandboxes WHERE id = $1 AND owner_id = $2 FOR SHARE`,
-			p.SandboxID, p.Owner).Scan(&state, &machineType, &diskGiB, &nodeID, &deletedAt)
+			p.SandboxID, p.Owner).Scan(&state, &machineType, &diskGiB, &nodeID, &deletedAt, &enabled, &dataExpiredAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -138,8 +145,33 @@ func (s *Store) AcceptSnapshotSave(ctx context.Context, p AcceptSnapshotSavePara
 			// from one that never existed.
 			return ErrNotFound
 		}
-		if !snapshotSourceReady(state) || nodeID == nil || *nodeID == "" {
+		if dataExpiredAt != nil {
+			// The source's stored data expired: there is nothing left to
+			// save as a new snapshot.
+			return ErrSnapshotDataExpired
+		}
+		if !enabled {
+			return ErrSnapshotsDisabled
+		}
+		// A generation-backed save may pin a stopped sandbox's latest
+		// generation and needs no node of its own; a node-local save needs
+		// a live ready source with a node.
+		stopped := p.GenerationBacked && state == StateArchived
+		if !snapshotSourceReady(state) && !stopped {
 			return ErrSnapshotSourceNotReady
+		}
+		sourceNode := ""
+		if nodeID != nil {
+			sourceNode = *nodeID
+		}
+		if !p.GenerationBacked && sourceNode == "" {
+			return ErrSnapshotSourceNotReady
+		}
+		var storedNode any = nodeID
+		if p.GenerationBacked {
+			// A generation-backed save never creates a node artifact, so
+			// the row carries no node even if it fails halfway.
+			storedNode = nil
 		}
 
 		rows, err := lockSnapshotRowsTx(ctx, tx, p.Owner, p.Name)
@@ -174,7 +206,7 @@ func (s *Store) AcceptSnapshotSave(ctx context.Context, p AcceptSnapshotSavePara
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
 			RETURNING `+snapshotCols,
 			uuid.NewV7(), p.Owner, p.Name, p.SandboxID, SnapshotSaving,
-			p.ArtifactID, generation, machineType, diskGiB, nodeID)
+			p.ArtifactID, generation, machineType, diskGiB, storedNode)
 		out, err = scanSnapshot(row)
 		if err != nil {
 			return fmtError("insert snapshot generation", err)
@@ -182,7 +214,7 @@ func (s *Store) AcceptSnapshotSave(ctx context.Context, p AcceptSnapshotSavePara
 
 		payload, err := marshalJobPayload(SaveSnapshotPayload{
 			SnapshotID: out.ID,
-			NodeID:     *nodeID,
+			NodeID:     sourceNode,
 			VMID:       p.SandboxID,
 			ArtifactID: out.ArtifactID,
 			Generation: out.Generation,
@@ -277,6 +309,13 @@ func (s *Store) AcceptSnapshotDelete(ctx context.Context, p AcceptSnapshotDelete
 			return fmtError("mark snapshot name deleted", err)
 		}
 		updated.Close()
+		// Deleting the name revokes every code that deploys it.
+		if _, err := tx.Exec(ctx, `
+			UPDATE snapshot_shares SET status = 'revoked', revoked_at = now()
+			WHERE owner_id = $1 AND name = $2 AND status = 'active'`,
+			p.Owner, p.Name); err != nil {
+			return fmtError("revoke snapshot shares", err)
+		}
 		out = *current
 		for _, row := range deleted {
 			if row.ID == current.ID {
@@ -298,11 +337,20 @@ func (s *Store) AcceptSnapshotDelete(ctx context.Context, p AcceptSnapshotDelete
 // name. A replacement may be saving or failed; the previous ready generation
 // stays deployable until the replacement becomes ready. Missing, foreign and
 // names without a ready generation all answer [ErrSnapshotNotFound].
+//
+// A generation-backed row resolves to its completed generation and can be
+// restored on any node; a legacy row keeps the artifact's recorded node rule.
 func (s *Store) SnapshotRestoreSource(ctx context.Context, owner uuid.UUID, name string) (SnapshotSource, error) {
+	return s.snapshotRestoreSource(ctx, s.pool, owner, name)
+}
+
+// snapshotRestoreSource is the shared owner+name resolution used by an own-name
+// restore and by a share code (which resolves the sharer's owner and name).
+func (s *Store) snapshotRestoreSource(ctx context.Context, q rowQuerier, owner uuid.UUID, name string) (SnapshotSource, error) {
 	if owner == uuid.Nil() || name == "" {
 		return SnapshotSource{}, ErrSnapshotNotFound
 	}
-	row := s.pool.QueryRow(ctx, `
+	row := q.QueryRow(ctx, `
 		SELECT `+snapshotCols+` FROM saved_snapshots
 		WHERE owner_id = $1 AND name = $2 AND deleted_at IS NULL
 		  AND status = 'ready' AND retired_at IS NULL
@@ -315,6 +363,57 @@ func (s *Store) SnapshotRestoreSource(ctx context.Context, owner uuid.UUID, name
 	if err != nil {
 		return SnapshotSource{}, fmtError("resolve snapshot source", err)
 	}
+	return s.snapshotSourceFromRow(ctx, q, snap)
+}
+
+// snapshotSourceFromRow turns one ready saved-snapshot row into its immutable
+// restore source. A generation-backed row reads the generation it pins; a
+// legacy row keeps its node artifact.
+func (s *Store) snapshotSourceFromRow(ctx context.Context, q rowQuerier, snap SavedSnapshot) (SnapshotSource, error) {
+	base := SnapshotSource{
+		RowID:           snap.ID,
+		OwnerID:         snap.OwnerID,
+		Name:            snap.Name,
+		SourceSandboxID: snap.SandboxID,
+		ArtifactID:      snap.ArtifactID,
+		MachineType:     snap.MachineType,
+		SizeBytes:       snap.SizeBytes,
+		Generation:      snap.Generation,
+	}
+	if snap.GenerationID != nil {
+		var (
+			manifestKey string
+			image       *string
+			disk        *int64
+			nodeID      string
+		)
+		err := q.QueryRow(ctx, `
+			SELECT manifest_key, image, disk_bytes, node_id FROM snapshots
+			WHERE id = $1 AND status = 'completed' AND purged_at IS NULL`,
+			*snap.GenerationID).Scan(&manifestKey, &image, &disk, &nodeID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The generation was purged or never completed: the saved name
+			// has nothing to deploy.
+			return SnapshotSource{}, ErrSnapshotNotFound
+		}
+		if err != nil {
+			return SnapshotSource{}, fmtError("resolve snapshot generation", err)
+		}
+		if image == nil || disk == nil || manifestKey == "" {
+			return SnapshotSource{}, ErrSnapshotNotFound
+		}
+		diskGiB := max(snapshotCanonicalDisk(snap), DiskGiBFor(uint64(*disk)))
+		if diskGiB == 0 {
+			return SnapshotSource{}, ErrSnapshotDiskUnknown
+		}
+		base.NodeID = nodeID
+		base.DiskGiB = diskGiB
+		base.GenerationID = new(*snap.GenerationID)
+		base.ManifestKey = manifestKey
+		base.Image = *image
+		base.DiskBytes = uint64(*disk)
+		return base, nil
+	}
 	if snap.NodeID == nil || *snap.NodeID == "" || !ValidSnapshotArtifactID(snap.ArtifactID) {
 		// A legacy row without a durable node cannot be restored without
 		// guessing where its artifact lives.
@@ -326,31 +425,26 @@ func (s *Store) SnapshotRestoreSource(ctx context.Context, owner uuid.UUID, name
 		// recorded disk and no known machine type.
 		return SnapshotSource{}, ErrSnapshotDiskUnknown
 	}
-	return SnapshotSource{
-		RowID:           snap.ID,
-		OwnerID:         snap.OwnerID,
-		Name:            snap.Name,
-		SourceSandboxID: snap.SandboxID,
-		ArtifactID:      snap.ArtifactID,
-		NodeID:          *snap.NodeID,
-		MachineType:     snap.MachineType,
-		DiskGiB:         disk,
-		SizeBytes:       snap.SizeBytes,
-		Generation:      snap.Generation,
-	}, nil
+	base.NodeID = *snap.NodeID
+	base.DiskGiB = disk
+	return base, nil
 }
 
 // lockRestoreSourceTx locks and revalidates the exact generation a create was
 // admitted from, increments its pin, and returns the row. Every mismatch is a
 // safe [ErrSnapshotNotFound]: the client sees a missing snapshot, never
 // another owner's row.
-func lockRestoreSourceTx(ctx context.Context, tx pgx.Tx, owner uuid.UUID, nodeID string, reserve Resources, want SnapshotSource) (SavedSnapshot, error) {
-	if want.RowID == uuid.Nil() || nodeID == "" || want.ArtifactID == "" {
+//
+// A row owned by another account is accepted only with a share code that is
+// still active and still deploys exactly this owner+name; the share check and
+// its use count happen in this same create transaction.
+func lockRestoreSourceTx(ctx context.Context, tx pgx.Tx, caller uuid.UUID, nodeID string, reserve Resources, want SnapshotSource) (SavedSnapshot, error) {
+	if want.RowID == uuid.Nil() || want.OwnerID == uuid.Nil() || nodeID == "" || want.ArtifactID == "" {
 		return SavedSnapshot{}, ErrSnapshotNotFound
 	}
 	row := tx.QueryRow(ctx, `
 		SELECT `+snapshotCols+` FROM saved_snapshots
-		WHERE id = $1 AND owner_id = $2 FOR UPDATE`, want.RowID, owner)
+		WHERE id = $1 AND owner_id = $2 FOR UPDATE`, want.RowID, want.OwnerID)
 	snap, err := scanSnapshot(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return SavedSnapshot{}, ErrSnapshotNotFound
@@ -365,12 +459,23 @@ func lockRestoreSourceTx(ctx context.Context, tx pgx.Tx, owner uuid.UUID, nodeID
 		return SavedSnapshot{}, ErrSnapshotDiskUnknown
 	}
 	if snap.Status != SnapshotReady || snap.RetiredAt != nil || snap.DeletedAt != nil ||
+		snap.GenerationID != nil ||
 		snap.NodeID == nil || *snap.NodeID != nodeID || snap.ArtifactID != want.ArtifactID ||
-		want.OwnerID != owner || want.Name != snap.Name ||
-		want.SourceSandboxID != snap.SandboxID || want.Generation != snap.Generation ||
-		want.MachineType != snap.MachineType || want.DiskGiB != disk ||
-		want.NodeID != nodeID {
+		want.Name != snap.Name || want.SourceSandboxID != snap.SandboxID ||
+		want.Generation != snap.Generation || want.MachineType != snap.MachineType ||
+		want.DiskGiB != disk || want.NodeID != nodeID {
 		return SavedSnapshot{}, ErrSnapshotNotFound
+	}
+	// Cross-account restores need an active share for exactly this name.
+	if snap.OwnerID != caller {
+		if want.ShareID == "" {
+			return SavedSnapshot{}, ErrSnapshotNotFound
+		}
+	}
+	if want.ShareID != "" {
+		if err := consumeSnapshotRestoreShareTx(ctx, tx, want.ShareID, snap); err != nil {
+			return SavedSnapshot{}, err
+		}
 	}
 	// CPU and RAM may grow or shrink with the requested type; only the disk
 	// is grow-only because the snapshot's filesystem must fit. The floor is
@@ -380,16 +485,17 @@ func lockRestoreSourceTx(ctx context.Context, tx pgx.Tx, owner uuid.UUID, nodeID
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE saved_snapshots SET pins = pins + 1, updated_at = now()
-		WHERE id = $1 AND owner_id = $2`, snap.ID, owner); err != nil {
+		WHERE id = $1 AND owner_id = $2`, snap.ID, snap.OwnerID); err != nil {
 		return SavedSnapshot{}, fmtError("pin snapshot source", err)
 	}
 	snap.Pins++
 	return snap, nil
 }
 
-// CompleteSnapshotSaveParams is the durable result of one successful node
-// SaveSnapshot. JobID/Worker/Token fence the live worker claim;
-// Generation/ArtifactID fence a stale generation.
+// CompleteSnapshotSaveParams is the durable result of one successful save.
+// JobID/Worker/Token fence the live worker claim; Generation/ArtifactID fence
+// a stale generation. GenerationID, when set, makes the row generation-backed:
+// it records the object-store generation and no node artifact.
 type CompleteSnapshotSaveParams struct {
 	Owner      uuid.UUID
 	SnapshotID uuid.UUID
@@ -397,6 +503,10 @@ type CompleteSnapshotSaveParams struct {
 	Generation int64
 	NodeID     string
 	SizeBytes  *int64
+
+	// GenerationID is the completed snapshots row this save pins. Its sandbox
+	// and owner must match the save source.
+	GenerationID *uuid.UUID
 
 	JobID  uuid.UUID
 	Worker string
@@ -442,16 +552,36 @@ func (s *Store) CompleteSnapshotSave(ctx context.Context, p CompleteSnapshotSave
 			out, changed = row, false
 			return nil
 		}
-		nodeID, err := mergeSnapshotNodeID(row.NodeID, p.NodeID)
-		if err != nil {
-			return err
+		var nodeID *string
+		if p.GenerationID != nil {
+			// A generation-backed save records the generation and no node
+			// artifact. The generation must be a completed, unpurged row of
+			// this save's own source sandbox.
+			var owned bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM snapshots
+					WHERE id = $1 AND owner_id = $2 AND sandbox_id = $3
+					  AND status = 'completed' AND purged_at IS NULL)`,
+				*p.GenerationID, p.Owner, row.SandboxID).Scan(&owned); err != nil {
+				return fmtError("snapshot save generation read", err)
+			}
+			if !owned {
+				return ErrSnapshotNotFound
+			}
+		} else {
+			merged, err := mergeSnapshotNodeID(row.NodeID, p.NodeID)
+			if err != nil {
+				return err
+			}
+			nodeID = &merged
 		}
 		current := currentSnapshot(rows)
 		switch {
 		case current == nil || current.DeletedAt != nil:
 			// The name was deleted while the save ran. Keep the fact that
 			// the artifact succeeded, but never resurrect the name.
-			out, err = updateSnapshotReadyTx(ctx, tx, row, nodeID, p.SizeBytes,
+			out, err = updateSnapshotReadyTx(ctx, tx, row, nodeID, p.SizeBytes, p.GenerationID,
 				snapshotReadyDeleted)
 			if err != nil {
 				return err
@@ -459,7 +589,7 @@ func (s *Store) CompleteSnapshotSave(ctx context.Context, p CompleteSnapshotSave
 			changed = true
 			return enqueueSnapshotDeleteOrNoop(ctx, tx, p.Owner, out)
 		case current.ID == row.ID:
-			out, err = updateSnapshotReadyTx(ctx, tx, row, nodeID, p.SizeBytes,
+			out, err = updateSnapshotReadyTx(ctx, tx, row, nodeID, p.SizeBytes, p.GenerationID,
 				snapshotReadyCurrent)
 			if err != nil {
 				return err
@@ -478,7 +608,7 @@ func (s *Store) CompleteSnapshotSave(ctx context.Context, p CompleteSnapshotSave
 		default:
 			// A newer generation is current: retire only this stale
 			// completion; the current row is never mutated.
-			out, err = updateSnapshotReadyTx(ctx, tx, row, nodeID, p.SizeBytes,
+			out, err = updateSnapshotReadyTx(ctx, tx, row, nodeID, p.SizeBytes, p.GenerationID,
 				snapshotReadyStale)
 			if err != nil {
 				return err
@@ -502,9 +632,10 @@ const (
 )
 
 // updateSnapshotReadyTx writes one ready generation. It never touches another
-// generation's current flag.
-func updateSnapshotReadyTx(ctx context.Context, tx pgx.Tx, row SavedSnapshot, nodeID string,
-	size *int64, mode snapshotReadyMode,
+// generation's current flag. nodeID is nil for a generation-backed row (no node
+// artifact), and generationID is the object-store generation it pins.
+func updateSnapshotReadyTx(ctx context.Context, tx pgx.Tx, row SavedSnapshot, nodeID *string,
+	size *int64, generationID *uuid.UUID, mode snapshotReadyMode,
 ) (SavedSnapshot, error) {
 	var (
 		retired   any
@@ -531,6 +662,7 @@ func updateSnapshotReadyTx(ctx context.Context, tx pgx.Tx, row SavedSnapshot, no
 			status = 'ready',
 			size_bytes = COALESCE($3, size_bytes),
 			node_id = $4,
+			generation_id = $8,
 			error_reason = '',
 			ready_at = now(),
 			retired_at = $5,
@@ -539,7 +671,7 @@ func updateSnapshotReadyTx(ctx context.Context, tx pgx.Tx, row SavedSnapshot, no
 			updated_at = now()
 		WHERE id = $1 AND owner_id = $2
 		RETURNING `+snapshotCols,
-		row.ID, row.OwnerID, sizeArg, nodeID, retired, deleted, isCurrent)
+		row.ID, row.OwnerID, sizeArg, nodeID, retired, deleted, isCurrent, generationID)
 	out, err := scanSnapshot(updated)
 	if err != nil {
 		return SavedSnapshot{}, fmtError("mark snapshot ready", err)
@@ -748,9 +880,14 @@ func (s *Store) ReleaseSnapshotPin(ctx context.Context, owner uuid.UUID, sandbox
 		if snapshotID == nil {
 			return ErrSnapshotPinMismatch
 		}
+		// The row id came from the owner-checked sandbox read above (its
+		// snapshot_id reference): it may belong to another account when the
+		// sandbox was created from a share code, but no caller input reaches
+		// this id. The pin belongs to that row, so it is decremented by id,
+		// never by the caller's owner.
 		tag, err := tx.Exec(ctx, `
 			UPDATE saved_snapshots SET pins = pins - 1, updated_at = now()
-			WHERE id = $1 AND owner_id = $2 AND pins > 0`, *snapshotID, owner)
+			WHERE id = $1 AND pins > 0`, *snapshotID)
 		if err != nil {
 			return fmtError("release snapshot pin decrement", err)
 		}
@@ -763,13 +900,13 @@ func (s *Store) ReleaseSnapshotPin(ctx context.Context, owner uuid.UUID, sandbox
 			return fmtError("release snapshot pin clear", err)
 		}
 		row := tx.QueryRow(ctx,
-			`SELECT `+snapshotCols+` FROM saved_snapshots WHERE id = $1 AND owner_id = $2`,
-			*snapshotID, owner)
+			`SELECT `+snapshotCols+` FROM saved_snapshots WHERE id = $1`,
+			*snapshotID)
 		snap, err := scanSnapshot(row)
 		if err != nil {
 			return fmtError("release snapshot pin snapshot read", err)
 		}
-		_, err = enqueueSnapshotDeleteTx(ctx, tx, owner, snap)
+		_, err = enqueueSnapshotDeleteTx(ctx, tx, snap.OwnerID, snap)
 		return err
 	})
 }

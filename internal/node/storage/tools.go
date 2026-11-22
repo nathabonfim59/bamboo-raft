@@ -244,8 +244,8 @@ func (j *JailedImager) run(ctx context.Context, op string, ref ImageRef, size ui
 		if err != nil {
 			return nil, fmt.Errorf("storage: create %s: %w", ref.Path, err)
 		}
-		if info.Size() != 0 || ref.BackingName == "" || ref.Base != nil {
-			return nil, fmt.Errorf("storage: create %s needs a new empty file and an exact backing name", ref.Path)
+		if info.Size() != 0 || ref.Base != nil {
+			return nil, fmt.Errorf("storage: create %s needs a new empty file and opens no base", ref.Path)
 		}
 	} else if err := checkBacking(ref, expected); err != nil {
 		return nil, err
@@ -301,6 +301,23 @@ func (j *JailedImager) run(ctx context.Context, op string, ref ImageRef, size ui
 func (j *JailedImager) CreateOverlay(ctx context.Context, dst ImageRef, virtualSize uint64) error {
 	if dst.Format != "qcow2" {
 		return fmt.Errorf("storage: create %s: format %q, want qcow2", dst.Path, dst.Format)
+	}
+	if dst.BackingName == "" {
+		return fmt.Errorf("storage: create %s: an overlay needs an exact backing name", dst.Path)
+	}
+	_, err := j.run(ctx, "create", dst, virtualSize, "")
+	return err
+}
+
+// CreateStandalone creates dst (owner-rw), a new empty pinned file under
+// the data root's phase2/ directory, as a qcow2 with no backing (a fleece
+// template). The created header is checked to store no backing name.
+func (j *JailedImager) CreateStandalone(ctx context.Context, dst ImageRef, virtualSize uint64) error {
+	if dst.Format != "qcow2" {
+		return fmt.Errorf("storage: create %s: format %q, want qcow2", dst.Path, dst.Format)
+	}
+	if dst.BackingName != "" || dst.Root != ImageRootData || !strings.HasPrefix(dst.Path, phase2Dir+"/") {
+		return fmt.Errorf("storage: create %s: a standalone image is a %s/ file with no backing name", dst.Path, phase2Dir)
 	}
 	_, err := j.run(ctx, "create", dst, virtualSize, "")
 	return err

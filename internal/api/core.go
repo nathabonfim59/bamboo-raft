@@ -75,6 +75,10 @@ type AdmissionRequest struct {
 	// An omitted type on a restore inherits the snapshot's canonical type;
 	// every other create already carries the default in MachineType.
 	TypeExplicit bool
+	// SnapshotsEnabled is the create's snapshots member; nil means on. A
+	// sandbox with snapshots off is never uploaded and its stop erases the
+	// disk.
+	SnapshotsEnabled *bool
 }
 
 // AdmissionResult is the durable create outcome returned by admission.
@@ -98,6 +102,22 @@ func (f AdmissionFunc) Admit(ctx context.Context, request AdmissionRequest) (Adm
 	return f(ctx, request)
 }
 
+// BatchAdmission places and durably records a create with count above one.
+// The implementation must check the first request's idempotency key before
+// resolving the saved snapshot, so a replay answers the original batch even
+// after the name changed or was deleted. All results are in creation order.
+type BatchAdmission interface {
+	AdmitBatch(ctx context.Context, requests []AdmissionRequest) ([]AdmissionResult, error)
+}
+
+// BatchAdmissionFunc adapts a plain function to [BatchAdmission].
+type BatchAdmissionFunc func(ctx context.Context, requests []AdmissionRequest) ([]AdmissionResult, error)
+
+// AdmitBatch implements [BatchAdmission].
+func (f BatchAdmissionFunc) AdmitBatch(ctx context.Context, requests []AdmissionRequest) ([]AdmissionResult, error) {
+	return f(ctx, requests)
+}
+
 // ErrNoReadyMachine is the admission sentinel for a fail-fast placement that
 // found no ready machine. A server adapter translates its scheduler's
 // no-ready-node error into this value; the handler maps it to the pinned 503
@@ -114,6 +134,10 @@ type CoreOptions struct {
 	Store CoreStore
 	// Admission places creates. Required.
 	Admission Admission
+	// Batch places creates with count above one. Nil leaves count above one
+	// an internal fault; a server with an object-store create path always
+	// wires it.
+	Batch BatchAdmission
 	// Logger receives operational failures. Nil discards them.
 	Logger *slog.Logger
 	// Now supplies the generated display name when a create omits one. Nil
@@ -134,6 +158,7 @@ type CoreOptions struct {
 type coreHandlers struct {
 	store         CoreStore
 	admission     Admission
+	batch         BatchAdmission
 	logger        *slog.Logger
 	now           func() time.Time
 	capacityRetry int
@@ -169,6 +194,7 @@ func NewCoreHandlers(options CoreOptions) (Handlers, error) {
 	handler := &coreHandlers{
 		store:         options.Store,
 		admission:     options.Admission,
+		batch:         options.Batch,
 		logger:        logger,
 		now:           now,
 		capacityRetry: capacityRetry,
@@ -271,6 +297,7 @@ func sandboxFromRow(row db.Sandbox) Sandbox {
 		IP:                  nil,
 		DesktopAvailable:    false,
 		DesktopURL:          nil,
+		Snapshots:           new(row.SnapshotsEnabled),
 		SnapshotAvailable:   false,
 		SnapshotCompletedAt: nil,
 	}
@@ -316,6 +343,11 @@ func sandboxFromRow(row db.Sandbox) Sandbox {
 	}
 	if row.StoppedAt != nil && !row.StoppedAt.IsZero() {
 		out.StoppedAt = new(row.StoppedAt.UTC())
+	}
+	// dataExpiredAt stays absent until the stored data expires; a stopped
+	// sandbox keeps reporting stoppedAt either way.
+	if row.DataExpiredAt != nil && !row.DataExpiredAt.IsZero() {
+		out.DataExpiredAt = new(row.DataExpiredAt.UTC())
 	}
 	return out
 }

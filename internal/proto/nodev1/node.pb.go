@@ -469,13 +469,20 @@ func (x *Resources) GetDiskGib() uint64 {
 }
 
 type CreateVMRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"` // bx_xxxxxxxx
-	Resources     *Resources             `protobuf:"bytes,2,opt,name=resources,proto3" json:"resources,omitempty"`
-	Image         string                 `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`                                                                       // empty: the node's default image
-	FromSnapshot  string                 `protobuf:"bytes,4,opt,name=from_snapshot,json=fromSnapshot,proto3" json:"from_snapshot,omitempty"`                                     // empty: a fresh disk from the image
-	Env           map[string]string      `protobuf:"bytes,5,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // set for every Exec (Exec's own env wins)
-	Hostname      string                 `protobuf:"bytes,6,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId    string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"` // bx_xxxxxxxx
+	Resources    *Resources             `protobuf:"bytes,2,opt,name=resources,proto3" json:"resources,omitempty"`
+	Image        string                 `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`                                                                       // empty: the node's default image
+	FromSnapshot string                 `protobuf:"bytes,4,opt,name=from_snapshot,json=fromSnapshot,proto3" json:"from_snapshot,omitempty"`                                     // empty: a fresh disk from the image
+	Env          map[string]string      `protobuf:"bytes,5,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // set for every Exec (Exec's own env wins)
+	Hostname     string                 `protobuf:"bytes,6,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	// Phase 2: an object-store manifest key (snapformat.ManifestKey) to restore
+	// the disk from, on the manifest's image (image must then be empty or the
+	// same, else INVALID_ARGUMENT). Exclusive with from_snapshot
+	// (INVALID_ARGUMENT). NOT_FOUND when the manifest does not exist,
+	// FAILED_PRECONDITION when its image is not on this node. resources.disk_gib
+	// smaller than the manifest's disk is INVALID_ARGUMENT; larger grows it.
+	FromManifest  string `protobuf:"bytes,7,opt,name=from_manifest,json=fromManifest,proto3" json:"from_manifest,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -552,6 +559,13 @@ func (x *CreateVMRequest) GetHostname() string {
 	return ""
 }
 
+func (x *CreateVMRequest) GetFromManifest() string {
+	if x != nil {
+		return x.FromManifest
+	}
+	return ""
+}
+
 type VM struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	SandboxId       string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
@@ -562,9 +576,14 @@ type VM struct {
 	CreatedAtUnixMs int64                  `protobuf:"varint,6,opt,name=created_at_unix_ms,json=createdAtUnixMs,proto3" json:"created_at_unix_ms,omitempty"`
 	Error           string                 `protobuf:"bytes,7,opt,name=error,proto3" json:"error,omitempty"` // why FAILED
 	// When the VM last became READY (CreateVM or StartVM); 0 if never.
-	StartedAtUnixMs int64 `protobuf:"varint,8,opt,name=started_at_unix_ms,json=startedAtUnixMs,proto3" json:"started_at_unix_ms,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	StartedAtUnixMs int64  `protobuf:"varint,8,opt,name=started_at_unix_ms,json=startedAtUnixMs,proto3" json:"started_at_unix_ms,omitempty"`
+	FromManifest    string `protobuf:"bytes,9,opt,name=from_manifest,json=fromManifest,proto3" json:"from_manifest,omitempty"` // Phase 2: as in CreateVMRequest
+	// Phase 2: whether the disk is fully local. Always set. A VM not created
+	// from a manifest is hydrated from the start. In Phase 2a restores are
+	// eager, so a READY VM is always hydrated; Phase 2b makes them lazy.
+	Hydration     *Hydration `protobuf:"bytes,10,opt,name=hydration,proto3" json:"hydration,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VM) Reset() {
@@ -653,6 +672,88 @@ func (x *VM) GetStartedAtUnixMs() int64 {
 	return 0
 }
 
+func (x *VM) GetFromManifest() string {
+	if x != nil {
+		return x.FromManifest
+	}
+	return ""
+}
+
+func (x *VM) GetHydration() *Hydration {
+	if x != nil {
+		return x.Hydration
+	}
+	return nil
+}
+
+type Hydration struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Hydrated         bool                   `protobuf:"varint,1,opt,name=hydrated,proto3" json:"hydrated,omitempty"`
+	HydratedAtUnixMs int64                  `protobuf:"varint,2,opt,name=hydrated_at_unix_ms,json=hydratedAtUnixMs,proto3" json:"hydrated_at_unix_ms,omitempty"` // 0 while not hydrated
+	ChunksDone       uint64                 `protobuf:"varint,3,opt,name=chunks_done,json=chunksDone,proto3" json:"chunks_done,omitempty"`                       // of the manifest's chunks, local so far
+	ChunksTotal      uint64                 `protobuf:"varint,4,opt,name=chunks_total,json=chunksTotal,proto3" json:"chunks_total,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *Hydration) Reset() {
+	*x = Hydration{}
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Hydration) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Hydration) ProtoMessage() {}
+
+func (x *Hydration) ProtoReflect() protoreflect.Message {
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Hydration.ProtoReflect.Descriptor instead.
+func (*Hydration) Descriptor() ([]byte, []int) {
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *Hydration) GetHydrated() bool {
+	if x != nil {
+		return x.Hydrated
+	}
+	return false
+}
+
+func (x *Hydration) GetHydratedAtUnixMs() int64 {
+	if x != nil {
+		return x.HydratedAtUnixMs
+	}
+	return 0
+}
+
+func (x *Hydration) GetChunksDone() uint64 {
+	if x != nil {
+		return x.ChunksDone
+	}
+	return 0
+}
+
+func (x *Hydration) GetChunksTotal() uint64 {
+	if x != nil {
+		return x.ChunksTotal
+	}
+	return 0
+}
+
 type GetVMRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
@@ -662,7 +763,7 @@ type GetVMRequest struct {
 
 func (x *GetVMRequest) Reset() {
 	*x = GetVMRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[6]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -674,7 +775,7 @@ func (x *GetVMRequest) String() string {
 func (*GetVMRequest) ProtoMessage() {}
 
 func (x *GetVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[6]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -687,7 +788,7 @@ func (x *GetVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMRequest.ProtoReflect.Descriptor instead.
 func (*GetVMRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{6}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GetVMRequest) GetSandboxId() string {
@@ -705,7 +806,7 @@ type ListVMsRequest struct {
 
 func (x *ListVMsRequest) Reset() {
 	*x = ListVMsRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[7]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -717,7 +818,7 @@ func (x *ListVMsRequest) String() string {
 func (*ListVMsRequest) ProtoMessage() {}
 
 func (x *ListVMsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[7]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -730,7 +831,7 @@ func (x *ListVMsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVMsRequest.ProtoReflect.Descriptor instead.
 func (*ListVMsRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{7}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{8}
 }
 
 type ListVMsResponse struct {
@@ -742,7 +843,7 @@ type ListVMsResponse struct {
 
 func (x *ListVMsResponse) Reset() {
 	*x = ListVMsResponse{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[8]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -754,7 +855,7 @@ func (x *ListVMsResponse) String() string {
 func (*ListVMsResponse) ProtoMessage() {}
 
 func (x *ListVMsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[8]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -767,7 +868,7 @@ func (x *ListVMsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVMsResponse.ProtoReflect.Descriptor instead.
 func (*ListVMsResponse) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{8}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ListVMsResponse) GetVms() []*VM {
@@ -786,7 +887,7 @@ type DeleteVMRequest struct {
 
 func (x *DeleteVMRequest) Reset() {
 	*x = DeleteVMRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[9]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -798,7 +899,7 @@ func (x *DeleteVMRequest) String() string {
 func (*DeleteVMRequest) ProtoMessage() {}
 
 func (x *DeleteVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[9]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -811,7 +912,7 @@ func (x *DeleteVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteVMRequest.ProtoReflect.Descriptor instead.
 func (*DeleteVMRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{9}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *DeleteVMRequest) GetSandboxId() string {
@@ -829,7 +930,7 @@ type DeleteVMResponse struct {
 
 func (x *DeleteVMResponse) Reset() {
 	*x = DeleteVMResponse{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[10]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -841,7 +942,7 @@ func (x *DeleteVMResponse) String() string {
 func (*DeleteVMResponse) ProtoMessage() {}
 
 func (x *DeleteVMResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[10]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -854,7 +955,7 @@ func (x *DeleteVMResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteVMResponse.ProtoReflect.Descriptor instead.
 func (*DeleteVMResponse) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{10}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{11}
 }
 
 type ExecRequest struct {
@@ -872,7 +973,7 @@ type ExecRequest struct {
 
 func (x *ExecRequest) Reset() {
 	*x = ExecRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[11]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -884,7 +985,7 @@ func (x *ExecRequest) String() string {
 func (*ExecRequest) ProtoMessage() {}
 
 func (x *ExecRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[11]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -897,7 +998,7 @@ func (x *ExecRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecRequest.ProtoReflect.Descriptor instead.
 func (*ExecRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{11}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ExecRequest) GetSandboxId() string {
@@ -950,7 +1051,7 @@ type ExecEvent struct {
 
 func (x *ExecEvent) Reset() {
 	*x = ExecEvent{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[12]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -962,7 +1063,7 @@ func (x *ExecEvent) String() string {
 func (*ExecEvent) ProtoMessage() {}
 
 func (x *ExecEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[12]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -975,7 +1076,7 @@ func (x *ExecEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecEvent.ProtoReflect.Descriptor instead.
 func (*ExecEvent) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{12}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ExecEvent) GetEvent() isExecEvent_Event {
@@ -1062,7 +1163,7 @@ type PutFileRequest struct {
 
 func (x *PutFileRequest) Reset() {
 	*x = PutFileRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[13]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1074,7 +1175,7 @@ func (x *PutFileRequest) String() string {
 func (*PutFileRequest) ProtoMessage() {}
 
 func (x *PutFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[13]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1087,7 +1188,7 @@ func (x *PutFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutFileRequest.ProtoReflect.Descriptor instead.
 func (*PutFileRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{13}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *PutFileRequest) GetPart() isPutFileRequest_Part {
@@ -1141,7 +1242,7 @@ type PutFileResponse struct {
 
 func (x *PutFileResponse) Reset() {
 	*x = PutFileResponse{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[14]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1153,7 +1254,7 @@ func (x *PutFileResponse) String() string {
 func (*PutFileResponse) ProtoMessage() {}
 
 func (x *PutFileResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[14]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1166,7 +1267,7 @@ func (x *PutFileResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutFileResponse.ProtoReflect.Descriptor instead.
 func (*PutFileResponse) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{14}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *PutFileResponse) GetPath() string {
@@ -1193,7 +1294,7 @@ type SaveSnapshotRequest struct {
 
 func (x *SaveSnapshotRequest) Reset() {
 	*x = SaveSnapshotRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[15]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1205,7 +1306,7 @@ func (x *SaveSnapshotRequest) String() string {
 func (*SaveSnapshotRequest) ProtoMessage() {}
 
 func (x *SaveSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[15]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1218,7 +1319,7 @@ func (x *SaveSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SaveSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*SaveSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{15}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *SaveSnapshotRequest) GetSandboxId() string {
@@ -1248,7 +1349,7 @@ type Snapshot struct {
 
 func (x *Snapshot) Reset() {
 	*x = Snapshot{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[16]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1260,7 +1361,7 @@ func (x *Snapshot) String() string {
 func (*Snapshot) ProtoMessage() {}
 
 func (x *Snapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[16]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1273,7 +1374,7 @@ func (x *Snapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Snapshot.ProtoReflect.Descriptor instead.
 func (*Snapshot) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{16}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *Snapshot) GetSnapshotId() string {
@@ -1320,7 +1421,7 @@ type DeleteSnapshotRequest struct {
 
 func (x *DeleteSnapshotRequest) Reset() {
 	*x = DeleteSnapshotRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[17]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1332,7 +1433,7 @@ func (x *DeleteSnapshotRequest) String() string {
 func (*DeleteSnapshotRequest) ProtoMessage() {}
 
 func (x *DeleteSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[17]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1345,7 +1446,7 @@ func (x *DeleteSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*DeleteSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{17}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *DeleteSnapshotRequest) GetSnapshotId() string {
@@ -1363,7 +1464,7 @@ type DeleteSnapshotResponse struct {
 
 func (x *DeleteSnapshotResponse) Reset() {
 	*x = DeleteSnapshotResponse{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[18]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1375,7 +1476,7 @@ func (x *DeleteSnapshotResponse) String() string {
 func (*DeleteSnapshotResponse) ProtoMessage() {}
 
 func (x *DeleteSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[18]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1388,7 +1489,7 @@ func (x *DeleteSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*DeleteSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{18}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{19}
 }
 
 type StopVMRequest struct {
@@ -1401,7 +1502,7 @@ type StopVMRequest struct {
 
 func (x *StopVMRequest) Reset() {
 	*x = StopVMRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[19]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1413,7 +1514,7 @@ func (x *StopVMRequest) String() string {
 func (*StopVMRequest) ProtoMessage() {}
 
 func (x *StopVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[19]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1426,7 +1527,7 @@ func (x *StopVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopVMRequest.ProtoReflect.Descriptor instead.
 func (*StopVMRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{19}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *StopVMRequest) GetSandboxId() string {
@@ -1455,7 +1556,7 @@ type StartVMRequest struct {
 
 func (x *StartVMRequest) Reset() {
 	*x = StartVMRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[20]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1467,7 +1568,7 @@ func (x *StartVMRequest) String() string {
 func (*StartVMRequest) ProtoMessage() {}
 
 func (x *StartVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[20]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1480,7 +1581,7 @@ func (x *StartVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartVMRequest.ProtoReflect.Descriptor instead.
 func (*StartVMRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{20}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *StartVMRequest) GetSandboxId() string {
@@ -1533,7 +1634,7 @@ type Process struct {
 
 func (x *Process) Reset() {
 	*x = Process{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[21]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1545,7 +1646,7 @@ func (x *Process) String() string {
 func (*Process) ProtoMessage() {}
 
 func (x *Process) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[21]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1558,7 +1659,7 @@ func (x *Process) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Process.ProtoReflect.Descriptor instead.
 func (*Process) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{21}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *Process) GetProcessId() uint32 {
@@ -1658,7 +1759,7 @@ type StartProcessRequest struct {
 
 func (x *StartProcessRequest) Reset() {
 	*x = StartProcessRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[22]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1670,7 +1771,7 @@ func (x *StartProcessRequest) String() string {
 func (*StartProcessRequest) ProtoMessage() {}
 
 func (x *StartProcessRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[22]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1683,7 +1784,7 @@ func (x *StartProcessRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartProcessRequest.ProtoReflect.Descriptor instead.
 func (*StartProcessRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{22}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *StartProcessRequest) GetSandboxId() string {
@@ -1740,7 +1841,7 @@ type GetProcessRequest struct {
 
 func (x *GetProcessRequest) Reset() {
 	*x = GetProcessRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[23]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1752,7 +1853,7 @@ func (x *GetProcessRequest) String() string {
 func (*GetProcessRequest) ProtoMessage() {}
 
 func (x *GetProcessRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[23]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1765,7 +1866,7 @@ func (x *GetProcessRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProcessRequest.ProtoReflect.Descriptor instead.
 func (*GetProcessRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{23}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *GetProcessRequest) GetSandboxId() string {
@@ -1819,7 +1920,7 @@ type ProcessOutput struct {
 
 func (x *ProcessOutput) Reset() {
 	*x = ProcessOutput{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[24]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1831,7 +1932,7 @@ func (x *ProcessOutput) String() string {
 func (*ProcessOutput) ProtoMessage() {}
 
 func (x *ProcessOutput) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[24]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1844,7 +1945,7 @@ func (x *ProcessOutput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessOutput.ProtoReflect.Descriptor instead.
 func (*ProcessOutput) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{24}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ProcessOutput) GetProcess() *Process {
@@ -1915,7 +2016,7 @@ type AttachProcessRequest struct {
 
 func (x *AttachProcessRequest) Reset() {
 	*x = AttachProcessRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[25]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1927,7 +2028,7 @@ func (x *AttachProcessRequest) String() string {
 func (*AttachProcessRequest) ProtoMessage() {}
 
 func (x *AttachProcessRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[25]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1940,7 +2041,7 @@ func (x *AttachProcessRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachProcessRequest.ProtoReflect.Descriptor instead.
 func (*AttachProcessRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{25}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *AttachProcessRequest) GetSandboxId() string {
@@ -1986,7 +2087,7 @@ type ProcessEvent struct {
 
 func (x *ProcessEvent) Reset() {
 	*x = ProcessEvent{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[26]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1998,7 +2099,7 @@ func (x *ProcessEvent) String() string {
 func (*ProcessEvent) ProtoMessage() {}
 
 func (x *ProcessEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[26]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2011,7 +2112,7 @@ func (x *ProcessEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessEvent.ProtoReflect.Descriptor instead.
 func (*ProcessEvent) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{26}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *ProcessEvent) GetEvent() isProcessEvent_Event {
@@ -2096,7 +2197,7 @@ type KillProcessRequest struct {
 
 func (x *KillProcessRequest) Reset() {
 	*x = KillProcessRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[27]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2108,7 +2209,7 @@ func (x *KillProcessRequest) String() string {
 func (*KillProcessRequest) ProtoMessage() {}
 
 func (x *KillProcessRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[27]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2121,7 +2222,7 @@ func (x *KillProcessRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KillProcessRequest.ProtoReflect.Descriptor instead.
 func (*KillProcessRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{27}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *KillProcessRequest) GetSandboxId() string {
@@ -2155,7 +2256,7 @@ type KillProcessResponse struct {
 
 func (x *KillProcessResponse) Reset() {
 	*x = KillProcessResponse{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[28]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2167,7 +2268,7 @@ func (x *KillProcessResponse) String() string {
 func (*KillProcessResponse) ProtoMessage() {}
 
 func (x *KillProcessResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[28]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2180,7 +2281,7 @@ func (x *KillProcessResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KillProcessResponse.ProtoReflect.Descriptor instead.
 func (*KillProcessResponse) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{28}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *KillProcessResponse) GetProcess() *Process {
@@ -2216,7 +2317,7 @@ type FileInfo struct {
 
 func (x *FileInfo) Reset() {
 	*x = FileInfo{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[29]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2228,7 +2329,7 @@ func (x *FileInfo) String() string {
 func (*FileInfo) ProtoMessage() {}
 
 func (x *FileInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[29]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2241,7 +2342,7 @@ func (x *FileInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileInfo.ProtoReflect.Descriptor instead.
 func (*FileInfo) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{29}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *FileInfo) GetPath() string {
@@ -2304,7 +2405,7 @@ type ReadFileRequest struct {
 
 func (x *ReadFileRequest) Reset() {
 	*x = ReadFileRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[30]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2316,7 +2417,7 @@ func (x *ReadFileRequest) String() string {
 func (*ReadFileRequest) ProtoMessage() {}
 
 func (x *ReadFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[30]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2329,7 +2430,7 @@ func (x *ReadFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadFileRequest.ProtoReflect.Descriptor instead.
 func (*ReadFileRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{30}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ReadFileRequest) GetSandboxId() string {
@@ -2366,7 +2467,7 @@ type ReadFileResponse struct {
 
 func (x *ReadFileResponse) Reset() {
 	*x = ReadFileResponse{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[31]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2378,7 +2479,7 @@ func (x *ReadFileResponse) String() string {
 func (*ReadFileResponse) ProtoMessage() {}
 
 func (x *ReadFileResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[31]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2391,7 +2492,7 @@ func (x *ReadFileResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadFileResponse.ProtoReflect.Descriptor instead.
 func (*ReadFileResponse) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{31}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *ReadFileResponse) GetPart() isReadFileResponse_Part {
@@ -2445,7 +2546,7 @@ type StatFileRequest struct {
 
 func (x *StatFileRequest) Reset() {
 	*x = StatFileRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[32]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2457,7 +2558,7 @@ func (x *StatFileRequest) String() string {
 func (*StatFileRequest) ProtoMessage() {}
 
 func (x *StatFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[32]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2470,7 +2571,7 @@ func (x *StatFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatFileRequest.ProtoReflect.Descriptor instead.
 func (*StatFileRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{32}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *StatFileRequest) GetSandboxId() string {
@@ -2498,7 +2599,7 @@ type ListFilesRequest struct {
 
 func (x *ListFilesRequest) Reset() {
 	*x = ListFilesRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[33]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2510,7 +2611,7 @@ func (x *ListFilesRequest) String() string {
 func (*ListFilesRequest) ProtoMessage() {}
 
 func (x *ListFilesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[33]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2523,7 +2624,7 @@ func (x *ListFilesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFilesRequest.ProtoReflect.Descriptor instead.
 func (*ListFilesRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{33}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ListFilesRequest) GetSandboxId() string {
@@ -2558,7 +2659,7 @@ type ListFilesResponse struct {
 
 func (x *ListFilesResponse) Reset() {
 	*x = ListFilesResponse{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[34]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2570,7 +2671,7 @@ func (x *ListFilesResponse) String() string {
 func (*ListFilesResponse) ProtoMessage() {}
 
 func (x *ListFilesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[34]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2583,7 +2684,7 @@ func (x *ListFilesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFilesResponse.ProtoReflect.Descriptor instead.
 func (*ListFilesResponse) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{34}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ListFilesResponse) GetPath() string {
@@ -2618,7 +2719,7 @@ type DeleteFileRequest struct {
 
 func (x *DeleteFileRequest) Reset() {
 	*x = DeleteFileRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[35]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2630,7 +2731,7 @@ func (x *DeleteFileRequest) String() string {
 func (*DeleteFileRequest) ProtoMessage() {}
 
 func (x *DeleteFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[35]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2643,7 +2744,7 @@ func (x *DeleteFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteFileRequest.ProtoReflect.Descriptor instead.
 func (*DeleteFileRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{35}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *DeleteFileRequest) GetSandboxId() string {
@@ -2676,7 +2777,7 @@ type DeleteFileResponse struct {
 
 func (x *DeleteFileResponse) Reset() {
 	*x = DeleteFileResponse{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[36]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2688,7 +2789,7 @@ func (x *DeleteFileResponse) String() string {
 func (*DeleteFileResponse) ProtoMessage() {}
 
 func (x *DeleteFileResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[36]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2701,7 +2802,7 @@ func (x *DeleteFileResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteFileResponse.ProtoReflect.Descriptor instead.
 func (*DeleteFileResponse) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{36}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *DeleteFileResponse) GetPath() string {
@@ -2722,7 +2823,7 @@ type MakeDirRequest struct {
 
 func (x *MakeDirRequest) Reset() {
 	*x = MakeDirRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[37]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2734,7 +2835,7 @@ func (x *MakeDirRequest) String() string {
 func (*MakeDirRequest) ProtoMessage() {}
 
 func (x *MakeDirRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[37]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2747,7 +2848,7 @@ func (x *MakeDirRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MakeDirRequest.ProtoReflect.Descriptor instead.
 func (*MakeDirRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{37}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *MakeDirRequest) GetSandboxId() string {
@@ -2783,7 +2884,7 @@ type MoveFileRequest struct {
 
 func (x *MoveFileRequest) Reset() {
 	*x = MoveFileRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[38]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2795,7 +2896,7 @@ func (x *MoveFileRequest) String() string {
 func (*MoveFileRequest) ProtoMessage() {}
 
 func (x *MoveFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[38]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2808,7 +2909,7 @@ func (x *MoveFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MoveFileRequest.ProtoReflect.Descriptor instead.
 func (*MoveFileRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{38}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *MoveFileRequest) GetSandboxId() string {
@@ -2849,7 +2950,7 @@ type MoveFileResponse struct {
 
 func (x *MoveFileResponse) Reset() {
 	*x = MoveFileResponse{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[39]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2861,7 +2962,7 @@ func (x *MoveFileResponse) String() string {
 func (*MoveFileResponse) ProtoMessage() {}
 
 func (x *MoveFileResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[39]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2874,7 +2975,7 @@ func (x *MoveFileResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MoveFileResponse.ProtoReflect.Descriptor instead.
 func (*MoveFileResponse) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{39}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *MoveFileResponse) GetSource() string {
@@ -2902,7 +3003,7 @@ type ChmodFileRequest struct {
 
 func (x *ChmodFileRequest) Reset() {
 	*x = ChmodFileRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[40]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2914,7 +3015,7 @@ func (x *ChmodFileRequest) String() string {
 func (*ChmodFileRequest) ProtoMessage() {}
 
 func (x *ChmodFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[40]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2927,7 +3028,7 @@ func (x *ChmodFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChmodFileRequest.ProtoReflect.Descriptor instead.
 func (*ChmodFileRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{40}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *ChmodFileRequest) GetSandboxId() string {
@@ -2961,7 +3062,7 @@ type AddSSHKeyRequest struct {
 
 func (x *AddSSHKeyRequest) Reset() {
 	*x = AddSSHKeyRequest{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[41]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2973,7 +3074,7 @@ func (x *AddSSHKeyRequest) String() string {
 func (*AddSSHKeyRequest) ProtoMessage() {}
 
 func (x *AddSSHKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[41]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2986,7 +3087,7 @@ func (x *AddSSHKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AddSSHKeyRequest.ProtoReflect.Descriptor instead.
 func (*AddSSHKeyRequest) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{41}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *AddSSHKeyRequest) GetSandboxId() string {
@@ -3015,7 +3116,7 @@ type SSHAccess struct {
 
 func (x *SSHAccess) Reset() {
 	*x = SSHAccess{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[42]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3027,7 +3128,7 @@ func (x *SSHAccess) String() string {
 func (*SSHAccess) ProtoMessage() {}
 
 func (x *SSHAccess) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[42]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3040,7 +3141,7 @@ func (x *SSHAccess) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SSHAccess.ProtoReflect.Descriptor instead.
 func (*SSHAccess) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{42}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *SSHAccess) GetUser() string {
@@ -3071,6 +3172,247 @@ func (x *SSHAccess) GetHostKey() string {
 	return ""
 }
 
+type SnapshotVMRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	// The chain this generation belongs to (a UUID string chosen by the
+	// server) and its position in it (0 = the chain's base).
+	ChainId    string `protobuf:"bytes,2,opt,name=chain_id,json=chainId,proto3" json:"chain_id,omitempty"`
+	Generation uint32 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
+	// Freeze the guest's file systems for the cut (default). false: crash
+	// consistent only, for a guest that does not answer.
+	Freeze        *bool `protobuf:"varint,4,opt,name=freeze,proto3,oneof" json:"freeze,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnapshotVMRequest) Reset() {
+	*x = SnapshotVMRequest{}
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotVMRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotVMRequest) ProtoMessage() {}
+
+func (x *SnapshotVMRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotVMRequest.ProtoReflect.Descriptor instead.
+func (*SnapshotVMRequest) Descriptor() ([]byte, []int) {
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *SnapshotVMRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *SnapshotVMRequest) GetChainId() string {
+	if x != nil {
+		return x.ChainId
+	}
+	return ""
+}
+
+func (x *SnapshotVMRequest) GetGeneration() uint32 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *SnapshotVMRequest) GetFreeze() bool {
+	if x != nil && x.Freeze != nil {
+		return *x.Freeze
+	}
+	return false
+}
+
+// Generation describes one written manifest.
+type Generation struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	ManifestKey     string                 `protobuf:"bytes,1,opt,name=manifest_key,json=manifestKey,proto3" json:"manifest_key,omitempty"` // snapformat.ManifestKey(chain_id, generation)
+	ChainId         string                 `protobuf:"bytes,2,opt,name=chain_id,json=chainId,proto3" json:"chain_id,omitempty"`
+	Generation      uint32                 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
+	Image           string                 `protobuf:"bytes,4,opt,name=image,proto3" json:"image,omitempty"`                                                  // the base image the manifest sits on
+	DiskBytes       uint64                 `protobuf:"varint,5,opt,name=disk_bytes,json=diskBytes,proto3" json:"disk_bytes,omitempty"`                        // virtual disk size
+	Chunks          uint64                 `protobuf:"varint,6,opt,name=chunks,proto3" json:"chunks,omitempty"`                                               // chunks the manifest lists (zero chunks included)
+	ChunksUploaded  uint64                 `protobuf:"varint,7,opt,name=chunks_uploaded,json=chunksUploaded,proto3" json:"chunks_uploaded,omitempty"`         // chunks this call put (not already in the store)
+	BytesUploaded   uint64                 `protobuf:"varint,8,opt,name=bytes_uploaded,json=bytesUploaded,proto3" json:"bytes_uploaded,omitempty"`            // compressed bytes this call put, manifest included
+	ContentBytes    uint64                 `protobuf:"varint,9,opt,name=content_bytes,json=contentBytes,proto3" json:"content_bytes,omitempty"`               // uncompressed bytes of the listed non-zero chunks
+	CreatedAtUnixMs int64                  `protobuf:"varint,10,opt,name=created_at_unix_ms,json=createdAtUnixMs,proto3" json:"created_at_unix_ms,omitempty"` // the cut (freeze) time
+	Frozen          bool                   `protobuf:"varint,11,opt,name=frozen,proto3" json:"frozen,omitempty"`                                              // the guest's file systems were frozen for the cut
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *Generation) Reset() {
+	*x = Generation{}
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[45]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Generation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Generation) ProtoMessage() {}
+
+func (x *Generation) ProtoReflect() protoreflect.Message {
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[45]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Generation.ProtoReflect.Descriptor instead.
+func (*Generation) Descriptor() ([]byte, []int) {
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{45}
+}
+
+func (x *Generation) GetManifestKey() string {
+	if x != nil {
+		return x.ManifestKey
+	}
+	return ""
+}
+
+func (x *Generation) GetChainId() string {
+	if x != nil {
+		return x.ChainId
+	}
+	return ""
+}
+
+func (x *Generation) GetGeneration() uint32 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *Generation) GetImage() string {
+	if x != nil {
+		return x.Image
+	}
+	return ""
+}
+
+func (x *Generation) GetDiskBytes() uint64 {
+	if x != nil {
+		return x.DiskBytes
+	}
+	return 0
+}
+
+func (x *Generation) GetChunks() uint64 {
+	if x != nil {
+		return x.Chunks
+	}
+	return 0
+}
+
+func (x *Generation) GetChunksUploaded() uint64 {
+	if x != nil {
+		return x.ChunksUploaded
+	}
+	return 0
+}
+
+func (x *Generation) GetBytesUploaded() uint64 {
+	if x != nil {
+		return x.BytesUploaded
+	}
+	return 0
+}
+
+func (x *Generation) GetContentBytes() uint64 {
+	if x != nil {
+		return x.ContentBytes
+	}
+	return 0
+}
+
+func (x *Generation) GetCreatedAtUnixMs() int64 {
+	if x != nil {
+		return x.CreatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *Generation) GetFrozen() bool {
+	if x != nil {
+		return x.Frozen
+	}
+	return false
+}
+
+type ResetVMRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResetVMRequest) Reset() {
+	*x = ResetVMRequest{}
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[46]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResetVMRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResetVMRequest) ProtoMessage() {}
+
+func (x *ResetVMRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[46]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResetVMRequest.ProtoReflect.Descriptor instead.
+func (*ResetVMRequest) Descriptor() ([]byte, []int) {
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{46}
+}
+
+func (x *ResetVMRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
 type ExecEvent_Started struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Pid           int32                  `protobuf:"varint,1,opt,name=pid,proto3" json:"pid,omitempty"`
@@ -3080,7 +3422,7 @@ type ExecEvent_Started struct {
 
 func (x *ExecEvent_Started) Reset() {
 	*x = ExecEvent_Started{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[45]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3092,7 +3434,7 @@ func (x *ExecEvent_Started) String() string {
 func (*ExecEvent_Started) ProtoMessage() {}
 
 func (x *ExecEvent_Started) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[45]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3105,7 +3447,7 @@ func (x *ExecEvent_Started) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecEvent_Started.ProtoReflect.Descriptor instead.
 func (*ExecEvent_Started) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{12, 0}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{13, 0}
 }
 
 func (x *ExecEvent_Started) GetPid() int32 {
@@ -3129,7 +3471,7 @@ type ExecEvent_Exit struct {
 
 func (x *ExecEvent_Exit) Reset() {
 	*x = ExecEvent_Exit{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[46]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3141,7 +3483,7 @@ func (x *ExecEvent_Exit) String() string {
 func (*ExecEvent_Exit) ProtoMessage() {}
 
 func (x *ExecEvent_Exit) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[46]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3154,7 +3496,7 @@ func (x *ExecEvent_Exit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecEvent_Exit.ProtoReflect.Descriptor instead.
 func (*ExecEvent_Exit) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{12, 1}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{13, 1}
 }
 
 func (x *ExecEvent_Exit) GetExitCode() int32 {
@@ -3203,7 +3545,7 @@ type PutFileRequest_Header struct {
 
 func (x *PutFileRequest_Header) Reset() {
 	*x = PutFileRequest_Header{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[47]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3215,7 +3557,7 @@ func (x *PutFileRequest_Header) String() string {
 func (*PutFileRequest_Header) ProtoMessage() {}
 
 func (x *PutFileRequest_Header) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[47]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3228,7 +3570,7 @@ func (x *PutFileRequest_Header) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutFileRequest_Header.ProtoReflect.Descriptor instead.
 func (*PutFileRequest_Header) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{13, 0}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{14, 0}
 }
 
 func (x *PutFileRequest_Header) GetSandboxId() string {
@@ -3263,7 +3605,7 @@ type ProcessEvent_Attached struct {
 
 func (x *ProcessEvent_Attached) Reset() {
 	*x = ProcessEvent_Attached{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[50]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3275,7 +3617,7 @@ func (x *ProcessEvent_Attached) String() string {
 func (*ProcessEvent_Attached) ProtoMessage() {}
 
 func (x *ProcessEvent_Attached) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[50]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3288,7 +3630,7 @@ func (x *ProcessEvent_Attached) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessEvent_Attached.ProtoReflect.Descriptor instead.
 func (*ProcessEvent_Attached) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{26, 0}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{27, 0}
 }
 
 func (x *ProcessEvent_Attached) GetProcess() *Process {
@@ -3322,7 +3664,7 @@ type ProcessEvent_Chunk struct {
 
 func (x *ProcessEvent_Chunk) Reset() {
 	*x = ProcessEvent_Chunk{}
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[51]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3334,7 +3676,7 @@ func (x *ProcessEvent_Chunk) String() string {
 func (*ProcessEvent_Chunk) ProtoMessage() {}
 
 func (x *ProcessEvent_Chunk) ProtoReflect() protoreflect.Message {
-	mi := &file_bbraft_node_v1_node_proto_msgTypes[51]
+	mi := &file_bbraft_node_v1_node_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3347,7 +3689,7 @@ func (x *ProcessEvent_Chunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessEvent_Chunk.ProtoReflect.Descriptor instead.
 func (*ProcessEvent_Chunk) Descriptor() ([]byte, []int) {
-	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{26, 1}
+	return file_bbraft_node_v1_node_proto_rawDescGZIP(), []int{27, 1}
 }
 
 func (x *ProcessEvent_Chunk) GetData() []byte {
@@ -3388,7 +3730,7 @@ const file_bbraft_node_v1_node_proto_rawDesc = "" +
 	"\x05vcpus\x18\x01 \x01(\rR\x05vcpus\x12\x1d\n" +
 	"\n" +
 	"memory_mib\x18\x02 \x01(\x04R\tmemoryMib\x12\x19\n" +
-	"\bdisk_gib\x18\x03 \x01(\x04R\adiskGib\"\xb4\x02\n" +
+	"\bdisk_gib\x18\x03 \x01(\x04R\adiskGib\"\xd9\x02\n" +
 	"\x0fCreateVMRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x127\n" +
@@ -3396,10 +3738,11 @@ const file_bbraft_node_v1_node_proto_rawDesc = "" +
 	"\x05image\x18\x03 \x01(\tR\x05image\x12#\n" +
 	"\rfrom_snapshot\x18\x04 \x01(\tR\ffromSnapshot\x12:\n" +
 	"\x03env\x18\x05 \x03(\v2(.bbraft.node.v1.CreateVMRequest.EnvEntryR\x03env\x12\x1a\n" +
-	"\bhostname\x18\x06 \x01(\tR\bhostname\x1a6\n" +
+	"\bhostname\x18\x06 \x01(\tR\bhostname\x12#\n" +
+	"\rfrom_manifest\x18\a \x01(\tR\ffromManifest\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb6\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x94\x03\n" +
 	"\x02VM\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12-\n" +
@@ -3409,7 +3752,16 @@ const file_bbraft_node_v1_node_proto_rawDesc = "" +
 	"\tresources\x18\x05 \x01(\v2\x19.bbraft.node.v1.ResourcesR\tresources\x12+\n" +
 	"\x12created_at_unix_ms\x18\x06 \x01(\x03R\x0fcreatedAtUnixMs\x12\x14\n" +
 	"\x05error\x18\a \x01(\tR\x05error\x12+\n" +
-	"\x12started_at_unix_ms\x18\b \x01(\x03R\x0fstartedAtUnixMs\"-\n" +
+	"\x12started_at_unix_ms\x18\b \x01(\x03R\x0fstartedAtUnixMs\x12#\n" +
+	"\rfrom_manifest\x18\t \x01(\tR\ffromManifest\x127\n" +
+	"\thydration\x18\n" +
+	" \x01(\v2\x19.bbraft.node.v1.HydrationR\thydration\"\x9a\x01\n" +
+	"\tHydration\x12\x1a\n" +
+	"\bhydrated\x18\x01 \x01(\bR\bhydrated\x12-\n" +
+	"\x13hydrated_at_unix_ms\x18\x02 \x01(\x03R\x10hydratedAtUnixMs\x12\x1f\n" +
+	"\vchunks_done\x18\x03 \x01(\x04R\n" +
+	"chunksDone\x12!\n" +
+	"\fchunks_total\x18\x04 \x01(\x04R\vchunksTotal\"-\n" +
 	"\fGetVMRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"\x10\n" +
@@ -3635,7 +3987,36 @@ const file_bbraft_node_v1_node_proto_rawDesc = "" +
 	"\x04user\x18\x01 \x01(\tR\x04user\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x03 \x01(\rR\x04port\x12\x19\n" +
-	"\bhost_key\x18\x04 \x01(\tR\ahostKey*\x8f\x01\n" +
+	"\bhost_key\x18\x04 \x01(\tR\ahostKey\"\x95\x01\n" +
+	"\x11SnapshotVMRequest\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x19\n" +
+	"\bchain_id\x18\x02 \x01(\tR\achainId\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x03 \x01(\rR\n" +
+	"generation\x12\x1b\n" +
+	"\x06freeze\x18\x04 \x01(\bH\x00R\x06freeze\x88\x01\x01B\t\n" +
+	"\a_freeze\"\xf1\x02\n" +
+	"\n" +
+	"Generation\x12!\n" +
+	"\fmanifest_key\x18\x01 \x01(\tR\vmanifestKey\x12\x19\n" +
+	"\bchain_id\x18\x02 \x01(\tR\achainId\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x03 \x01(\rR\n" +
+	"generation\x12\x14\n" +
+	"\x05image\x18\x04 \x01(\tR\x05image\x12\x1d\n" +
+	"\n" +
+	"disk_bytes\x18\x05 \x01(\x04R\tdiskBytes\x12\x16\n" +
+	"\x06chunks\x18\x06 \x01(\x04R\x06chunks\x12'\n" +
+	"\x0fchunks_uploaded\x18\a \x01(\x04R\x0echunksUploaded\x12%\n" +
+	"\x0ebytes_uploaded\x18\b \x01(\x04R\rbytesUploaded\x12#\n" +
+	"\rcontent_bytes\x18\t \x01(\x04R\fcontentBytes\x12+\n" +
+	"\x12created_at_unix_ms\x18\n" +
+	" \x01(\x03R\x0fcreatedAtUnixMs\x12\x16\n" +
+	"\x06frozen\x18\v \x01(\bR\x06frozen\"/\n" +
+	"\x0eResetVMRequest\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId*\x8f\x01\n" +
 	"\aVMState\x12\x18\n" +
 	"\x14VM_STATE_UNSPECIFIED\x10\x00\x12\x14\n" +
 	"\x10VM_STATE_BOOTING\x10\x01\x12\x12\n" +
@@ -3652,7 +4033,7 @@ const file_bbraft_node_v1_node_proto_rawDesc = "" +
 	"\x15FILE_TYPE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11FILE_TYPE_REGULAR\x10\x01\x12\x17\n" +
 	"\x13FILE_TYPE_DIRECTORY\x10\x02\x12\x13\n" +
-	"\x0fFILE_TYPE_OTHER\x10\x032\xcf\r\n" +
+	"\x0fFILE_TYPE_OTHER\x10\x032\xdb\x0e\n" +
 	"\x04Node\x12A\n" +
 	"\x04Info\x12\x1b.bbraft.node.v1.InfoRequest\x1a\x1c.bbraft.node.v1.InfoResponse\x12?\n" +
 	"\bCreateVM\x12\x1f.bbraft.node.v1.CreateVMRequest\x1a\x12.bbraft.node.v1.VM\x129\n" +
@@ -3678,7 +4059,10 @@ const file_bbraft_node_v1_node_proto_rawDesc = "" +
 	"\aMakeDir\x12\x1e.bbraft.node.v1.MakeDirRequest\x1a\x18.bbraft.node.v1.FileInfo\x12M\n" +
 	"\bMoveFile\x12\x1f.bbraft.node.v1.MoveFileRequest\x1a .bbraft.node.v1.MoveFileResponse\x12G\n" +
 	"\tChmodFile\x12 .bbraft.node.v1.ChmodFileRequest\x1a\x18.bbraft.node.v1.FileInfo\x12H\n" +
-	"\tAddSSHKey\x12 .bbraft.node.v1.AddSSHKeyRequest\x1a\x19.bbraft.node.v1.SSHAccessBCZAgithub.com/nathabonfim59/bamboo-raft/internal/proto/nodev1;nodev1b\x06proto3"
+	"\tAddSSHKey\x12 .bbraft.node.v1.AddSSHKeyRequest\x1a\x19.bbraft.node.v1.SSHAccess\x12K\n" +
+	"\n" +
+	"SnapshotVM\x12!.bbraft.node.v1.SnapshotVMRequest\x1a\x1a.bbraft.node.v1.Generation\x12=\n" +
+	"\aResetVM\x12\x1e.bbraft.node.v1.ResetVMRequest\x1a\x12.bbraft.node.v1.VMBCZAgithub.com/nathabonfim59/bamboo-raft/internal/proto/nodev1;nodev1b\x06proto3"
 
 var (
 	file_bbraft_node_v1_node_proto_rawDescOnce sync.Once
@@ -3693,7 +4077,7 @@ func file_bbraft_node_v1_node_proto_rawDescGZIP() []byte {
 }
 
 var file_bbraft_node_v1_node_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_bbraft_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 52)
+var file_bbraft_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 56)
 var file_bbraft_node_v1_node_proto_goTypes = []any{
 	(VMState)(0),                   // 0: bbraft.node.v1.VMState
 	(ProcessState)(0),              // 1: bbraft.node.v1.ProcessState
@@ -3704,131 +4088,140 @@ var file_bbraft_node_v1_node_proto_goTypes = []any{
 	(*Resources)(nil),              // 6: bbraft.node.v1.Resources
 	(*CreateVMRequest)(nil),        // 7: bbraft.node.v1.CreateVMRequest
 	(*VM)(nil),                     // 8: bbraft.node.v1.VM
-	(*GetVMRequest)(nil),           // 9: bbraft.node.v1.GetVMRequest
-	(*ListVMsRequest)(nil),         // 10: bbraft.node.v1.ListVMsRequest
-	(*ListVMsResponse)(nil),        // 11: bbraft.node.v1.ListVMsResponse
-	(*DeleteVMRequest)(nil),        // 12: bbraft.node.v1.DeleteVMRequest
-	(*DeleteVMResponse)(nil),       // 13: bbraft.node.v1.DeleteVMResponse
-	(*ExecRequest)(nil),            // 14: bbraft.node.v1.ExecRequest
-	(*ExecEvent)(nil),              // 15: bbraft.node.v1.ExecEvent
-	(*PutFileRequest)(nil),         // 16: bbraft.node.v1.PutFileRequest
-	(*PutFileResponse)(nil),        // 17: bbraft.node.v1.PutFileResponse
-	(*SaveSnapshotRequest)(nil),    // 18: bbraft.node.v1.SaveSnapshotRequest
-	(*Snapshot)(nil),               // 19: bbraft.node.v1.Snapshot
-	(*DeleteSnapshotRequest)(nil),  // 20: bbraft.node.v1.DeleteSnapshotRequest
-	(*DeleteSnapshotResponse)(nil), // 21: bbraft.node.v1.DeleteSnapshotResponse
-	(*StopVMRequest)(nil),          // 22: bbraft.node.v1.StopVMRequest
-	(*StartVMRequest)(nil),         // 23: bbraft.node.v1.StartVMRequest
-	(*Process)(nil),                // 24: bbraft.node.v1.Process
-	(*StartProcessRequest)(nil),    // 25: bbraft.node.v1.StartProcessRequest
-	(*GetProcessRequest)(nil),      // 26: bbraft.node.v1.GetProcessRequest
-	(*ProcessOutput)(nil),          // 27: bbraft.node.v1.ProcessOutput
-	(*AttachProcessRequest)(nil),   // 28: bbraft.node.v1.AttachProcessRequest
-	(*ProcessEvent)(nil),           // 29: bbraft.node.v1.ProcessEvent
-	(*KillProcessRequest)(nil),     // 30: bbraft.node.v1.KillProcessRequest
-	(*KillProcessResponse)(nil),    // 31: bbraft.node.v1.KillProcessResponse
-	(*FileInfo)(nil),               // 32: bbraft.node.v1.FileInfo
-	(*ReadFileRequest)(nil),        // 33: bbraft.node.v1.ReadFileRequest
-	(*ReadFileResponse)(nil),       // 34: bbraft.node.v1.ReadFileResponse
-	(*StatFileRequest)(nil),        // 35: bbraft.node.v1.StatFileRequest
-	(*ListFilesRequest)(nil),       // 36: bbraft.node.v1.ListFilesRequest
-	(*ListFilesResponse)(nil),      // 37: bbraft.node.v1.ListFilesResponse
-	(*DeleteFileRequest)(nil),      // 38: bbraft.node.v1.DeleteFileRequest
-	(*DeleteFileResponse)(nil),     // 39: bbraft.node.v1.DeleteFileResponse
-	(*MakeDirRequest)(nil),         // 40: bbraft.node.v1.MakeDirRequest
-	(*MoveFileRequest)(nil),        // 41: bbraft.node.v1.MoveFileRequest
-	(*MoveFileResponse)(nil),       // 42: bbraft.node.v1.MoveFileResponse
-	(*ChmodFileRequest)(nil),       // 43: bbraft.node.v1.ChmodFileRequest
-	(*AddSSHKeyRequest)(nil),       // 44: bbraft.node.v1.AddSSHKeyRequest
-	(*SSHAccess)(nil),              // 45: bbraft.node.v1.SSHAccess
-	nil,                            // 46: bbraft.node.v1.CreateVMRequest.EnvEntry
-	nil,                            // 47: bbraft.node.v1.ExecRequest.EnvEntry
-	(*ExecEvent_Started)(nil),      // 48: bbraft.node.v1.ExecEvent.Started
-	(*ExecEvent_Exit)(nil),         // 49: bbraft.node.v1.ExecEvent.Exit
-	(*PutFileRequest_Header)(nil),  // 50: bbraft.node.v1.PutFileRequest.Header
-	nil,                            // 51: bbraft.node.v1.StartVMRequest.EnvEntry
-	nil,                            // 52: bbraft.node.v1.StartProcessRequest.EnvEntry
-	(*ProcessEvent_Attached)(nil),  // 53: bbraft.node.v1.ProcessEvent.Attached
-	(*ProcessEvent_Chunk)(nil),     // 54: bbraft.node.v1.ProcessEvent.Chunk
+	(*Hydration)(nil),              // 9: bbraft.node.v1.Hydration
+	(*GetVMRequest)(nil),           // 10: bbraft.node.v1.GetVMRequest
+	(*ListVMsRequest)(nil),         // 11: bbraft.node.v1.ListVMsRequest
+	(*ListVMsResponse)(nil),        // 12: bbraft.node.v1.ListVMsResponse
+	(*DeleteVMRequest)(nil),        // 13: bbraft.node.v1.DeleteVMRequest
+	(*DeleteVMResponse)(nil),       // 14: bbraft.node.v1.DeleteVMResponse
+	(*ExecRequest)(nil),            // 15: bbraft.node.v1.ExecRequest
+	(*ExecEvent)(nil),              // 16: bbraft.node.v1.ExecEvent
+	(*PutFileRequest)(nil),         // 17: bbraft.node.v1.PutFileRequest
+	(*PutFileResponse)(nil),        // 18: bbraft.node.v1.PutFileResponse
+	(*SaveSnapshotRequest)(nil),    // 19: bbraft.node.v1.SaveSnapshotRequest
+	(*Snapshot)(nil),               // 20: bbraft.node.v1.Snapshot
+	(*DeleteSnapshotRequest)(nil),  // 21: bbraft.node.v1.DeleteSnapshotRequest
+	(*DeleteSnapshotResponse)(nil), // 22: bbraft.node.v1.DeleteSnapshotResponse
+	(*StopVMRequest)(nil),          // 23: bbraft.node.v1.StopVMRequest
+	(*StartVMRequest)(nil),         // 24: bbraft.node.v1.StartVMRequest
+	(*Process)(nil),                // 25: bbraft.node.v1.Process
+	(*StartProcessRequest)(nil),    // 26: bbraft.node.v1.StartProcessRequest
+	(*GetProcessRequest)(nil),      // 27: bbraft.node.v1.GetProcessRequest
+	(*ProcessOutput)(nil),          // 28: bbraft.node.v1.ProcessOutput
+	(*AttachProcessRequest)(nil),   // 29: bbraft.node.v1.AttachProcessRequest
+	(*ProcessEvent)(nil),           // 30: bbraft.node.v1.ProcessEvent
+	(*KillProcessRequest)(nil),     // 31: bbraft.node.v1.KillProcessRequest
+	(*KillProcessResponse)(nil),    // 32: bbraft.node.v1.KillProcessResponse
+	(*FileInfo)(nil),               // 33: bbraft.node.v1.FileInfo
+	(*ReadFileRequest)(nil),        // 34: bbraft.node.v1.ReadFileRequest
+	(*ReadFileResponse)(nil),       // 35: bbraft.node.v1.ReadFileResponse
+	(*StatFileRequest)(nil),        // 36: bbraft.node.v1.StatFileRequest
+	(*ListFilesRequest)(nil),       // 37: bbraft.node.v1.ListFilesRequest
+	(*ListFilesResponse)(nil),      // 38: bbraft.node.v1.ListFilesResponse
+	(*DeleteFileRequest)(nil),      // 39: bbraft.node.v1.DeleteFileRequest
+	(*DeleteFileResponse)(nil),     // 40: bbraft.node.v1.DeleteFileResponse
+	(*MakeDirRequest)(nil),         // 41: bbraft.node.v1.MakeDirRequest
+	(*MoveFileRequest)(nil),        // 42: bbraft.node.v1.MoveFileRequest
+	(*MoveFileResponse)(nil),       // 43: bbraft.node.v1.MoveFileResponse
+	(*ChmodFileRequest)(nil),       // 44: bbraft.node.v1.ChmodFileRequest
+	(*AddSSHKeyRequest)(nil),       // 45: bbraft.node.v1.AddSSHKeyRequest
+	(*SSHAccess)(nil),              // 46: bbraft.node.v1.SSHAccess
+	(*SnapshotVMRequest)(nil),      // 47: bbraft.node.v1.SnapshotVMRequest
+	(*Generation)(nil),             // 48: bbraft.node.v1.Generation
+	(*ResetVMRequest)(nil),         // 49: bbraft.node.v1.ResetVMRequest
+	nil,                            // 50: bbraft.node.v1.CreateVMRequest.EnvEntry
+	nil,                            // 51: bbraft.node.v1.ExecRequest.EnvEntry
+	(*ExecEvent_Started)(nil),      // 52: bbraft.node.v1.ExecEvent.Started
+	(*ExecEvent_Exit)(nil),         // 53: bbraft.node.v1.ExecEvent.Exit
+	(*PutFileRequest_Header)(nil),  // 54: bbraft.node.v1.PutFileRequest.Header
+	nil,                            // 55: bbraft.node.v1.StartVMRequest.EnvEntry
+	nil,                            // 56: bbraft.node.v1.StartProcessRequest.EnvEntry
+	(*ProcessEvent_Attached)(nil),  // 57: bbraft.node.v1.ProcessEvent.Attached
+	(*ProcessEvent_Chunk)(nil),     // 58: bbraft.node.v1.ProcessEvent.Chunk
 }
 var file_bbraft_node_v1_node_proto_depIdxs = []int32{
 	5,  // 0: bbraft.node.v1.InfoResponse.images:type_name -> bbraft.node.v1.Image
-	19, // 1: bbraft.node.v1.InfoResponse.snapshots:type_name -> bbraft.node.v1.Snapshot
+	20, // 1: bbraft.node.v1.InfoResponse.snapshots:type_name -> bbraft.node.v1.Snapshot
 	6,  // 2: bbraft.node.v1.CreateVMRequest.resources:type_name -> bbraft.node.v1.Resources
-	46, // 3: bbraft.node.v1.CreateVMRequest.env:type_name -> bbraft.node.v1.CreateVMRequest.EnvEntry
+	50, // 3: bbraft.node.v1.CreateVMRequest.env:type_name -> bbraft.node.v1.CreateVMRequest.EnvEntry
 	0,  // 4: bbraft.node.v1.VM.state:type_name -> bbraft.node.v1.VMState
 	6,  // 5: bbraft.node.v1.VM.resources:type_name -> bbraft.node.v1.Resources
-	8,  // 6: bbraft.node.v1.ListVMsResponse.vms:type_name -> bbraft.node.v1.VM
-	47, // 7: bbraft.node.v1.ExecRequest.env:type_name -> bbraft.node.v1.ExecRequest.EnvEntry
-	48, // 8: bbraft.node.v1.ExecEvent.started:type_name -> bbraft.node.v1.ExecEvent.Started
-	49, // 9: bbraft.node.v1.ExecEvent.exit:type_name -> bbraft.node.v1.ExecEvent.Exit
-	50, // 10: bbraft.node.v1.PutFileRequest.header:type_name -> bbraft.node.v1.PutFileRequest.Header
-	6,  // 11: bbraft.node.v1.StartVMRequest.resources:type_name -> bbraft.node.v1.Resources
-	51, // 12: bbraft.node.v1.StartVMRequest.env:type_name -> bbraft.node.v1.StartVMRequest.EnvEntry
-	1,  // 13: bbraft.node.v1.Process.state:type_name -> bbraft.node.v1.ProcessState
-	49, // 14: bbraft.node.v1.Process.exit:type_name -> bbraft.node.v1.ExecEvent.Exit
-	52, // 15: bbraft.node.v1.StartProcessRequest.env:type_name -> bbraft.node.v1.StartProcessRequest.EnvEntry
-	24, // 16: bbraft.node.v1.ProcessOutput.process:type_name -> bbraft.node.v1.Process
-	53, // 17: bbraft.node.v1.ProcessEvent.attached:type_name -> bbraft.node.v1.ProcessEvent.Attached
-	54, // 18: bbraft.node.v1.ProcessEvent.stdout:type_name -> bbraft.node.v1.ProcessEvent.Chunk
-	54, // 19: bbraft.node.v1.ProcessEvent.stderr:type_name -> bbraft.node.v1.ProcessEvent.Chunk
-	24, // 20: bbraft.node.v1.ProcessEvent.exit:type_name -> bbraft.node.v1.Process
-	24, // 21: bbraft.node.v1.KillProcessResponse.process:type_name -> bbraft.node.v1.Process
-	2,  // 22: bbraft.node.v1.FileInfo.type:type_name -> bbraft.node.v1.FileType
-	32, // 23: bbraft.node.v1.ReadFileResponse.info:type_name -> bbraft.node.v1.FileInfo
-	32, // 24: bbraft.node.v1.ListFilesResponse.entries:type_name -> bbraft.node.v1.FileInfo
-	24, // 25: bbraft.node.v1.ProcessEvent.Attached.process:type_name -> bbraft.node.v1.Process
-	3,  // 26: bbraft.node.v1.Node.Info:input_type -> bbraft.node.v1.InfoRequest
-	7,  // 27: bbraft.node.v1.Node.CreateVM:input_type -> bbraft.node.v1.CreateVMRequest
-	9,  // 28: bbraft.node.v1.Node.GetVM:input_type -> bbraft.node.v1.GetVMRequest
-	10, // 29: bbraft.node.v1.Node.ListVMs:input_type -> bbraft.node.v1.ListVMsRequest
-	12, // 30: bbraft.node.v1.Node.DeleteVM:input_type -> bbraft.node.v1.DeleteVMRequest
-	14, // 31: bbraft.node.v1.Node.Exec:input_type -> bbraft.node.v1.ExecRequest
-	16, // 32: bbraft.node.v1.Node.PutFile:input_type -> bbraft.node.v1.PutFileRequest
-	18, // 33: bbraft.node.v1.Node.SaveSnapshot:input_type -> bbraft.node.v1.SaveSnapshotRequest
-	20, // 34: bbraft.node.v1.Node.DeleteSnapshot:input_type -> bbraft.node.v1.DeleteSnapshotRequest
-	22, // 35: bbraft.node.v1.Node.StopVM:input_type -> bbraft.node.v1.StopVMRequest
-	23, // 36: bbraft.node.v1.Node.StartVM:input_type -> bbraft.node.v1.StartVMRequest
-	25, // 37: bbraft.node.v1.Node.StartProcess:input_type -> bbraft.node.v1.StartProcessRequest
-	26, // 38: bbraft.node.v1.Node.GetProcess:input_type -> bbraft.node.v1.GetProcessRequest
-	28, // 39: bbraft.node.v1.Node.AttachProcess:input_type -> bbraft.node.v1.AttachProcessRequest
-	30, // 40: bbraft.node.v1.Node.KillProcess:input_type -> bbraft.node.v1.KillProcessRequest
-	33, // 41: bbraft.node.v1.Node.ReadFile:input_type -> bbraft.node.v1.ReadFileRequest
-	35, // 42: bbraft.node.v1.Node.StatFile:input_type -> bbraft.node.v1.StatFileRequest
-	36, // 43: bbraft.node.v1.Node.ListFiles:input_type -> bbraft.node.v1.ListFilesRequest
-	38, // 44: bbraft.node.v1.Node.DeleteFile:input_type -> bbraft.node.v1.DeleteFileRequest
-	40, // 45: bbraft.node.v1.Node.MakeDir:input_type -> bbraft.node.v1.MakeDirRequest
-	41, // 46: bbraft.node.v1.Node.MoveFile:input_type -> bbraft.node.v1.MoveFileRequest
-	43, // 47: bbraft.node.v1.Node.ChmodFile:input_type -> bbraft.node.v1.ChmodFileRequest
-	44, // 48: bbraft.node.v1.Node.AddSSHKey:input_type -> bbraft.node.v1.AddSSHKeyRequest
-	4,  // 49: bbraft.node.v1.Node.Info:output_type -> bbraft.node.v1.InfoResponse
-	8,  // 50: bbraft.node.v1.Node.CreateVM:output_type -> bbraft.node.v1.VM
-	8,  // 51: bbraft.node.v1.Node.GetVM:output_type -> bbraft.node.v1.VM
-	11, // 52: bbraft.node.v1.Node.ListVMs:output_type -> bbraft.node.v1.ListVMsResponse
-	13, // 53: bbraft.node.v1.Node.DeleteVM:output_type -> bbraft.node.v1.DeleteVMResponse
-	15, // 54: bbraft.node.v1.Node.Exec:output_type -> bbraft.node.v1.ExecEvent
-	17, // 55: bbraft.node.v1.Node.PutFile:output_type -> bbraft.node.v1.PutFileResponse
-	19, // 56: bbraft.node.v1.Node.SaveSnapshot:output_type -> bbraft.node.v1.Snapshot
-	21, // 57: bbraft.node.v1.Node.DeleteSnapshot:output_type -> bbraft.node.v1.DeleteSnapshotResponse
-	8,  // 58: bbraft.node.v1.Node.StopVM:output_type -> bbraft.node.v1.VM
-	8,  // 59: bbraft.node.v1.Node.StartVM:output_type -> bbraft.node.v1.VM
-	24, // 60: bbraft.node.v1.Node.StartProcess:output_type -> bbraft.node.v1.Process
-	27, // 61: bbraft.node.v1.Node.GetProcess:output_type -> bbraft.node.v1.ProcessOutput
-	29, // 62: bbraft.node.v1.Node.AttachProcess:output_type -> bbraft.node.v1.ProcessEvent
-	31, // 63: bbraft.node.v1.Node.KillProcess:output_type -> bbraft.node.v1.KillProcessResponse
-	34, // 64: bbraft.node.v1.Node.ReadFile:output_type -> bbraft.node.v1.ReadFileResponse
-	32, // 65: bbraft.node.v1.Node.StatFile:output_type -> bbraft.node.v1.FileInfo
-	37, // 66: bbraft.node.v1.Node.ListFiles:output_type -> bbraft.node.v1.ListFilesResponse
-	39, // 67: bbraft.node.v1.Node.DeleteFile:output_type -> bbraft.node.v1.DeleteFileResponse
-	32, // 68: bbraft.node.v1.Node.MakeDir:output_type -> bbraft.node.v1.FileInfo
-	42, // 69: bbraft.node.v1.Node.MoveFile:output_type -> bbraft.node.v1.MoveFileResponse
-	32, // 70: bbraft.node.v1.Node.ChmodFile:output_type -> bbraft.node.v1.FileInfo
-	45, // 71: bbraft.node.v1.Node.AddSSHKey:output_type -> bbraft.node.v1.SSHAccess
-	49, // [49:72] is the sub-list for method output_type
-	26, // [26:49] is the sub-list for method input_type
-	26, // [26:26] is the sub-list for extension type_name
-	26, // [26:26] is the sub-list for extension extendee
-	0,  // [0:26] is the sub-list for field type_name
+	9,  // 6: bbraft.node.v1.VM.hydration:type_name -> bbraft.node.v1.Hydration
+	8,  // 7: bbraft.node.v1.ListVMsResponse.vms:type_name -> bbraft.node.v1.VM
+	51, // 8: bbraft.node.v1.ExecRequest.env:type_name -> bbraft.node.v1.ExecRequest.EnvEntry
+	52, // 9: bbraft.node.v1.ExecEvent.started:type_name -> bbraft.node.v1.ExecEvent.Started
+	53, // 10: bbraft.node.v1.ExecEvent.exit:type_name -> bbraft.node.v1.ExecEvent.Exit
+	54, // 11: bbraft.node.v1.PutFileRequest.header:type_name -> bbraft.node.v1.PutFileRequest.Header
+	6,  // 12: bbraft.node.v1.StartVMRequest.resources:type_name -> bbraft.node.v1.Resources
+	55, // 13: bbraft.node.v1.StartVMRequest.env:type_name -> bbraft.node.v1.StartVMRequest.EnvEntry
+	1,  // 14: bbraft.node.v1.Process.state:type_name -> bbraft.node.v1.ProcessState
+	53, // 15: bbraft.node.v1.Process.exit:type_name -> bbraft.node.v1.ExecEvent.Exit
+	56, // 16: bbraft.node.v1.StartProcessRequest.env:type_name -> bbraft.node.v1.StartProcessRequest.EnvEntry
+	25, // 17: bbraft.node.v1.ProcessOutput.process:type_name -> bbraft.node.v1.Process
+	57, // 18: bbraft.node.v1.ProcessEvent.attached:type_name -> bbraft.node.v1.ProcessEvent.Attached
+	58, // 19: bbraft.node.v1.ProcessEvent.stdout:type_name -> bbraft.node.v1.ProcessEvent.Chunk
+	58, // 20: bbraft.node.v1.ProcessEvent.stderr:type_name -> bbraft.node.v1.ProcessEvent.Chunk
+	25, // 21: bbraft.node.v1.ProcessEvent.exit:type_name -> bbraft.node.v1.Process
+	25, // 22: bbraft.node.v1.KillProcessResponse.process:type_name -> bbraft.node.v1.Process
+	2,  // 23: bbraft.node.v1.FileInfo.type:type_name -> bbraft.node.v1.FileType
+	33, // 24: bbraft.node.v1.ReadFileResponse.info:type_name -> bbraft.node.v1.FileInfo
+	33, // 25: bbraft.node.v1.ListFilesResponse.entries:type_name -> bbraft.node.v1.FileInfo
+	25, // 26: bbraft.node.v1.ProcessEvent.Attached.process:type_name -> bbraft.node.v1.Process
+	3,  // 27: bbraft.node.v1.Node.Info:input_type -> bbraft.node.v1.InfoRequest
+	7,  // 28: bbraft.node.v1.Node.CreateVM:input_type -> bbraft.node.v1.CreateVMRequest
+	10, // 29: bbraft.node.v1.Node.GetVM:input_type -> bbraft.node.v1.GetVMRequest
+	11, // 30: bbraft.node.v1.Node.ListVMs:input_type -> bbraft.node.v1.ListVMsRequest
+	13, // 31: bbraft.node.v1.Node.DeleteVM:input_type -> bbraft.node.v1.DeleteVMRequest
+	15, // 32: bbraft.node.v1.Node.Exec:input_type -> bbraft.node.v1.ExecRequest
+	17, // 33: bbraft.node.v1.Node.PutFile:input_type -> bbraft.node.v1.PutFileRequest
+	19, // 34: bbraft.node.v1.Node.SaveSnapshot:input_type -> bbraft.node.v1.SaveSnapshotRequest
+	21, // 35: bbraft.node.v1.Node.DeleteSnapshot:input_type -> bbraft.node.v1.DeleteSnapshotRequest
+	23, // 36: bbraft.node.v1.Node.StopVM:input_type -> bbraft.node.v1.StopVMRequest
+	24, // 37: bbraft.node.v1.Node.StartVM:input_type -> bbraft.node.v1.StartVMRequest
+	26, // 38: bbraft.node.v1.Node.StartProcess:input_type -> bbraft.node.v1.StartProcessRequest
+	27, // 39: bbraft.node.v1.Node.GetProcess:input_type -> bbraft.node.v1.GetProcessRequest
+	29, // 40: bbraft.node.v1.Node.AttachProcess:input_type -> bbraft.node.v1.AttachProcessRequest
+	31, // 41: bbraft.node.v1.Node.KillProcess:input_type -> bbraft.node.v1.KillProcessRequest
+	34, // 42: bbraft.node.v1.Node.ReadFile:input_type -> bbraft.node.v1.ReadFileRequest
+	36, // 43: bbraft.node.v1.Node.StatFile:input_type -> bbraft.node.v1.StatFileRequest
+	37, // 44: bbraft.node.v1.Node.ListFiles:input_type -> bbraft.node.v1.ListFilesRequest
+	39, // 45: bbraft.node.v1.Node.DeleteFile:input_type -> bbraft.node.v1.DeleteFileRequest
+	41, // 46: bbraft.node.v1.Node.MakeDir:input_type -> bbraft.node.v1.MakeDirRequest
+	42, // 47: bbraft.node.v1.Node.MoveFile:input_type -> bbraft.node.v1.MoveFileRequest
+	44, // 48: bbraft.node.v1.Node.ChmodFile:input_type -> bbraft.node.v1.ChmodFileRequest
+	45, // 49: bbraft.node.v1.Node.AddSSHKey:input_type -> bbraft.node.v1.AddSSHKeyRequest
+	47, // 50: bbraft.node.v1.Node.SnapshotVM:input_type -> bbraft.node.v1.SnapshotVMRequest
+	49, // 51: bbraft.node.v1.Node.ResetVM:input_type -> bbraft.node.v1.ResetVMRequest
+	4,  // 52: bbraft.node.v1.Node.Info:output_type -> bbraft.node.v1.InfoResponse
+	8,  // 53: bbraft.node.v1.Node.CreateVM:output_type -> bbraft.node.v1.VM
+	8,  // 54: bbraft.node.v1.Node.GetVM:output_type -> bbraft.node.v1.VM
+	12, // 55: bbraft.node.v1.Node.ListVMs:output_type -> bbraft.node.v1.ListVMsResponse
+	14, // 56: bbraft.node.v1.Node.DeleteVM:output_type -> bbraft.node.v1.DeleteVMResponse
+	16, // 57: bbraft.node.v1.Node.Exec:output_type -> bbraft.node.v1.ExecEvent
+	18, // 58: bbraft.node.v1.Node.PutFile:output_type -> bbraft.node.v1.PutFileResponse
+	20, // 59: bbraft.node.v1.Node.SaveSnapshot:output_type -> bbraft.node.v1.Snapshot
+	22, // 60: bbraft.node.v1.Node.DeleteSnapshot:output_type -> bbraft.node.v1.DeleteSnapshotResponse
+	8,  // 61: bbraft.node.v1.Node.StopVM:output_type -> bbraft.node.v1.VM
+	8,  // 62: bbraft.node.v1.Node.StartVM:output_type -> bbraft.node.v1.VM
+	25, // 63: bbraft.node.v1.Node.StartProcess:output_type -> bbraft.node.v1.Process
+	28, // 64: bbraft.node.v1.Node.GetProcess:output_type -> bbraft.node.v1.ProcessOutput
+	30, // 65: bbraft.node.v1.Node.AttachProcess:output_type -> bbraft.node.v1.ProcessEvent
+	32, // 66: bbraft.node.v1.Node.KillProcess:output_type -> bbraft.node.v1.KillProcessResponse
+	35, // 67: bbraft.node.v1.Node.ReadFile:output_type -> bbraft.node.v1.ReadFileResponse
+	33, // 68: bbraft.node.v1.Node.StatFile:output_type -> bbraft.node.v1.FileInfo
+	38, // 69: bbraft.node.v1.Node.ListFiles:output_type -> bbraft.node.v1.ListFilesResponse
+	40, // 70: bbraft.node.v1.Node.DeleteFile:output_type -> bbraft.node.v1.DeleteFileResponse
+	33, // 71: bbraft.node.v1.Node.MakeDir:output_type -> bbraft.node.v1.FileInfo
+	43, // 72: bbraft.node.v1.Node.MoveFile:output_type -> bbraft.node.v1.MoveFileResponse
+	33, // 73: bbraft.node.v1.Node.ChmodFile:output_type -> bbraft.node.v1.FileInfo
+	46, // 74: bbraft.node.v1.Node.AddSSHKey:output_type -> bbraft.node.v1.SSHAccess
+	48, // 75: bbraft.node.v1.Node.SnapshotVM:output_type -> bbraft.node.v1.Generation
+	8,  // 76: bbraft.node.v1.Node.ResetVM:output_type -> bbraft.node.v1.VM
+	52, // [52:77] is the sub-list for method output_type
+	27, // [27:52] is the sub-list for method input_type
+	27, // [27:27] is the sub-list for extension type_name
+	27, // [27:27] is the sub-list for extension extendee
+	0,  // [0:27] is the sub-list for field type_name
 }
 
 func init() { file_bbraft_node_v1_node_proto_init() }
@@ -3836,35 +4229,36 @@ func file_bbraft_node_v1_node_proto_init() {
 	if File_bbraft_node_v1_node_proto != nil {
 		return
 	}
-	file_bbraft_node_v1_node_proto_msgTypes[12].OneofWrappers = []any{
+	file_bbraft_node_v1_node_proto_msgTypes[13].OneofWrappers = []any{
 		(*ExecEvent_Started_)(nil),
 		(*ExecEvent_Stdout)(nil),
 		(*ExecEvent_Stderr)(nil),
 		(*ExecEvent_Exit_)(nil),
 	}
-	file_bbraft_node_v1_node_proto_msgTypes[13].OneofWrappers = []any{
+	file_bbraft_node_v1_node_proto_msgTypes[14].OneofWrappers = []any{
 		(*PutFileRequest_Header_)(nil),
 		(*PutFileRequest_Data)(nil),
 	}
-	file_bbraft_node_v1_node_proto_msgTypes[23].OneofWrappers = []any{}
-	file_bbraft_node_v1_node_proto_msgTypes[26].OneofWrappers = []any{
+	file_bbraft_node_v1_node_proto_msgTypes[24].OneofWrappers = []any{}
+	file_bbraft_node_v1_node_proto_msgTypes[27].OneofWrappers = []any{
 		(*ProcessEvent_Attached_)(nil),
 		(*ProcessEvent_Stdout)(nil),
 		(*ProcessEvent_Stderr)(nil),
 		(*ProcessEvent_Exit)(nil),
 	}
-	file_bbraft_node_v1_node_proto_msgTypes[31].OneofWrappers = []any{
+	file_bbraft_node_v1_node_proto_msgTypes[32].OneofWrappers = []any{
 		(*ReadFileResponse_Info)(nil),
 		(*ReadFileResponse_Data)(nil),
 	}
-	file_bbraft_node_v1_node_proto_msgTypes[46].OneofWrappers = []any{}
+	file_bbraft_node_v1_node_proto_msgTypes[44].OneofWrappers = []any{}
+	file_bbraft_node_v1_node_proto_msgTypes[50].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_bbraft_node_v1_node_proto_rawDesc), len(file_bbraft_node_v1_node_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   52,
+			NumMessages:   56,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

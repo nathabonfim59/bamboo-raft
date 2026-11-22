@@ -141,6 +141,81 @@ func TestLoadDefaults(t *testing.T) {
 	if opt := c.Lifecycle.StoppedRetentionOption(); opt == nil || *opt != 7*24*time.Hour {
 		t.Fatalf("stopped-retention option = %v", opt)
 	}
+	if c.Lifecycle.DataRetentionSeconds != 1209600 {
+		t.Fatalf("data-retention default = %d", c.Lifecycle.DataRetentionSeconds)
+	}
+	if opt := c.Lifecycle.DataRetentionOption(); opt == nil || *opt != 14*24*time.Hour {
+		t.Fatalf("data-retention option = %v", opt)
+	}
+}
+
+// TestLoadDataRetentionDefaults checks the two retention windows together:
+// without an object store today's seven-day stopped-disk deletion stays, with
+// one the row is kept and only the data expires, so row deletion is off unless
+// the operator asked for it explicitly.
+func TestLoadDataRetentionDefaults(t *testing.T) {
+	f := newFixture(t)
+	secretFile := s3TestSecretFile(t, "s3-secret\n")
+	withStore := func(t *testing.T, extra ...string) *Config {
+		t.Helper()
+		c, err := Load(t.Context(), append(append(f.baseArgs(), s3TestFlags(secretFile)...), extra...), noEnv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	plain, err := Load(t.Context(), f.baseArgs(), noEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.ObjectStore != nil || plain.Lifecycle.StoppedRetentionSeconds != 604800 {
+		t.Fatalf("phase 1 defaults: store=%v stopped=%d", plain.ObjectStore, plain.Lifecycle.StoppedRetentionSeconds)
+	}
+	if opt := plain.Lifecycle.DataRetentionOption(); opt == nil || *opt != 14*24*time.Hour {
+		t.Fatalf("phase 1 data-retention option = %v", opt)
+	}
+
+	stored := withStore(t)
+	if stored.ObjectStore == nil {
+		t.Fatal("object store not configured")
+	}
+	if stored.Lifecycle.StoppedRetentionSeconds != 0 {
+		t.Fatalf("stopped-retention with an object store = %d, want 0 (off)", stored.Lifecycle.StoppedRetentionSeconds)
+	}
+	if opt := stored.Lifecycle.DataRetentionOption(); opt == nil || *opt != 14*24*time.Hour {
+		t.Fatalf("data-retention option with an object store = %v", opt)
+	}
+
+	if got := withStore(t, "-lifecycle.stopped-retention-seconds", "3600").Lifecycle.StoppedRetentionSeconds; got != 3600 {
+		t.Fatalf("explicit stopped-retention with an object store = %d", got)
+	}
+	env := testEnv(map[string]string{
+		"BBRAFT_AUTH_KEYS_FILE":                      f.keysFile,
+		"BBRAFT_NODE_TOKENS_FILE":                    f.tokensFile,
+		"BBRAFT_DATABASE_URL_FILE":                   f.dbURLFile,
+		"BBRAFT_NODE_GATEWAY_TOKEN_FILE":             f.gwFile,
+		"BBRAFT_SECRETS_ALLOW_EPHEMERAL":             "true",
+		"BBRAFT_LIFECYCLE_STOPPED_RETENTION_SECONDS": "7200",
+		"BBRAFT_LIFECYCLE_DATA_RETENTION_SECONDS":    "60",
+		"BBRAFT_S3_ENDPOINT":                         "http://s3.example.test:3900",
+		"BBRAFT_S3_BUCKET":                           "bbraft",
+		"BBRAFT_S3_ACCESS_KEY_ID":                    "GKEXAMPLE",
+		"BBRAFT_S3_SECRET_ACCESS_KEY":                "env-s3-secret",
+	})
+	fromEnv, err := Load(t.Context(), nil, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromEnv.Lifecycle.StoppedRetentionSeconds != 7200 || fromEnv.Lifecycle.DataRetentionSeconds != 60 {
+		t.Fatalf("explicit retention from env: stopped=%d data=%d",
+			fromEnv.Lifecycle.StoppedRetentionSeconds, fromEnv.Lifecycle.DataRetentionSeconds)
+	}
+
+	off := withStore(t, "-lifecycle.data-retention-seconds", "0")
+	if opt := off.Lifecycle.DataRetentionOption(); opt == nil || *opt != 0 {
+		t.Fatalf("disabled data-retention option = %v", opt)
+	}
 }
 
 func TestLoadEnvFallback(t *testing.T) {
@@ -257,6 +332,9 @@ func TestLoadMalformed(t *testing.T) {
 		{"negative stopped retention", append(good, "-lifecycle.stopped-retention-seconds", "-1"), nil, "stopped-retention"},
 		{"stopped retention overflow", append(good, "-lifecycle.stopped-retention-seconds", "9223372037"), nil, "stopped-retention"},
 		{"stopped retention not int", good, map[string]string{"BBRAFT_LIFECYCLE_STOPPED_RETENTION_SECONDS": "week"}, "not an integer"},
+		{"negative data retention", append(good, "-lifecycle.data-retention-seconds", "-1"), nil, "data-retention"},
+		{"data retention overflow", append(good, "-lifecycle.data-retention-seconds", "9223372037"), nil, "data-retention"},
+		{"data retention not int", good, map[string]string{"BBRAFT_LIFECYCLE_DATA_RETENTION_SECONDS": "fortnight"}, "not an integer"},
 		{"missing keys file", []string{"-roles", "api", "-database.url-file", f.dbURLFile, "-node.gateway-token-file", f.gwFile, "-secrets.allow-ephemeral"}, nil, "keys-file"},
 		{"missing tokens file", []string{"-roles", "nodehub", "-database.url-file", f.dbURLFile, "-node.gateway-token-file", f.gwFile, "-secrets.allow-ephemeral"}, nil, "tokens-file"},
 		{"missing database", []string{"-roles", "lifecycle", "-node.gateway-token-file", f.gwFile, "-secrets.allow-ephemeral"}, nil, "database"},
@@ -510,5 +588,122 @@ func TestLoadPublicURLAndGatewayDialMalformed(t *testing.T) {
 				t.Fatalf("%s: error does not mention %q", tc.name, tc.want)
 			}
 		})
+	}
+}
+
+// TestLoadNodeLost covers -lifecycle.node-lost-seconds: the default, the
+// environment fallback, zero to disable, and the refused values (below two
+// inventory polls, negative, too large).
+func TestLoadNodeLost(t *testing.T) {
+	f := newFixture(t)
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		env     map[string]string
+		want    int
+		wantErr bool
+	}{
+		{name: "default", want: DefaultNodeLostSeconds},
+		{name: "flag", args: []string{"-lifecycle.node-lost-seconds", "300"}, want: 300},
+		{name: "env", env: map[string]string{"BBRAFT_LIFECYCLE_NODE_LOST_SECONDS": "90"}, want: 90},
+		{name: "disabled", args: []string{"-lifecycle.node-lost-seconds", "0"}, want: 0},
+		{name: "minimum", args: []string{"-lifecycle.node-lost-seconds", "60"}, want: 60},
+		{name: "below two polls", args: []string{"-lifecycle.node-lost-seconds", "59"}, wantErr: true},
+		{name: "negative", args: []string{"-lifecycle.node-lost-seconds", "-1"}, wantErr: true},
+		{name: "overflow", args: []string{"-lifecycle.node-lost-seconds", "9223372037"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := noEnv
+			if tc.env != nil {
+				env = testEnv(tc.env)
+			}
+			c, err := Load(t.Context(), append(f.baseArgs(), tc.args...), env)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "node-lost-seconds") {
+					t.Fatalf("Load = %v, want a node-lost-seconds error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.Lifecycle.NodeLostSeconds != tc.want {
+				t.Fatalf("node-lost-seconds = %d, want %d", c.Lifecycle.NodeLostSeconds, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadDiskLowPercent covers -lifecycle.disk-low-percent: the default,
+// the environment fallback, zero to disable, and the refused values
+// (negative, above 90).
+func TestLoadDiskLowPercent(t *testing.T) {
+	f := newFixture(t)
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		env     map[string]string
+		want    int
+		wantErr bool
+	}{
+		{name: "default", want: DefaultDiskLowPercent},
+		{name: "flag", args: []string{"-lifecycle.disk-low-percent", "25"}, want: 25},
+		{name: "env", env: map[string]string{"BBRAFT_LIFECYCLE_DISK_LOW_PERCENT": "5"}, want: 5},
+		{name: "disabled", args: []string{"-lifecycle.disk-low-percent", "0"}, want: 0},
+		{name: "maximum", args: []string{"-lifecycle.disk-low-percent", "90"}, want: 90},
+		{name: "above maximum", args: []string{"-lifecycle.disk-low-percent", "91"}, wantErr: true},
+		{name: "negative", args: []string{"-lifecycle.disk-low-percent", "-1"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := noEnv
+			if tc.env != nil {
+				env = testEnv(tc.env)
+			}
+			c, err := Load(t.Context(), append(f.baseArgs(), tc.args...), env)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "disk-low-percent") {
+					t.Fatalf("Load = %v, want a disk-low-percent error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.Lifecycle.DiskLowPercent != tc.want {
+				t.Fatalf("disk-low-percent = %d, want %d", c.Lifecycle.DiskLowPercent, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadGC covers the chunk collector's flags: defaults, environment
+// fallback and refused values (a zero grace would delete chunks an attempt has
+// just uploaded).
+func TestLoadGC(t *testing.T) {
+	f := newFixture(t)
+	c, err := Load(t.Context(), f.baseArgs(), noEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (GC{IntervalSeconds: 21600, GraceSeconds: 86400, HistorySeconds: 86400, Batch: 1000}); c.GC != want {
+		t.Fatalf("defaults = %+v, want %+v", c.GC, want)
+	}
+	c, err = Load(t.Context(), append(f.baseArgs(), "-gc.batch", "50"), testEnv(map[string]string{"BBRAFT_GC_GRACE_SECONDS": "3600"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.GC.Batch != 50 || c.GC.GraceSeconds != 3600 {
+		t.Fatalf("flag and env = %+v", c.GC)
+	}
+	for _, tc := range []struct {
+		flag, value string
+	}{
+		{"gc.interval-seconds", "0"}, {"gc.grace-seconds", "0"}, {"gc.history-seconds", "-1"},
+		{"gc.batch", "0"}, {"gc.grace-seconds", "9223372037"},
+	} {
+		_, err := Load(t.Context(), append(f.baseArgs(), "-"+tc.flag, tc.value), noEnv)
+		if err == nil || !strings.Contains(err.Error(), tc.flag) {
+			t.Errorf("-%s %s: Load = %v, want an error naming the flag", tc.flag, tc.value, err)
+		}
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/nathabonfim59/bamboo-raft/internal/api"
 	"github.com/nathabonfim59/bamboo-raft/internal/apierr"
 	"github.com/nathabonfim59/bamboo-raft/internal/db"
+	"github.com/nathabonfim59/bamboo-raft/internal/scheduler"
 )
 
 // lifecycleCompatStore is the external fake the compatibility test drives
@@ -74,6 +75,7 @@ func lifecycleCompatSandbox() db.Sandbox {
 		MachineType: "default", Name: "job", TTLSeconds: new(3600),
 		ExpiresAt: new(coreCompatTime.Add(time.Hour)), StoppedAt: &stopped,
 		StopOperationID: &stopID, CreatedAt: coreCompatTime, UpdatedAt: coreCompatTime,
+		SnapshotsEnabled: true, // the database default
 	}
 }
 
@@ -282,6 +284,22 @@ func TestLifecycleCompatSuccessAndErrors(t *testing.T) {
 			name: "resume capacity", method: http.MethodPost,
 			code: apierr.CodeNoReadyMachine, operationID: "resume", status: http.StatusServiceUnavailable, body: `{}`,
 			resume: lifecycleCompatResume{err: db.ErrNoCapacity},
+		},
+		// resume on another node.
+		{
+			name: "resume data expired", method: http.MethodPost,
+			code: apierr.CodeSnapshotDataExpired, operationID: "resume", status: http.StatusConflict, body: `{}`,
+			resume: lifecycleCompatResume{err: db.ErrSnapshotDataExpired},
+		},
+		{
+			name: "resume nothing to restore", method: http.MethodPost,
+			code: apierr.CodeResumeFailed, operationID: "resume", status: http.StatusConflict, body: `{}`,
+			resume: lifecycleCompatResume{err: db.ErrNoRestorableData},
+		},
+		{
+			name: "resume disk node away without a generation", method: http.MethodPost,
+			code: apierr.CodeNoReadyMachine, operationID: "resume", status: http.StatusServiceUnavailable, body: `{}`,
+			resume: lifecycleCompatResume{err: scheduler.ErrNoNode},
 		},
 		{
 			name: "resume internal", method: http.MethodPost,

@@ -479,3 +479,27 @@ func TestNoRoomLogAbsentWhenLiveInventoryFits(t *testing.T) {
 		})
 	}
 }
+
+func (s *replayStore) CreateSandboxes(context.Context, []db.CreateSandboxParams) ([]db.CreateSandboxResult, error) {
+	return nil, errors.New("replayStore: batch create not used")
+}
+
+func (s *replayStore) ReplayCreateSandboxBatch(context.Context, uuid.UUID, string, []byte) ([]db.CreateSandboxResult, bool, error) {
+	return nil, false, nil
+}
+
+func (s *cancelReplayStore) CreateSandboxes(context.Context, []db.CreateSandboxParams) ([]db.CreateSandboxResult, error) {
+	return nil, errors.New("cancelReplayStore: batch create not used")
+}
+
+func (s *cancelReplayStore) ReplayCreateSandboxBatch(context.Context, uuid.UUID, string, []byte) ([]db.CreateSandboxResult, bool, error) {
+	return nil, false, nil
+}
+
+func (s *roomStore) CreateSandboxes(context.Context, []db.CreateSandboxParams) ([]db.CreateSandboxResult, error) {
+	return nil, errors.New("roomStore: batch create not used")
+}
+
+func (s *roomStore) ReplayCreateSandboxBatch(context.Context, uuid.UUID, string, []byte) ([]db.CreateSandboxResult, bool, error) {
+	return nil, false, nil
+}

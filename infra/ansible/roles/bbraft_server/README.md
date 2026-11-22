@@ -24,7 +24,8 @@ Dependencies: none beyond `ansible-core` (2.22.0 tested). Everything is
 | `bbraft_server_api_keys` | list of `{id, owner, key}`; `key` is the raw API key; required for `roles: api` / `all` |
 | `bbraft_server_node_tokens` | list of `{id, tokenSha256}`; digest only, 64 lowercase hex; ids unique, digests may repeat; required for `roles: nodehub` / `all` |
 
-There is no default for the four scalar secrets. The role stops before
+There is no default for the four required scalar secrets, and the optional
+object-store secret below has none either. The role stops before
 creating a user or a unit when one is empty. An empty API-key or node-token
 list stops the run when its role is selected. The master key is copied
 byte-for-byte (`remote_src: false` by default; set
@@ -46,6 +47,8 @@ Place the raw secrets in a vault or the gitignored inventory. Placeholders in
 | `/etc/bbraft-server/secrets-master-key` | `0640` root:bbraft-server | exactly 32 raw bytes, no trailing newline |
 | `/etc/bbraft-server/api-keys.json` | `0640` root:bbraft-server | `{"keys":[{"id":"main","owner":"acct_...","key":"bmb_..."}]}` |
 | `/etc/bbraft-server/node-tokens.json` | `0640` root:bbraft-server | `{"nodes":[{"id":"node-example","tokenSha256":"<64 lowercase hex>"}]}` |
+| `/etc/bbraft/s3.env` | `0600` root:root | only when the object store is enabled: the five non-secret `BBRAFT_S3_*` settings |
+| `/etc/bbraft/s3-secret-access-key` | `0600` root:root | only when the object store is enabled: the secret access key alone |
 | `/etc/systemd/system/bbraft-server.service` | `0644` root:root | hardened unit |
 
 The JSON shapes match `auth.LoadKeysFile` and `auth.LoadNodeTokensFile`, which
@@ -67,6 +70,10 @@ Default listeners are the accepted Phase 0.5 values:
 | `-node.gateway-listen` | `127.0.0.1:7702` |
 | `-commands.stream-max-seconds` | `7200` |
 | `-lifecycle.retry-seconds` / `-reaper-seconds` / `-job-poll-seconds` | `5` / `60` / `15` |
+| `-lifecycle.snapshot-interval-seconds` / `-snapshot-timeout-seconds` | `60` / `600` |
+| `-lifecycle.node-lost-seconds` | `120` (`0` disables, else at least `60`) |
+| `-lifecycle.data-retention-seconds` | `1209600` (fourteen days; `0` never expires) |
+| `-lifecycle.disk-low-percent` | `10` (`0` disables, else `1`-`90`) |
 | `-auth.key-prefix` | `bmb_` |
 
 Credential flags point at the files above: `-database.url-file`,
@@ -153,6 +160,63 @@ The unit sets `NoNewPrivileges=true`, `ProtectSystem=strict`,
 read-only to the service. A changed unit reloads systemd; a changed binary,
 credential file or unit restarts the service. Unchanged runs do neither.
 
+## Object storage (optional)
+
+`bbraft_server_s3_enabled` defaults to `false`. When the inventory sets it to
+`true`, the role writes:
+
+- `bbraft_server_s3_env_file` (default `/etc/bbraft/s3.env`, mode `0600`)
+  with exactly `BBRAFT_S3_ENDPOINT`, `BBRAFT_S3_REGION`, `BBRAFT_S3_BUCKET`,
+  `BBRAFT_S3_PATH_STYLE` and `BBRAFT_S3_ACCESS_KEY_ID`;
+- `bbraft_server_s3_secret_file` (default
+  `/etc/bbraft/s3-secret-access-key`, mode `0600`) with the secret access key
+  alone. Every task that reads or writes the secret sets `no_log: true`.
+
+The unit then carries:
+
+```ini
+EnvironmentFile=/etc/bbraft/s3.env
+LoadCredential=s3-secret-access-key:/etc/bbraft/s3-secret-access-key
+Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE=%d/s3-secret-access-key
+```
+
+systemd reads the environment file and the source secret as root, then hands
+the service a private `0400` copy of the secret under `%d`; the binary's
+`-s3.secret-access-key-file` check accepts that mode. The secret value never
+appears in `ExecStart`, the environment file or the unit.
+
+systemd does **not** unquote `EnvironmentFile=` or `LoadCredential=`: a quoted
+path is logged as `path is not absolute, ignoring` or `Credential source ...
+not valid, ignoring`, and the unit starts without the object store. Both lines
+therefore render through `bbraft_systemd_abs_path`, which writes the path
+verbatim, doubles `%`, and refuses a path that is relative, contains
+whitespace, a quote, a backslash, a line break or NUL, has a `.`/`..` element,
+or ends with `/`.
+
+| Variable | Meaning |
+|---|---|
+| `bbraft_server_s3_enabled` | write the files and unit lines (`false` by default) |
+| `bbraft_server_s3_endpoint` | `http(s)://host[:port]`; empty means AWS S3 |
+| `bbraft_server_s3_region` | the service's configured region (`garage`, `auto` on R2, the AWS region); empty defaults to `us-east-1` only without a custom endpoint |
+| `bbraft_server_s3_bucket` | one bucket per installation |
+| `bbraft_server_s3_path_style` | `true` for Garage and most self-hosted services |
+| `bbraft_server_s3_access_key_id` | credential identifier |
+| `bbraft_server_s3_secret_access_key` | the secret access key; supply it from the vault or the gitignored inventory |
+| `bbraft_server_s3_dir` | directory for both files, default `/etc/bbraft` |
+| `bbraft_server_s3_env_file` / `_secret_file` | target paths; both must stay under `bbraft_server_s3_dir` |
+
+`/etc/bbraft/s3.env` and `/etc/bbraft/s3-secret-access-key` are also the names
+a colocated Garage uses (`garage_credentials_file` and `garage_secret_file`),
+so the server and node roles can share one set: keep the default paths and
+supply the same values in the inventory. The role never creates the bucket:
+`-s3.create-bucket` stays at the binary default (`false`), and the bucket
+belongs to the object-store deployment.
+
+The lifecycle settings in the table above come from `internal/server/config`
+and are rendered as ordinary `ExecStart` flags. The role has no `-gc.*`
+variables: chunk garbage collection runs with the server defaults
+(`docs/server.md`, "Chunk garbage collection").
+
 ## Example (private inventory, never committed)
 
 ```yaml
@@ -191,8 +255,13 @@ hardening and no-secret-in-ExecStart; `systemd-analyze verify` on the rendered
 unit before cleanup (API requires it; set `bbraft_server_verify_unit=false`
 only in a documented non-systemd test container); lifecycle-only, TLS-pair,
 wildcard-API-with-public-URL-gateway-trust and nodehub-only-wildcard renders;
-a verbose validation/render pass asserting no credential placeholder is
-printed; and rejections for every required input, malformed digest, raw token,
+one object-store render asserting the three unit lines, the `0600` file
+modes, the five-variable environment file, that the secret never reaches the
+unit or the environment file, and that `systemd-analyze verify` reports no
+setting it ignored, plus the absence of every S3 line when disabled; a verbose
+validation/render pass asserting no credential placeholder
+is printed; and rejections for every required input, malformed digest, raw
+token,
 duplicate effective API key id (empty id defaulting to the owner),
 float/non-decimal intervals, unbracketed IPv6, float/Unicode digit ports,
 IPv4-mapped public plaintext listeners, invalid listeners even with TLS

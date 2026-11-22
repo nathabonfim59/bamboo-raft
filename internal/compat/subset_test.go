@@ -19,7 +19,7 @@ func TestSpecOperations(t *testing.T) {
 		"me", "sandboxes", "create", "get", "deleteSandbox", "getDeletionOperation",
 		"command", "createUploadUrl", "listSavedSnapshots", "saveSavedSnapshot",
 		"getSavedSnapshot", "deleteSavedSnapshot",
-		"update", "stop", "getStop", "resume",
+		"update", "stop", "getStop", "resume", "fork",
 		"readFile", "writeFile", "deleteFile", "listFiles", "getFileInfo",
 		"createFolder", "moveFile", "setFilePermissions", "createDownloadUrl",
 		"sshKey",
@@ -48,6 +48,7 @@ func TestCoreRouteConstantsMatchSubset(t *testing.T) {
 		{http.MethodPost, api.PathSandboxStop},
 		{http.MethodGet, api.PathSandboxStops},
 		{http.MethodPost, api.PathSandboxResume},
+		{http.MethodPost, api.PathSandboxFork},
 	}
 	for _, route := range routes {
 		if !subset.HasOperation(route.method, route.path) {

@@ -93,7 +93,14 @@
           # A10 fix D: the unit file is named after the service.
           # (raw defaults text: the template expression itself is compared)
           - bbraft_node_defaults.bbraft_node_unit_path == '/etc/systemd/system/' ~ '{' ~ '{ bbraft_node_service }' ~ '}' ~ '.service'
-        fail_msg: "published images/binary/unit must default to root-owned/read-only, data private on the fresh v1 root, node.id empty, overcommit 1.0, TAP mode with no defaulted operator network or jail hardware inputs"
+          # Phase 2 is off by default: neither S3 mode is configured and no
+          # secret value exists in the defaults.
+          - bbraft_node_defaults.bbraft_node_s3_env_file == ''
+          - bbraft_node_defaults.bbraft_node_s3_secret_file == '/etc/bbraft/s3-secret-access-key'
+          - bbraft_node_defaults.bbraft_node_s3 == {}
+          - bbraft_node_defaults.bbraft_node_s3_secret_access_key == ''
+          - bbraft_node_defaults.bbraft_node_chunk_cache_bytes == 8589934592
+        fail_msg: "published images/binary/unit must default to root-owned/read-only, data private on the fresh v1 root, node.id empty, overcommit 1.0, TAP mode with no defaulted operator network or jail hardware inputs, and the Phase 2 object store off with no secret"
         quiet: true
 
     - name: Use a temporary tree with spaces, percent, dollar and quotes in its path
@@ -267,6 +274,11 @@
           - "'-node.jail-io-read-iops' not in bbraft_node_unit_content"
           - "'-node.jail-io-write-iops' not in bbraft_node_unit_content"
           - "(bbraft_node_unit_content | regex_findall('(?m)^    -[a-z]') | length) == 31"
+          # Phase 2 off: no env file, credential or cache flag.
+          - "'EnvironmentFile=' not in bbraft_node_unit_content"
+          - "'LoadCredential=' not in bbraft_node_unit_content"
+          - "'Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE' not in bbraft_node_unit_content"
+          - "'-node.chunk-cache-bytes' not in bbraft_node_unit_content"
         fail_msg: "the unit does not carry the exact cmd/bbraft-node/config flag names and defaults, or the production TAP networking configuration"
         quiet: true
 
@@ -457,6 +469,184 @@
         quiet: true
       vars:
         bbraft_node_optional_unit_content: "{{ bbraft_node_optional_unit.content | b64decode }}"
+
+    # --- Phase 2, colocated Garage ---------------------------------------
+    # The garage role already wrote both files; this role only points the unit
+    # at them, so their checksums must not change.
+    - name: Provide the colocated object store files
+      ansible.builtin.file:
+        path: "{{ bbraft_node_test_root.path }}/s3"
+        state: directory
+        mode: "0700"
+
+    - name: Write the colocated object store env and secret files
+      ansible.builtin.copy:
+        dest: "{{ item.dest }}"
+        content: "{{ item.content }}"
+        mode: "0600"
+      loop:
+        - dest: "{{ bbraft_node_test_root.path }}/s3/s3.env"
+          content: |
+            BBRAFT_S3_ENDPOINT=http://127.0.0.1:3900
+            BBRAFT_S3_REGION=garage
+            BBRAFT_S3_BUCKET=bbraft
+            BBRAFT_S3_PATH_STYLE=true
+            BBRAFT_S3_ACCESS_KEY_ID=GKtestaccesskeyid
+        - dest: "{{ bbraft_node_test_root.path }}/s3/s3-secret-access-key"
+          content: |
+            SENTINEL-bbraft-node-s3-secret-5c9d
+      no_log: true
+
+    - name: Stat the colocated files before the render
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_test_root.path }}/s3/{{ item }}"
+        get_checksum: true
+      loop:
+        - s3.env
+        - s3-secret-access-key
+      register: bbraft_node_s3_before
+
+    - name: Select the colocated object store mode
+      ansible.builtin.set_fact:
+        bbraft_node_s3_env_file: "{{ bbraft_node_test_root.path }}/s3/s3.env"
+        bbraft_node_s3_secret_file: "{{ bbraft_node_test_root.path }}/s3/s3-secret-access-key"
+        bbraft_node_chunk_cache_bytes: 4294967296
+
+    - name: Re-validate and render the colocated object store mode
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate
+
+    - name: Render the colocated object store mode
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: files
+
+    - name: Read the colocated unit and credential files
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ bbraft_node_unit_path }}"
+        - "{{ bbraft_node_test_root.path }}/s3/s3.env"
+        - "{{ bbraft_node_test_root.path }}/s3/s3-secret-access-key"
+      register: bbraft_node_s3_colocated
+      no_log: true
+
+    - name: The colocated unit reads the env file and the secret credential in order
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_colocated_unit is search('(?m)^EnvironmentFile=' ~ bbraft_node_colocated_env_quoted ~ '$')
+          - bbraft_node_colocated_unit is search('(?m)^LoadCredential=s3-secret-access-key:' ~ bbraft_node_colocated_secret_quoted ~ '$')
+          - bbraft_node_colocated_unit is search('(?m)^Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE=%d/s3-secret-access-key$')
+          # systemd reads these two values verbatim: a path in quotes is "not absolute" and the setting is silently ignored.
+          - bbraft_node_colocated_unit is not search('(?m)^(EnvironmentFile=|LoadCredential=s3-secret-access-key:)"')
+          - bbraft_node_colocated_unit.index('EnvironmentFile=') < bbraft_node_colocated_unit.index('LoadCredential=s3-secret-access-key:')
+          - bbraft_node_colocated_unit.index('LoadCredential=s3-secret-access-key:') < bbraft_node_colocated_unit.index('Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE=')
+          - "'-node.chunk-cache-bytes \"4294967296\"' in bbraft_node_colocated_unit"
+          - bbraft_node_colocated_unit.count('-node.chunk-cache-bytes') == 1
+          - "(bbraft_node_colocated_unit | regex_findall('(?m)^    -[a-z]') | length) == 40"
+          - "'SENTINEL-bbraft-node-s3-secret-5c9d' not in bbraft_node_colocated_unit"
+        fail_msg: "a colocated Garage must render EnvironmentFile=, then LoadCredential=s3-secret-access-key:<secret file>, then Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE=%d/..., plus one chunk-cache flag; no secret may reach the unit"
+        quiet: true
+      vars:
+        bbraft_node_colocated_unit: "{{ bbraft_node_s3_colocated.results[0].content | b64decode }}"
+        bbraft_node_colocated_env_quoted: "{{ bbraft_node_s3_env_file | bbraft_node_systemd_path_value | regex_escape }}"
+        bbraft_node_colocated_secret_quoted: "{{ bbraft_node_s3_secret_file | bbraft_node_systemd_path_value | regex_escape }}"
+      no_log: true
+
+    - name: Stat the colocated files after the render
+      ansible.builtin.stat:
+        path: "{{ bbraft_node_test_root.path }}/s3/{{ item }}"
+        get_checksum: true
+      loop:
+        - s3.env
+        - s3-secret-access-key
+      register: bbraft_node_s3_after
+
+    - name: The role never rewrites the garage-owned colocated files
+      ansible.builtin.assert:
+        that:
+          - (bbraft_node_s3_after.results | map(attribute='stat.checksum') | list) ==
+            (bbraft_node_s3_before.results | map(attribute='stat.checksum') | list)
+        fail_msg: "a colocated render changed the garage-owned credential files"
+        quiet: true
+
+    # --- Phase 2, remote S3 ----------------------------------------------
+    # Remote mode renders both files under the config directory. The secret
+    # comes from the inventory, is written with no_log and never appears in
+    # the env file or the unit.
+    - name: Select the remote object store mode
+      ansible.builtin.set_fact:
+        bbraft_node_s3_env_file: ""
+        bbraft_node_s3:
+          endpoint: http://203.0.113.20:3900
+          region: garage
+          bucket: bbraft-remote
+          path_style: true
+          access_key_id: GKremoteaccesskeyid
+        bbraft_node_s3_secret_access_key: SENTINEL-bbraft-node-remote-secret-8e2a
+        bbraft_node_chunk_cache_bytes: 0
+        bbraft_node_s3_managed_env_file: "{{ bbraft_node_config_dir }}/s3.env"
+        bbraft_node_s3_managed_secret_file: "{{ bbraft_node_config_dir }}/s3-secret-access-key"
+      no_log: true
+
+    - name: Re-validate and render the remote object store mode
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: validate
+
+    - name: Render the remote object store mode
+      ansible.builtin.include_role:
+        name: bbraft_node
+        tasks_from: files
+
+    - name: Read the remote unit and rendered files
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ bbraft_node_unit_path }}"
+        - "{{ bbraft_node_s3_managed_env_file }}"
+        - "{{ bbraft_node_s3_managed_secret_file }}"
+      register: bbraft_node_s3_remote
+      no_log: true
+
+    - name: The remote mode renders the five settings and the secret separately
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_remote_env.splitlines() | select('match', '^BBRAFT_S3_') | list ==
+            ['BBRAFT_S3_ENDPOINT=http://203.0.113.20:3900',
+             'BBRAFT_S3_REGION=garage',
+             'BBRAFT_S3_BUCKET=bbraft-remote',
+             'BBRAFT_S3_PATH_STYLE=true',
+             'BBRAFT_S3_ACCESS_KEY_ID=GKremoteaccesskeyid']
+          - "'SECRET' not in bbraft_node_remote_env"
+          - bbraft_node_remote_secret == 'SENTINEL-bbraft-node-remote-secret-8e2a\n'
+        fail_msg: "the remote env file must hold the five non-secret settings and never the secret"
+        quiet: true
+      vars:
+        bbraft_node_remote_env: "{{ bbraft_node_s3_remote.results[1].content | b64decode }}"
+        bbraft_node_remote_secret: "{{ bbraft_node_s3_remote.results[2].content | b64decode }}"
+      no_log: true
+
+    - name: The remote unit uses the rendered files and the cache flag
+      ansible.builtin.assert:
+        that:
+          - bbraft_node_remote_unit is search('(?m)^EnvironmentFile=' ~ bbraft_node_remote_env_quoted ~ '$')
+          - bbraft_node_remote_unit is search('(?m)^LoadCredential=s3-secret-access-key:' ~ bbraft_node_remote_secret_quoted ~ '$')
+          - bbraft_node_remote_unit is search('(?m)^Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE=%d/s3-secret-access-key$')
+          # systemd reads these two values verbatim: a path in quotes is "not absolute" and the setting is silently ignored.
+          - bbraft_node_remote_unit is not search('(?m)^(EnvironmentFile=|LoadCredential=s3-secret-access-key:)"')
+          - bbraft_node_remote_unit.index('EnvironmentFile=') < bbraft_node_remote_unit.index('LoadCredential=s3-secret-access-key:')
+          - bbraft_node_remote_unit.index('LoadCredential=s3-secret-access-key:') < bbraft_node_remote_unit.index('Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE=')
+          - "'-node.chunk-cache-bytes \"0\"' in bbraft_node_remote_unit"
+          - "'SENTINEL-bbraft-node-remote-secret-8e2a' not in bbraft_node_remote_unit"
+        fail_msg: "remote mode must render the same env/credential order and a zero cache flag, and never put the secret in the unit"
+        quiet: true
+      vars:
+        bbraft_node_remote_unit: "{{ bbraft_node_s3_remote.results[0].content | b64decode }}"
+        bbraft_node_remote_env_quoted: "{{ bbraft_node_s3_managed_env_file | bbraft_node_systemd_path_value | regex_escape }}"
+        bbraft_node_remote_secret_quoted: "{{ bbraft_node_s3_managed_secret_file | bbraft_node_systemd_path_value | regex_escape }}"
+      no_log: true
 
     - name: Keep a copy of the full rendered unit for the real CLI flag check
       ansible.builtin.copy:

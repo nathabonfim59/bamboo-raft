@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -25,7 +26,9 @@ import (
 	"uuid"
 
 	"github.com/nathabonfim59/bamboo-raft/internal/db"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore"
 	"github.com/nathabonfim59/bamboo-raft/internal/proto/nodev1"
+	"github.com/nathabonfim59/bamboo-raft/internal/scheduler"
 )
 
 // Defaults for the lifecycle role. They align with server configuration
@@ -54,6 +57,11 @@ const (
 	// retained disk before the reaper deletes the sandbox through the normal
 	// deletion path (-lifecycle.stopped-retention-seconds, seven days).
 	DefaultStoppedRetention = 7 * 24 * time.Hour
+
+	// DefaultDataRetention is how long a stopped sandbox's stored data is
+	// kept before the reaper expires it (-lifecycle.data-retention-seconds,
+	// fourteen days).
+	DefaultDataRetention = 14 * 24 * time.Hour
 )
 
 // Store is the database surface lifecycle consumes. *db.Store implements it;
@@ -90,6 +98,11 @@ type Store interface {
 	// transactionally before the normal deletion path runs (B1.2).
 	StoppedSandboxesBefore(ctx context.Context, before time.Time, limit int) ([]db.Sandbox, error)
 	AcceptStoppedRetentionDeletion(ctx context.Context, owner uuid.UUID, sandboxID string, stoppedBefore time.Time, reason db.DeletionReason) (db.DeletionOperation, db.Sandbox, bool, error)
+	// StoppedSandboxesWithDataBefore lists archived sandboxes whose stored
+	// data has not expired yet; AcceptDataExpiry rechecks and expires one
+	// transactionally, evicting its local disk but keeping the row.
+	StoppedSandboxesWithDataBefore(ctx context.Context, before time.Time, limit int) ([]db.Sandbox, error)
+	AcceptDataExpiry(ctx context.Context, owner uuid.UUID, sandboxID string, stoppedBefore time.Time) (db.Sandbox, bool, error)
 	SandboxesOnNode(ctx context.Context, nodeID string) ([]db.Sandbox, error)
 	NodeIDs(ctx context.Context) ([]string, error)
 
@@ -122,6 +135,70 @@ type Store interface {
 
 	AcquireSandboxGuard(ctx context.Context, owner uuid.UUID, sandboxID string) (*db.SandboxGuard, error)
 	ListenJobs(ctx context.Context, pollEvery time.Duration) (*db.JobListener, error)
+
+	// Object-store snapshot generations: the snapshot worker and
+	// the stop's final generation begin, complete and fail rows; the
+	// scheduler loop enqueues due sandboxes; the reaper fails pending rows
+	// whose deadline passed.
+	BeginGeneration(ctx context.Context, p db.BeginGenerationParams) (db.Generation, error)
+	CompleteGeneration(ctx context.Context, id uuid.UUID, r db.GenerationResult, next time.Time) (db.Generation, error)
+	FailGeneration(ctx context.Context, id uuid.UUID, reason string, next time.Time) (db.Generation, error)
+	PendingGenerations(ctx context.Context, limit int) ([]db.Generation, error)
+	DueSnapshotSandboxes(ctx context.Context, now time.Time, limit int) ([]db.Sandbox, error)
+	EnqueueSnapshotJob(ctx context.Context, owner uuid.UUID, sandboxID string) (bool, error)
+	// Fork jobs resolve the source generation (its latest completed one, or
+	// the one admission pinned) and hand the fork to its provision job.
+	LatestGeneration(ctx context.Context, owner uuid.UUID, sandboxID string) (db.Generation, bool, error)
+	GenerationByID(ctx context.Context, owner uuid.UUID, sandboxID string, id uuid.UUID) (db.Generation, error)
+	StartFork(ctx context.Context, jobID uuid.UUID, worker string, token uuid.UUID, p db.StartForkParams) (db.Job, error)
+
+	// RecordRecoverEvent records a recovery outcome event under a live
+	// sandbox.recover claim.
+	RecordRecoverEvent(ctx context.Context, jobID uuid.UUID, worker string, token uuid.UUID, owner uuid.UUID, sandboxID string, e db.EventInput) error
+
+	// Multi-node placement: a manifest restore refused by a node without an
+	// object store marks that node and moves the boot to another node under
+	// the provision job's claim; a successful snapshot or restore marks the
+	// node usable again.
+	MarkNodeObjectStore(ctx context.Context, nodeID string, ok bool) error
+	ReadmitSandbox(ctx context.Context, jobID uuid.UUID, worker string, token uuid.UUID, p db.ReadmitParams) (db.Sandbox, db.Job, error)
+
+	// Resume on another node: a cross-node resume refused by a node
+	// without an object store moves to another node under its claim; a
+	// terminal restore failure leaves the sandbox archived with no local
+	// disk. Evicted copies of a sandbox on a node are deleted by the
+	// resume after READY or by VM reconciliation, then marked done.
+	MoveResume(ctx context.Context, jobID uuid.UUID, worker string, token uuid.UUID, p db.MoveResumeParams) (db.Sandbox, db.Job, error)
+	FinalizeSandboxResumeElsewhereFailure(ctx context.Context, jobID uuid.UUID, worker string, token uuid.UUID, p db.FinalizeResumeFailureParams, reason string) (db.Sandbox, error)
+	OpenEvictions(ctx context.Context, nodeID string) ([]db.Eviction, error)
+	OpenEvictionNodes(ctx context.Context, owner uuid.UUID, sandboxID string) ([]string, error)
+	MarkEvictionDone(ctx context.Context, nodeID, sandboxID string) error
+
+	// Node loss: the reaper lists nodes not observed connected for the
+	// grace and their sandboxes, then decides each one in a store
+	// transaction that rechecks the row and the node: move it from its
+	// latest generation, fail it, or keep only its generation.
+	LostNodes(ctx context.Context, cutoff time.Time) ([]string, error)
+	SandboxesOnLostNode(ctx context.Context, nodeID string) ([]db.Sandbox, error)
+	MoveLostSandbox(ctx context.Context, p db.NodeLossParams, m db.NodeLossMove) (db.Sandbox, db.Job, error)
+	FailLostSandbox(ctx context.Context, p db.NodeLossParams) (db.Sandbox, error)
+	EvictLostDisk(ctx context.Context, p db.NodeLossParams) (db.Sandbox, error)
+	FinishLostStop(ctx context.Context, p db.NodeLossParams) (db.Sandbox, db.StopOperation, error)
+
+	// Disk pressure: the reaper lists nodes under their free-disk
+	// threshold and the archived sandboxes they may evict, commits each
+	// eviction and then confirms the copy's delete. DiskLowPercent 0
+	// disables it.
+	LowDiskNodes(ctx context.Context, percent int) ([]db.Node, error)
+	DiskPressureCandidates(ctx context.Context, nodeID string, limit int) ([]db.Sandbox, error)
+	EvictSandboxDisk(ctx context.Context, p db.DiskPressureParams) (db.Sandbox, error)
+}
+
+// Placer ranks nodes for a sandbox; *scheduler.Scheduler implements it. The
+// provision job uses it to move a manifest restore off a node that cannot
+// read the object store.
+type Placer interface {
+	Place(ctx context.Context, req scheduler.PlaceRequest) ([]scheduler.Candidate, error)
 }
 
 // NodeClient is the gateway-bound node surface workers use. Every side
@@ -164,6 +241,47 @@ type Options struct {
 	// path. Nil selects [DefaultStoppedRetention] (seven days); an explicit
 	// zero disables retention deletion; a negative value is rejected.
 	StoppedRetention *time.Duration
+
+	// DataRetention is how long the reaper keeps an archived sandbox's stored
+	// data before it expires: the local disk copy is evicted, data_expired_at
+	// is set and resume, fork and save refuse it. Nil selects
+	// [DefaultDataRetention] (fourteen days); an explicit zero never expires
+	// data; a negative value is rejected. It applies only with ObjectStore:
+	// Phase 1 mode has no stored data to expire, so it is always off there.
+	DataRetention *time.Duration
+
+	// ObjectStore is the installation's object store, carried for the
+	// Phase 2 snapshot worker and the stop's final generation. Nil means
+	// none is configured: Phase 1 mode, with no snapshot uploads and local
+	// stop/resume behaviour.
+	ObjectStore objstore.Store
+	// SnapshotInterval is the period between generations of one sandbox
+	// (±10 % jitter); zero selects [DefaultSnapshotInterval].
+	SnapshotInterval time.Duration
+	// SnapshotTimeout bounds one SnapshotVM call and is the deadline of its
+	// pending generation row; zero selects [DefaultSnapshotTimeout].
+	SnapshotTimeout time.Duration
+	// SnapshotRand returns a value in [0, 1) that spreads the next snapshot
+	// time over the jitter window; nil uses math/rand/v2. Tests make it
+	// deterministic.
+	SnapshotRand func() float64
+
+	// Placer re-places a manifest restore whose node refused it with
+	// FAILED_PRECONDITION. Nil means no re-placement: such a boot fails
+	// with no_ready_machine. Node loss needs it to move a sandbox.
+	Placer Placer
+
+	// NodeLostAfter is how long a node may go without a connected inventory
+	// observation before the reaper treats it as lost and moves what it
+	// held (-lifecycle.node-lost-seconds). Zero disables node loss, and so
+	// does a nil ObjectStore; a negative value is rejected.
+	NodeLostAfter time.Duration
+
+	// DiskLowPercent is the share of a node's total disk below which the
+	// reaper gives up the retained disks of archived sandboxes on it
+	// (-lifecycle.disk-low-percent). Zero disables disk-pressure eviction
+	// and so does a nil ObjectStore; anything above 90 is rejected.
+	DiskLowPercent int
 }
 
 // Worker owns one process's lifecycle loops. Construct it once; Handlers is
@@ -184,14 +302,28 @@ type Worker struct {
 	reapGuardWait    time.Duration
 	guardReacquire   time.Duration
 	stoppedRetention time.Duration
+	dataRetention    time.Duration
 	handlers         map[db.JobKind]Handler
 	runOnce          atomic.Bool
+
+	objectStore      objstore.Store
+	snapshotInterval time.Duration
+	snapshotTimeout  time.Duration
+	snapshotRand     func() float64
+	precondWarned    warnOnce
+	placer           Placer
+
+	nodeLostAfter  time.Duration
+	diskLowPercent int
+	started        time.Time // node loss waits nodeLostAfter from here
+	lostWarned     warnOnce
+	lowWarned      warnOnce // low nodes with nothing left to evict
 }
 
 // New validates opts, copies the handler map and installs the built-in
-// provision, stop, resume and delete handlers. Supplying a handler for the
-// same kind replaces the default; unknown kinds have no handler and fail
-// safely.
+// provision, stop, resume, delete and snapshot handlers. Supplying a handler
+// for the same kind replaces the default; unknown kinds have no handler and
+// fail safely.
 func New(opts Options) (*Worker, error) {
 	if opts.Store == nil {
 		return nil, errors.New("lifecycle: New needs a Store")
@@ -204,7 +336,8 @@ func New(opts Options) (*Worker, error) {
 	}
 	if opts.Lease < 0 || opts.BootTimeout < 0 || opts.RetryBase < 0 ||
 		opts.MaxBackoff < 0 || opts.JobPoll < 0 || opts.ReaperInterval < 0 ||
-		opts.CleanupTimeout < 0 || opts.ReapGuardWait < 0 || opts.GuardReacquire < 0 {
+		opts.CleanupTimeout < 0 || opts.ReapGuardWait < 0 || opts.GuardReacquire < 0 ||
+		opts.SnapshotInterval < 0 || opts.SnapshotTimeout < 0 || opts.NodeLostAfter < 0 {
 		return nil, errors.New("lifecycle: durations must not be negative")
 	}
 	if opts.Workers < 0 {
@@ -216,10 +349,25 @@ func New(opts Options) (*Worker, error) {
 	if opts.StoppedRetention != nil && *opts.StoppedRetention < 0 {
 		return nil, errors.New("lifecycle: StoppedRetention must not be negative")
 	}
+	if opts.DataRetention != nil && *opts.DataRetention < 0 {
+		return nil, errors.New("lifecycle: DataRetention must not be negative")
+	}
+	if opts.DiskLowPercent < 0 || opts.DiskLowPercent > 90 {
+		return nil, errors.New("lifecycle: disk low percent must be 0..90")
+	}
 
 	stoppedRetention := DefaultStoppedRetention
 	if opts.StoppedRetention != nil {
 		stoppedRetention = *opts.StoppedRetention
+	}
+	dataRetention := DefaultDataRetention
+	if opts.DataRetention != nil {
+		dataRetention = *opts.DataRetention
+	}
+	if opts.ObjectStore == nil {
+		// Phase 1 mode keeps its behaviour exactly: with no object store a
+		// stopped sandbox has no stored data to expire.
+		dataRetention = 0
 	}
 	w := &Worker{
 		store:            opts.Store,
@@ -237,12 +385,27 @@ func New(opts Options) (*Worker, error) {
 		reapGuardWait:    cmp.Or(opts.ReapGuardWait, DefaultReapGuardWait),
 		guardReacquire:   cmp.Or(opts.GuardReacquire, DefaultGuardReacquire),
 		stoppedRetention: stoppedRetention,
-		handlers:         make(map[db.JobKind]Handler, 4+len(opts.Handlers)),
+		dataRetention:    dataRetention,
+		handlers:         make(map[db.JobKind]Handler, 5+len(opts.Handlers)),
+		objectStore:      opts.ObjectStore,
+		snapshotInterval: cmp.Or(opts.SnapshotInterval, DefaultSnapshotInterval),
+		snapshotTimeout:  cmp.Or(opts.SnapshotTimeout, DefaultSnapshotTimeout),
+		snapshotRand:     opts.SnapshotRand,
+		placer:           opts.Placer,
+		nodeLostAfter:    opts.NodeLostAfter,
+		diskLowPercent:   opts.DiskLowPercent,
+		started:          time.Now(),
+	}
+	if w.snapshotRand == nil {
+		w.snapshotRand = rand.Float64
 	}
 	w.handlers[db.JobProvision] = w.provision
 	w.handlers[db.JobStop] = w.stopSandbox
 	w.handlers[db.JobResume] = w.resumeSandbox
 	w.handlers[db.JobDeleteVM] = w.deleteVM
+	w.handlers[db.JobSnapshot] = w.snapshotSandbox
+	w.handlers[db.JobRecover] = w.recoverSandbox
+	w.handlers[db.JobFork] = w.forkSandbox
 	for kind, h := range opts.Handlers {
 		w.handlers[kind] = h
 	}
@@ -256,8 +419,9 @@ func defaultWorkerID() string {
 	return fmt.Sprintf("%s-%d-%s", cmp.Or(host, "lifecycle"), os.Getpid(), uuid.NewV7())
 }
 
-// Run serves jobs and the reaper until ctx ends, then cancels in-flight
-// attempts and joins every goroutine and the listener. It can be called once.
+// Run serves jobs, the reaper and (with an object store) the snapshot
+// scheduler until ctx ends, then cancels in-flight attempts and joins every
+// goroutine and the listener. It can be called once.
 func (w *Worker) Run(ctx context.Context) error {
 	if !w.runOnce.CompareAndSwap(false, true) {
 		return errors.New("lifecycle: Run may only be called once")
@@ -274,6 +438,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		wg.Go(func() { w.jobLoop(ctx, listener) })
 	}
 	wg.Go(func() { w.reaperLoop(ctx) })
+	if w.objectStore != nil {
+		wg.Go(func() { w.snapshotLoop(ctx) })
+	}
 	wg.Wait()
 	return nil
 }

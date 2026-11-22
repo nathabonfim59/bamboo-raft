@@ -25,6 +25,7 @@ func TestJailedArgs(t *testing.T) {
 		"-nodefaults",
 		"-no-user-config",
 		"-no-reboot",
+		"-S",
 		"-m", "8192M",
 		"-smp", "4",
 		"-kernel", "/proc/self/fd/5",

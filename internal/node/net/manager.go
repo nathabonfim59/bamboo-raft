@@ -170,7 +170,13 @@ func (m *Manager) Setup(ctx context.Context, sandboxID string) (*Lease, error) {
 		}
 		return lease, nil
 	}
-	alloc, err := m.allocate(sandboxID)
+	// A guest must never be given an address the host itself holds, even when
+	// the interface appeared after CheckHost ran.
+	local, err := m.hostAddrs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	alloc, err := m.allocate(sandboxID, local)
 	if err != nil {
 		return nil, err
 	}
@@ -529,9 +535,12 @@ func (m *Manager) SSHEndpoint(sandboxID string) (netip.AddrPort, bool) {
 
 // allocate picks the lowest free address and port for a new sandbox and
 // derives its MAC and TAP name from the id, so the identity is reproducible
-// after a restart.
-func (m *Manager) allocate(sandboxID string) (Allocation, error) {
-	used := make(map[netip.Addr]struct{}, len(m.allocs))
+// after a restart. Addresses held by host interfaces are never handed out.
+func (m *Manager) allocate(sandboxID string, hostLocal []hostAddr) (Allocation, error) {
+	used := make(map[netip.Addr]struct{}, len(m.allocs)+len(hostLocal))
+	for _, h := range hostLocal {
+		used[h.Addr.Addr()] = struct{}{}
+	}
 	usedPorts := make(map[uint16]struct{}, len(m.allocs))
 	usedTaps := make(map[string]struct{}, len(m.allocs))
 	usedMACs := make(map[string]struct{}, len(m.allocs))

@@ -107,7 +107,9 @@ type ToolSpec struct {
 	// Base is an optional verified standalone root 0444 base, the explicit
 	// graph's fd 4; the stored backing name is never followed.
 	Base *os.File
-	// BackingName is the exact stored backing name for create (-u).
+	// BackingName is the exact stored backing name for create (-u). Empty
+	// selects the standalone create (no backing), allowed only for a target
+	// under StandaloneCreateDir in the data root.
 	BackingName string
 	Size        uint64
 	Limits      ToolLimits
@@ -152,6 +154,10 @@ type ToolReport struct {
 // unproven: its record, target lease and uid stay held, and the caller must
 // keep every path that contains the target.
 var ErrToolRetained = errors.New("jailer: tool attempt retained; its target and uid stay held")
+
+// StandaloneCreateDir is the data-root directory whose files a create
+// without a backing name may target (the Phase 2 fleece templates).
+const StandaloneCreateDir = "phase2"
 
 // Tool output and naming bounds.
 const (
@@ -251,7 +257,15 @@ func (s ToolSpec) Validate() error {
 		return fmt.Errorf("jailer: unknown tool driver %q", s.Driver)
 	}
 	if s.Op == ToolCreate {
-		if s.BackingName == "" || len(s.BackingName) > maxToolBackingName || strings.ContainsAny(s.BackingName, ",\x00\n") {
+		switch {
+		case s.BackingName == "":
+			// A standalone create (no backing) makes only the Phase 2 fleece
+			// templates under data/phase2/; a VM overlay always stores its
+			// base's name.
+			if s.TargetRoot != TargetRootData || !strings.HasPrefix(s.TargetPath, StandaloneCreateDir+"/") {
+				return fmt.Errorf("jailer: a create without a backing name is only allowed under %s/, not %q", StandaloneCreateDir, s.TargetPath)
+			}
+		case len(s.BackingName) > maxToolBackingName || strings.ContainsAny(s.BackingName, ",\x00\n"):
 			return fmt.Errorf("jailer: invalid create backing name %q", s.BackingName)
 		}
 		if s.Base != nil || s.Driver != "qcow2" {
@@ -307,6 +321,9 @@ func toolArgs(spec ToolSpec) ([]string, error) {
 	case ToolResize:
 		return []string{"resize", "--image-opts", toolGraph(spec), size}, nil
 	default: // ToolCreate
+		if spec.BackingName == "" {
+			return []string{"create", "-f", "qcow2", "/proc/self/fd/3", size}, nil
+		}
 		return []string{"create", "-f", "qcow2", "-u", "-F", "qcow2", "-b", spec.BackingName, "/proc/self/fd/3", size}, nil
 	}
 }

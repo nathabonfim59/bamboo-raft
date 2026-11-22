@@ -49,6 +49,20 @@ play "$here/validate.yml" \
     -e 'bbraft_server_stream_max_seconds=7200' >/dev/null
 echo "ok: an ASCII-decimal string interval is accepted"
 
+# Zero is meaningful for the settings where it disables the feature.
+play "$here/validate.yml" \
+    -e 'bbraft_server_node_lost_seconds=0' \
+    -e 'bbraft_server_data_retention_seconds=0' \
+    -e 'bbraft_server_disk_low_percent=0' >/dev/null
+echo "ok: zero disables node loss, data retention and disk pressure"
+
+# An empty endpoint is AWS S3, whose region then defaults to us-east-1.
+play "$here/validate.yml" \
+    -e 'bbraft_server_s3_enabled=true' \
+    -e 'bbraft_server_s3_endpoint=' \
+    -e 'bbraft_server_s3_region=' >/dev/null
+echo "ok: object-store settings are accepted when enabled"
+
 # A public node listener and an off-loopback gateway are valid with TLS.
 play "$here/validate.yml" \
     -e 'bbraft_server_node_listen=[::ffff:203.0.113.10]:7701' \
@@ -204,6 +218,42 @@ expect_fail "line-separator gateway server name" \
     -e @"$here/invalid/gateway-server-name-line-separator.yml"
 expect_fail "paragraph-separator gateway server name" \
     -e @"$here/invalid/gateway-server-name-paragraph-separator.yml"
+expect_fail "zero snapshot interval" \
+    -e 'bbraft_server_snapshot_interval_seconds=0'
+expect_fail "zero snapshot timeout" \
+    -e 'bbraft_server_snapshot_timeout_seconds=0'
+expect_fail "node lost below the two-poll minimum" \
+    -e 'bbraft_server_node_lost_seconds=59'
+expect_fail "negative node lost" \
+    -e 'bbraft_server_node_lost_seconds=-1'
+expect_fail "negative data retention" \
+    -e 'bbraft_server_data_retention_seconds=-1'
+expect_fail "disk pressure above ninety percent" \
+    -e 'bbraft_server_disk_low_percent=91'
+expect_fail "negative disk pressure" \
+    -e 'bbraft_server_disk_low_percent=-1'
+expect_fail "object store without a bucket" \
+    -e 'bbraft_server_s3_enabled=true' \
+    -e 'bbraft_server_s3_bucket='
+expect_fail "custom object-store endpoint without a region" \
+    -e 'bbraft_server_s3_enabled=true' \
+    -e 'bbraft_server_s3_region='
+expect_fail "object store without an access key id" \
+    -e 'bbraft_server_s3_enabled=true' \
+    -e 'bbraft_server_s3_access_key_id='
+expect_fail "object store without a secret" \
+    -e 'bbraft_server_s3_enabled=true' \
+    -e 'bbraft_server_s3_secret_access_key='
+expect_fail "object-store endpoint that is not http(s)" \
+    -e 'bbraft_server_s3_enabled=true' \
+    -e 'bbraft_server_s3_endpoint=ftp://s3.example.test'
+expect_fail "object-store bucket with whitespace" \
+    -e @"$here/invalid/s3-bucket-whitespace.yml"
+expect_fail "object-store env file outside its directory" \
+    -e 'bbraft_server_s3_enabled=true' \
+    -e 'bbraft_server_s3_env_file=/tmp/s3.env'
+expect_fail "multi-line object-store secret" \
+    -e @"$here/invalid/s3-secret-newline.yml"
 
 echo "== verbose output credential check =="
 check_no_leak() {
@@ -211,7 +261,8 @@ check_no_leak() {
     for value in \
         'placeholder-password' \
         'placeholder-gateway-token-not-real' \
-        'bmb_placeholder_key_not_real'
+        'bmb_placeholder_key_not_real' \
+        'placeholder-s3-secret-not-real'
     do
         if grep -F -q -- "$value" "$log"; then
             echo "FAIL: verbose output leaked a credential placeholder value" >&2

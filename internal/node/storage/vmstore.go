@@ -93,6 +93,15 @@ type VMMeta struct {
 	// was never launched jailed.
 	Control *Identity `json:"control,omitzero"`
 	Console *Identity `json:"console,omitzero"`
+	// FromManifest is the object-store manifest key the disk was restored
+	// from (CreateVM from_manifest); empty for any other VM.
+	FromManifest string `json:"fromManifest,omitzero"`
+	// RestoreChunks is the number of entries of the FromManifest manifest.
+	RestoreChunks uint64 `json:"restoreChunks,omitzero"`
+	// HydratedAtUnixMs is when the VM first became READY with its whole
+	// disk local (CommitReady sets it once); 0 before that and on records
+	// written before Phase 2.
+	HydratedAtUnixMs int64 `json:"hydratedAtUnixMs,omitzero"`
 }
 
 // Stopped reports the durable STOPPED marker: no QEMU record exists and a
@@ -370,6 +379,11 @@ func (s *Store) CommitReady(id string, nowUnixMs int64) error {
 	}
 	meta.StartedAtUnixMs = nowUnixMs
 	meta.StoppedAtUnixMs = 0
+	// Phase 2a restores are eager: the first READY is when the disk became
+	// wholly local, and it stays the hydration time across restarts.
+	if meta.HydratedAtUnixMs == 0 {
+		meta.HydratedAtUnixMs = nowUnixMs
+	}
 	return s.writeManifest(meta)
 }
 

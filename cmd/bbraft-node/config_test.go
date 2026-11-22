@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"io"
 	"math"
 	"net/netip"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	nodenet "github.com/nathabonfim59/bamboo-raft/internal/node/net"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore/s3"
 	"github.com/nathabonfim59/bamboo-raft/internal/overcommit"
 )
 
@@ -56,6 +58,7 @@ func TestEnvName(t *testing.T) {
 		"node.ssh-ingress-addr":    "BBRAFT_NODE_SSH_INGRESS_ADDR",
 		"node.ssh-ingress-iface":   "BBRAFT_NODE_SSH_INGRESS_IFACE",
 		"node.ssh-port-range":      "BBRAFT_NODE_SSH_PORT_RANGE",
+		"node.vsock-cid-range":     "BBRAFT_NODE_VSOCK_CID_RANGE",
 	} {
 		if got := envName(flagName); got != want {
 			t.Errorf("envName(%q) = %q, want %q", flagName, got, want)
@@ -104,6 +107,15 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if o.networkPrefix != "" || o.networkGateway != "" || o.networkManagement != "" ||
 		o.sshIngressAddr != "" || o.sshIngressIface != "" || o.sshPortRange != "" {
 		t.Errorf("operator network inputs must have no defaults: %+v", o)
+	}
+	if o.s3Configured {
+		t.Error("the object store must be off unless a bucket is configured")
+	}
+	if o.chunkCacheBytes != defaultChunkCacheBytes {
+		t.Errorf("chunkCacheBytes %d, want %d", o.chunkCacheBytes, defaultChunkCacheBytes)
+	}
+	if o.vsockCIDRange != "" || o.vsockMinCID != 0 || o.vsockMaxCID != 0 {
+		t.Errorf("vsock cid range %q/%d/%d, want empty zeros (Manager defaults)", o.vsockCIDRange, o.vsockMinCID, o.vsockMaxCID)
 	}
 }
 
@@ -1136,5 +1148,409 @@ func TestNetworkingTapRejectsUnsafeConfig(t *testing.T) {
 				t.Fatalf("error %q does not contain %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestParseFlagsObjectStore resolves the shared -s3.* flags through the node's
+// own parser: the store is off unless a bucket is configured, every field has
+// a BBRAFT_S3_* fallback, and an explicit flag wins over its variable.
+func TestParseFlagsObjectStore(t *testing.T) {
+	const (
+		accessKey = "AKIAIOSFODNN7EXAMPLE"
+		secret    = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	)
+	envAll := map[string]string{
+		"BBRAFT_S3_ENDPOINT":          "http://env.example:3900",
+		"BBRAFT_S3_REGION":            "env-region",
+		"BBRAFT_S3_BUCKET":            "env-bucket",
+		"BBRAFT_S3_PATH_STYLE":        "true",
+		"BBRAFT_S3_ACCESS_KEY_ID":     accessKey,
+		"BBRAFT_S3_SECRET_ACCESS_KEY": secret,
+		"BBRAFT_S3_CREATE_BUCKET":     "true",
+		"BBRAFT_S3_LOCATION_HINT":     "env-hint",
+	}
+	tests := []struct {
+		name       string
+		args       []string
+		env        map[string]string
+		configured bool
+		want       s3.Config
+		wantErr    string // substring; empty means success
+	}{
+		{
+			name: "not configured",
+		},
+		{
+			name:       "environment only",
+			env:        envAll,
+			configured: true,
+			want: s3.Config{
+				Endpoint:        "http://env.example:3900",
+				Region:          "env-region",
+				Bucket:          "env-bucket",
+				PathStyle:       true,
+				AccessKeyID:     accessKey,
+				SecretAccessKey: secret,
+				CreateBucket:    true,
+				LocationHint:    "env-hint",
+			},
+		},
+		{
+			name: "flags win over environment",
+			args: []string{
+				"-s3.endpoint=http://flag.example:3900",
+				"-s3.region=flag-region",
+				"-s3.bucket=flag-bucket",
+				"-s3.create-bucket=false",
+			},
+			env:        envAll,
+			configured: true,
+			want: s3.Config{
+				Endpoint:        "http://flag.example:3900",
+				Region:          "flag-region",
+				Bucket:          "flag-bucket",
+				PathStyle:       true, // from the environment
+				AccessKeyID:     accessKey,
+				SecretAccessKey: secret,
+				CreateBucket:    false, // explicit false beats true
+				LocationHint:    "env-hint",
+			},
+		},
+		{
+			name: "bucket without secret",
+			env: map[string]string{
+				"BBRAFT_S3_BUCKET":        "b",
+				"BBRAFT_S3_ACCESS_KEY_ID": accessKey,
+			},
+			wantErr: "no secret access key",
+		},
+		{
+			name: "bucket without access key",
+			env: map[string]string{
+				"BBRAFT_S3_BUCKET":            "b",
+				"BBRAFT_S3_SECRET_ACCESS_KEY": secret,
+			},
+			wantErr: "access key id",
+		},
+		{
+			name:    "both secret sources",
+			args:    []string{"-s3.secret-access-key-file=unused"},
+			env:     envAll,
+			wantErr: "set only one of",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o, err := parseFlags(tt.args, io.Discard, testEnv(tt.env), okHostname)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseFlags error = %v, want one containing %q", err, tt.wantErr)
+				}
+				// Secret non-disclosure: the configured secret never reaches
+				// an error.
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("error leaks the S3 secret: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseFlags: %v", err)
+			}
+			if o.s3Configured != tt.configured {
+				t.Fatalf("s3Configured = %t, want %t", o.s3Configured, tt.configured)
+			}
+			if o.s3Config != tt.want {
+				t.Fatalf("s3Config = %s, want %s", o.s3Config, tt.want)
+			}
+		})
+	}
+}
+
+// cfgWriteSecret writes a secret file with an exact mode below t.TempDir().
+func cfgWriteSecret(t *testing.T, content string, perm os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "s3-secret")
+	if err := os.WriteFile(path, []byte(content), perm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, perm); err != nil { // WriteFile is subject to umask
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestParseFlagsObjectStoreSecretFile: the node accepts the secret only from
+// a 0600-or-stricter file (trailing newline trimmed) or the environment, and
+// a refused file never echoes the secret.
+func TestParseFlagsObjectStoreSecretFile(t *testing.T) {
+	const (
+		accessKey = "AKIAIOSFODNN7EXAMPLE"
+		secret    = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	)
+	good := cfgWriteSecret(t, secret+"\n", 0o600)
+	o, err := parseFlags([]string{
+		"-s3.bucket=b",
+		"-s3.access-key-id=" + accessKey,
+		"-s3.secret-access-key-file=" + good,
+	}, io.Discard, testEnv(nil), okHostname)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if !o.s3Configured || o.s3Config.SecretAccessKey != secret {
+		t.Fatalf("configured %t secret %q, want the file's", o.s3Configured, o.s3Config.SecretAccessKey)
+	}
+
+	for name, perm := range map[string]os.FileMode{
+		"group readable": 0o640,
+		"world readable": 0o604,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := cfgWriteSecret(t, secret, perm)
+			_, err := parseFlags([]string{
+				"-s3.bucket=b",
+				"-s3.access-key-id=" + accessKey,
+				"-s3.secret-access-key-file=" + path,
+			}, io.Discard, testEnv(nil), okHostname)
+			if err == nil || !strings.Contains(err.Error(), "0600 or stricter") {
+				t.Fatalf("parseFlags error = %v, want a mode refusal", err)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error leaks the S3 secret: %v", err)
+			}
+		})
+	}
+}
+
+// TestParseFlagsChunkCacheBytes: the cap defaults to 8 GiB, 0 disables it,
+// the env fallback and flag precedence go through the shared node parsing,
+// and values a Config int64 cannot hold are refused.
+func TestParseFlagsChunkCacheBytes(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		env     map[string]string
+		want    uint64
+		wantErr string
+	}{
+		{name: "default", want: defaultChunkCacheBytes},
+		{name: "env zero disables", env: map[string]string{"BBRAFT_NODE_CHUNK_CACHE_BYTES": "0"}, want: 0},
+		{name: "env value", env: map[string]string{"BBRAFT_NODE_CHUNK_CACHE_BYTES": "4096"}, want: 4096},
+		{
+			name: "flag wins over env",
+			args: []string{"-node.chunk-cache-bytes=8192"},
+			env:  map[string]string{"BBRAFT_NODE_CHUNK_CACHE_BYTES": "4096"},
+			want: 8192,
+		},
+		{name: "max int64", args: []string{"-node.chunk-cache-bytes=9223372036854775807"}, want: math.MaxInt64},
+		{
+			name:    "beyond int64",
+			args:    []string{"-node.chunk-cache-bytes=9223372036854775808"},
+			wantErr: "exceeds",
+		},
+		{
+			name:    "malformed env names the variable",
+			env:     map[string]string{"BBRAFT_NODE_CHUNK_CACHE_BYTES": "many"},
+			wantErr: "BBRAFT_NODE_CHUNK_CACHE_BYTES",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o, err := parseFlags(tt.args, io.Discard, testEnv(tt.env), okHostname)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseFlags error = %v, want one containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseFlags: %v", err)
+			}
+			if o.chunkCacheBytes != tt.want {
+				t.Fatalf("chunkCacheBytes = %d, want %d", o.chunkCacheBytes, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseFlagsHelpObjectStore checks the usage text documents the object
+// store and chunk cache flags and never prints a secret, even when one is
+// configured in the environment.
+func TestParseFlagsHelpObjectStore(t *testing.T) {
+	const secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	var out strings.Builder
+	_, err := parseFlags([]string{"-h"}, &out, testEnv(map[string]string{
+		"BBRAFT_S3_BUCKET":            "b",
+		"BBRAFT_S3_ACCESS_KEY_ID":     "AKIAIOSFODNN7EXAMPLE",
+		"BBRAFT_S3_SECRET_ACCESS_KEY": secret,
+	}), okHostname)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("parseFlags(-h) = %v, want flag.ErrHelp", err)
+	}
+	help := out.String()
+	for _, want := range []string{
+		"-s3.endpoint",
+		"-s3.bucket",
+		"-s3.secret-access-key-file",
+		"-node.chunk-cache-bytes",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help does not document %s", want)
+		}
+	}
+	if strings.Contains(help, secret) {
+		t.Error("help output leaks the S3 secret")
+	}
+}
+
+// TestParseFlagsVSockCIDRange drives -node.vsock-cid-range through the flag
+// and its env fallback. Empty leaves both bounds zero so the Manager keeps its
+// default range; every refused shape names the flag, never just "invalid".
+func TestParseFlagsVSockCIDRange(t *testing.T) {
+	const envVar = "BBRAFT_NODE_VSOCK_CID_RANGE"
+	tests := []struct {
+		name    string
+		args    []string
+		env     map[string]string
+		wantMin uint32
+		wantMax uint32
+		wantErr string
+	}{
+		{name: "default empty"},
+		{name: "empty env", env: map[string]string{envVar: ""}},
+		{name: "flag range", args: []string{"-node.vsock-cid-range=3-999"}, wantMin: 3, wantMax: 999},
+		{name: "single cid", args: []string{"-node.vsock-cid-range=7-7"}, wantMin: 7, wantMax: 7},
+		{name: "highest accepted max", args: []string{"-node.vsock-cid-range=3-4294967294"}, wantMin: 3, wantMax: math.MaxUint32 - 1},
+		{name: "env range", env: map[string]string{envVar: "100-200"}, wantMin: 100, wantMax: 200},
+		{
+			name:    "flag wins over env",
+			args:    []string{"-node.vsock-cid-range=10-20"},
+			env:     map[string]string{envVar: "30-40"},
+			wantMin: 10, wantMax: 20,
+		},
+		{name: "missing dash", args: []string{"-node.vsock-cid-range=3"}, wantErr: "is not MIN-MAX"},
+		{name: "missing max", args: []string{"-node.vsock-cid-range=3-"}, wantErr: "is not MIN-MAX"},
+		{name: "missing min", args: []string{"-node.vsock-cid-range=-3"}, wantErr: "is not MIN-MAX"},
+		{name: "min not a number", args: []string{"-node.vsock-cid-range=three-10"}, wantErr: "is not a decimal integer"},
+		{name: "max not a number", args: []string{"-node.vsock-cid-range=3-ten"}, wantErr: "is not a decimal integer"},
+		{name: "extra dash", args: []string{"-node.vsock-cid-range=3-10-20"}, wantErr: "is not a decimal integer"},
+		{name: "min below reserved", args: []string{"-node.vsock-cid-range=2-10"}, wantErr: "minimum 2 is below 3"},
+		{name: "min zero", args: []string{"-node.vsock-cid-range=0-10"}, wantErr: "minimum 0 is below 3"},
+		{name: "max is VMADDR_CID_ANY", args: []string{"-node.vsock-cid-range=3-4294967295"}, wantErr: "VMADDR_CID_ANY"},
+		{name: "max overflows uint32", args: []string{"-node.vsock-cid-range=3-4294967296"}, wantErr: "is not a decimal integer"},
+		{name: "inverted", args: []string{"-node.vsock-cid-range=10-3"}, wantErr: "minimum 10 is above maximum 3"},
+		{name: "malformed env", env: map[string]string{envVar: "2-10"}, wantErr: "minimum 2 is below 3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o, err := parseFlags(tt.args, io.Discard, testEnv(tt.env), okHostname)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("parseFlags(%v, env %v) accepted a bad range", tt.args, tt.env)
+				}
+				if !strings.Contains(err.Error(), "-node.vsock-cid-range") {
+					t.Fatalf("error %q does not name the flag", err)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error %q misses %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseFlags: %v", err)
+			}
+			if o.vsockMinCID != tt.wantMin || o.vsockMaxCID != tt.wantMax {
+				t.Fatalf("vsock range = %d..%d, want %d..%d", o.vsockMinCID, o.vsockMaxCID, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
+// TestParseFlagsHelpVSockCIDRange checks -help lists the flag and its env
+// fallback.
+func TestParseFlagsHelpVSockCIDRange(t *testing.T) {
+	var out strings.Builder
+	if _, err := parseFlags([]string{"-h"}, &out, testEnv(nil), okHostname); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("parseFlags(-h) = %v, want flag.ErrHelp", err)
+	}
+	for _, want := range []string{"-node.vsock-cid-range", "BBRAFT_NODE_VSOCK_CID_RANGE"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("help does not document %s", want)
+		}
+	}
+}
+
+// TestParseFlagsObjectStoreIncomplete: any object store setting without a
+// bucket is a configuration error (the node used to start quietly without a
+// store, which is what a half-applied environment file produces). It names
+// the settings and never a value.
+func TestParseFlagsObjectStoreIncomplete(t *testing.T) {
+	const secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	secretFile := cfgWriteSecret(t, secret+"\n", 0o600)
+	for name, env := range map[string]map[string]string{
+		"secret file only":   {"BBRAFT_S3_SECRET_ACCESS_KEY_FILE": secretFile},
+		"secret value only":  {"BBRAFT_S3_SECRET_ACCESS_KEY": secret},
+		"endpoint and key":   {"BBRAFT_S3_ENDPOINT": "http://s3.example:3900", "BBRAFT_S3_ACCESS_KEY_ID": "AKIAEXAMPLE"},
+		"region only":        {"BBRAFT_S3_REGION": "garage"},
+		"nothing but a flag": nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			args := []string(nil)
+			if env == nil {
+				args = []string{"-s3.region=garage"}
+			}
+			_, err := parseFlags(args, io.Discard, testEnv(env), okHostname)
+			if err == nil || !strings.Contains(err.Error(), "object store settings are incomplete") ||
+				!strings.Contains(err.Error(), "-s3.bucket (BBRAFT_S3_BUCKET) is not set") {
+				t.Fatalf("parseFlags error = %v, want the incomplete object store error", err)
+			}
+			for _, leaked := range []string{secret, secretFile, "s3.example", "AKIAEXAMPLE"} {
+				if strings.Contains(err.Error(), leaked) {
+					t.Fatalf("error leaks %q: %v", leaked, err)
+				}
+			}
+		})
+	}
+}
+
+// TestRunRefusesIncompleteObjectStore: the node does not start in that state:
+// nothing runs, the node token is not read and no readiness is logged.
+func TestRunRefusesIncompleteObjectStore(t *testing.T) {
+	secretFile := cfgWriteSecret(t, "SENTINEL-run-s3-secret\n", 0o600)
+	d, s := devDeps(map[string]string{
+		"BBRAFT_NODE_TOKEN":                "tok",
+		"BBRAFT_S3_SECRET_ACCESS_KEY_FILE": secretFile, // the bucket's variable never arrived
+	})
+	var stderr strings.Builder
+	err := runWithDeps(t.Context(), nil, &stderr, d)
+	if err == nil || !strings.Contains(err.Error(), "object store settings are incomplete") {
+		t.Fatalf("run error = %v, want the incomplete object store error", err)
+	}
+	if got := s.snapshot(); len(got) != 0 {
+		t.Fatalf("events %v: nothing may run with half an object store configuration", got)
+	}
+	if s.factsCalls != 0 || s.tokenLookups != 0 {
+		t.Fatalf("host facts probed %d times, node token read %d times", s.factsCalls, s.tokenLookups)
+	}
+	if strings.Contains(stderr.String(), "bbraft-node ready") || strings.Contains(stderr.String(), "SENTINEL-run-s3-secret") || strings.Contains(err.Error(), "SENTINEL-run-s3-secret") {
+		t.Fatalf("readiness logged or the secret leaked: %q / %v", stderr.String(), err)
+	}
+}
+
+// TestRunRefusesUnreadableObjectStoreSecret: a bucket whose secret file is
+// missing stops the node with an error that names only the path.
+func TestRunRefusesUnreadableObjectStoreSecret(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-s3-secret")
+	d, s := devDeps(map[string]string{
+		"BBRAFT_NODE_TOKEN":                "tok",
+		"BBRAFT_S3_BUCKET":                 "bucket",
+		"BBRAFT_S3_ACCESS_KEY_ID":          "AKIAEXAMPLE",
+		"BBRAFT_S3_SECRET_ACCESS_KEY_FILE": missing,
+	})
+	err := runWithDeps(t.Context(), nil, io.Discard, d)
+	if err == nil || !strings.Contains(err.Error(), missing) {
+		t.Fatalf("run error = %v, want one naming %s", err, missing)
+	}
+	if got := s.snapshot(); len(got) != 0 {
+		t.Fatalf("events %v: nothing may run without the secret", got)
 	}
 }

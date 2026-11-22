@@ -340,7 +340,10 @@ type FinalizeResumeParams struct {
 // FinalizeSandboxResume completes a resume after StartVM succeeded, fenced by
 // the actual [JobResume] claim, the lifecycle generation from its payload and
 // the row version. It moves provisioning to ready and clears the stop
-// timestamp. A stale generation, wrong state or version mismatch answers
+// timestamp. For a cross-node resume (payload FromManifest set) it also sets
+// disk_node_id to the node the disk was restored on, hydrated_at and the
+// resume job's source generation as the restore source (the chunk collector
+// keeps it), and records [EventSandboxHydrated]. A stale generation, wrong state or version mismatch answers
 // [ErrConflict]; a lost claim [ErrJobNotLeased]; a deleted or foreign sandbox
 // [ErrNotFound].
 func (s *Store) FinalizeSandboxResume(ctx context.Context, jobID uuid.UUID, worker string, token uuid.UUID, p FinalizeResumeParams) (Sandbox, error) {
@@ -376,16 +379,28 @@ func (s *Store) FinalizeSandboxResume(ctx context.Context, jobID uuid.UUID, work
 		if p.Version != 0 && sbx.Version != p.Version {
 			return ErrConflict
 		}
+		// A cross-node resume restored the disk on the payload's
+		// node: it is local there now, and fully hydrated (restores are
+		// eager).
+		elsewhere := claimed.FromManifest != ""
+		if elsewhere && derefString(sbx.NodeID) != claimed.NodeID {
+			return ErrConflict
+		}
 		row := tx.QueryRow(ctx, `
 			UPDATE sandboxes SET
 				state = 'ready', version = version + 1,
 				stopped_at = NULL, error_reason = '',
+				disk_node_id = CASE WHEN $5 THEN node_id ELSE disk_node_id END,
+				hydrated_at = CASE WHEN $5 THEN now() ELSE hydrated_at END,
+				restore_source_generation_id = CASE WHEN $5
+					THEN (SELECT source_generation_id FROM jobs WHERE id = $6)
+					ELSE restore_source_generation_id END,
 				ssh_endpoint = NULL, ssh_host_key = NULL, updated_at = now()
 			WHERE id = $1 AND owner_id = $2 AND version = $3
 			  AND state = 'provisioning' AND lifecycle_generation = $4
 			  AND deleted_at IS NULL
 			RETURNING `+sandboxCols,
-			p.SandboxID, p.Owner, sbx.Version, p.Generation)
+			p.SandboxID, p.Owner, sbx.Version, p.Generation, elsewhere, jobID)
 		out, err = scanSandbox(row)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrConflict
@@ -393,7 +408,13 @@ func (s *Store) FinalizeSandboxResume(ctx context.Context, jobID uuid.UUID, work
 		if err != nil {
 			return fmtError("finalize resume transition", err)
 		}
-		return insertEventTx(ctx, tx, out, EventInput{Type: EventStatePrefix + string(StateReady)})
+		if err := insertEventTx(ctx, tx, out, EventInput{Type: EventStatePrefix + string(StateReady)}); err != nil {
+			return err
+		}
+		if elsewhere {
+			return insertEventTx(ctx, tx, out, EventInput{Type: EventSandboxHydrated})
+		}
+		return nil
 	})
 	if err != nil {
 		return Sandbox{}, err

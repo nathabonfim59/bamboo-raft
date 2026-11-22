@@ -83,7 +83,7 @@ export default defineConfig({
   },
   themeConfig: {
     nav: [
-      { text: 'Docs', link: '/server', activeMatch: '^/(agent-install|server|node|guest-image|windows|infra|cli|api$|e2e)' },
+      { text: 'Docs', link: '/server', activeMatch: '^/(agent-install|deploy|server|node|guest-image|windows|infra|cli|api$|e2e)' },
       { text: 'API reference', link: '/api-reference/http/', activeMatch: '^/api-reference/' },
       { text: 'Releases', link: `${repositoryUrl}/releases` },
     ],
@@ -94,6 +94,7 @@ export default defineConfig({
           { text: 'Install with an agent', link: '/agent-install' },
           { text: 'Control plane', link: '/server' },
           { text: 'KVM node', link: '/node' },
+          { text: 'Several nodes', link: '/deploy' },
           { text: 'Guest image', link: '/guest-image' },
           { text: 'Hyper-V dev node', link: '/windows-hyperv-node' },
         ],

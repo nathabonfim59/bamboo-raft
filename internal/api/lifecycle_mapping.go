@@ -147,6 +147,18 @@ func resumeFailure(ctx context.Context, logger *slog.Logger, capacityRetry int, 
 	switch {
 	case errors.Is(err, db.ErrNotFound):
 		return coreNotFound()
+	case errors.Is(err, db.ErrSnapshotDataExpired):
+		return apierr.New(http.StatusConflict, apierr.CodeSnapshotDataExpired,
+			"the sandbox's stored data expired; it cannot be resumed").Retryable(false)
+	case errors.Is(err, db.ErrNoRestorableData):
+		return apierr.New(http.StatusConflict, apierr.CodeResumeFailed,
+			"the sandbox has no disk on any node and no completed snapshot to resume from").Retryable(false)
+	case errors.Is(err, db.ErrSnapshotsDisabled):
+		return snapshotsDisabledResume()
+	case errors.Is(err, db.ErrSnapshotNotFound):
+		// The last generation was purged between the read and the
+		// admission: a retry resolves it from the new latest one.
+		return coreConflict("the sandbox's snapshot changed while the resume was accepted")
 	case errors.Is(err, db.ErrNoCapacity), errors.Is(err, ErrNoReadyMachine),
 		errors.Is(err, scheduler.ErrNoCapacity), errors.Is(err, scheduler.ErrNoNode):
 		return coreNoReadyMachine(lifecycleRetrySeconds(capacityRetry))
@@ -197,6 +209,13 @@ func resumeStateFailure(row db.Sandbox, changes resumeChanges) *apierr.Error {
 func sandboxNotReady() *apierr.Error {
 	return apierr.New(http.StatusConflict, apierr.CodeSandboxNotReady,
 		"the sandbox stopped with an error and cannot be resumed; delete it instead").Retryable(false)
+}
+
+// snapshotsDisabledResume is the conflict for resuming a stopped sandbox
+// created with snapshots off: its stop erased the disk.
+func snapshotsDisabledResume() *apierr.Error {
+	return apierr.New(http.StatusConflict, apierr.CodeSnapshotsDisabled,
+		"the sandbox was created with snapshots off, so stopping it erased its disk; it cannot be resumed").Retryable(false)
 }
 
 // sandboxStopping builds the pinned sandbox_stopping conflict for a resume

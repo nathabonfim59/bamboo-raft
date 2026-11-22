@@ -20,6 +20,8 @@ const (
 // guest-influenced metadata: it is compared, never opened.
 type qcowHeader struct {
 	backing string
+	// size is the virtual disk size in bytes.
+	size uint64
 }
 
 // readQCOWHeader parses f's qcow2 header strictly: version 2 or 3, no
@@ -46,6 +48,7 @@ func readQCOWHeader(f *os.File) (qcowHeader, error) {
 	if binary.BigEndian.Uint32(raw[32:36]) != 0 {
 		return qcowHeader{}, errors.New("unsupported feature: encryption")
 	}
+	size := binary.BigEndian.Uint64(raw[24:32])
 	headerLength := uint64(72)
 	if version == 3 {
 		if n < qcowHeaderBytes {
@@ -61,7 +64,7 @@ func readQCOWHeader(f *os.File) (qcowHeader, error) {
 		}
 	}
 	if backingSize == 0 {
-		return qcowHeader{}, nil
+		return qcowHeader{size: size}, nil
 	}
 	if backingSize > qcowMaxBackingName {
 		return qcowHeader{}, fmt.Errorf("backing name is %d bytes", backingSize)
@@ -73,5 +76,5 @@ func readQCOWHeader(f *os.File) (qcowHeader, error) {
 	if _, err := f.ReadAt(name, int64(backingOffset)); err != nil {
 		return qcowHeader{}, fmt.Errorf("read backing name: %w", err)
 	}
-	return qcowHeader{backing: string(name)}, nil
+	return qcowHeader{backing: string(name), size: size}, nil
 }

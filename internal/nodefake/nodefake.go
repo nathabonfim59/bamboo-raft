@@ -30,8 +30,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore/memstore"
 	"github.com/nathabonfim59/bamboo-raft/internal/proto/nodev1"
+	"github.com/nathabonfim59/bamboo-raft/internal/snapformat"
 )
 
 // Image is the only image a fake node has.
@@ -40,6 +43,7 @@ const Image = "fake-v0"
 // Node implements nodev1.NodeServer.
 type Node struct {
 	nodev1.UnimplementedNodeServer
+	phase2 // Store and SnapshotVM serialization (phase2.go)
 
 	id   string
 	root string
@@ -61,9 +65,11 @@ type Node struct {
 	procs map[string]map[uint32]*proc // detached processes per sandbox (phase1.go)
 }
 
-// New returns a fake node that keeps its VMs under root.
+// New returns a fake node that keeps its VMs under root, with its own empty
+// in-memory object store (replace Store to share one between fakes).
 func New(nodeID, root string) *Node {
 	return &Node{
+		phase2:    phase2{Store: memstore.New()},
 		id:        nodeID,
 		root:      root,
 		VCPUs:     64,
@@ -117,6 +123,23 @@ func (n *Node) CreateVM(ctx context.Context, req *nodev1.CreateVMRequest) (*node
 		n.mu.Unlock()
 		return n.waitReady(ctx, vm)
 	}
+	var manifest *snapformat.Manifest
+	if req.GetFromManifest() != "" {
+		// Checked outside the lock (it reads the store), then the existence
+		// check is redone: a concurrent CreateVM may have won meanwhile. Its
+		// errors come before the image and capacity checks below.
+		n.mu.Unlock()
+		m, err := n.loadManifest(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		manifest = m
+		n.mu.Lock()
+		if _, ok := n.vms[req.SandboxId]; ok {
+			n.mu.Unlock()
+			return n.CreateVM(ctx, req)
+		}
+	}
 	if img := req.GetImage(); img != "" && img != Image {
 		n.mu.Unlock()
 		return nil, status.Errorf(codes.NotFound, "image %q not found", img)
@@ -131,13 +154,20 @@ func (n *Node) CreateVM(ctx context.Context, req *nodev1.CreateVMRequest) (*node
 			return nil, status.Errorf(codes.NotFound, "snapshot %q not found", s)
 		}
 	}
+	now := time.Now().UnixMilli()
 	vm := &nodev1.VM{
 		SandboxId:       req.SandboxId,
 		State:           nodev1.VMState_VM_STATE_BOOTING,
 		Image:           Image,
 		FromSnapshot:    req.GetFromSnapshot(),
 		Resources:       req.GetResources(),
-		CreatedAtUnixMs: time.Now().UnixMilli(),
+		CreatedAtUnixMs: now,
+		FromManifest:    req.GetFromManifest(),
+		Hydration:       &nodev1.Hydration{Hydrated: true, HydratedAtUnixMs: now},
+	}
+	if manifest != nil {
+		total := uint64(len(manifest.Chunks))
+		vm.Hydration = &nodev1.Hydration{ChunksTotal: total}
 	}
 	// The boot belongs to the node, not to this call: it goes on if the
 	// caller gives up, and only DeleteVM stops it (proto: DeleteVM fences).
@@ -151,7 +181,7 @@ func (n *Node) CreateVM(ctx context.Context, req *nodev1.CreateVMRequest) (*node
 	go func() {
 		defer close(bt.done)
 		defer cancel()
-		err := n.boot(bctx, req)
+		err := n.boot(bctx, req, manifest)
 		n.mu.Lock()
 		defer n.mu.Unlock()
 		delete(n.boots, req.SandboxId)
@@ -165,6 +195,9 @@ func (n *Node) CreateVM(ctx context.Context, req *nodev1.CreateVMRequest) (*node
 		}
 		vm.State = nodev1.VMState_VM_STATE_READY
 		vm.StartedAtUnixMs = time.Now().UnixMilli()
+		if h := vm.Hydration; !h.Hydrated { // eager restore: all local at READY
+			h.Hydrated, h.HydratedAtUnixMs, h.ChunksDone = true, vm.StartedAtUnixMs, h.ChunksTotal
+		}
 	}()
 	return n.waitReady(ctx, vm)
 }
@@ -213,9 +246,13 @@ type booting struct {
 	done   chan struct{}
 }
 
-func (n *Node) boot(ctx context.Context, req *nodev1.CreateVMRequest) error {
+func (n *Node) boot(ctx context.Context, req *nodev1.CreateVMRequest, manifest *snapformat.Manifest) error {
 	dir := n.vmDir(req.SandboxId)
-	if s := req.GetFromSnapshot(); s != "" {
+	if manifest != nil {
+		if err := n.restoreManifest(ctx, manifest, dir); err != nil {
+			return fmt.Errorf("restore %s: %w", req.GetFromManifest(), err)
+		}
+	} else if s := req.GetFromSnapshot(); s != "" {
 		if err := os.CopyFS(dir, os.DirFS(n.snapDir(s))); err != nil {
 			return err
 		}
@@ -591,15 +628,4 @@ func (n *Node) DeleteSnapshot(_ context.Context, req *nodev1.DeleteSnapshotReque
 	return &nodev1.DeleteSnapshotResponse{}, nil
 }
 
-func cloneVM(vm *nodev1.VM) *nodev1.VM {
-	return &nodev1.VM{
-		SandboxId:       vm.SandboxId,
-		State:           vm.State,
-		Image:           vm.Image,
-		FromSnapshot:    vm.FromSnapshot,
-		Resources:       vm.Resources,
-		CreatedAtUnixMs: vm.CreatedAtUnixMs,
-		Error:           vm.Error,
-		StartedAtUnixMs: vm.StartedAtUnixMs,
-	}
-}
+func cloneVM(vm *nodev1.VM) *nodev1.VM { return proto.Clone(vm).(*nodev1.VM) }

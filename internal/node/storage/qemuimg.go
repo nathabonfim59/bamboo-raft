@@ -66,6 +66,11 @@ func (q QemuImg) Check(ctx context.Context, img ImageRef) error {
 	return q.imager().Check(ctx, img)
 }
 
+// CreateStandalone implements [StandaloneCreator].
+func (q QemuImg) CreateStandalone(ctx context.Context, dst ImageRef, virtualSize uint64) error {
+	return q.imager().CreateStandalone(ctx, dst, virtualSize)
+}
+
 // localToolRunner runs qemu-img as the current, non-root user.
 type localToolRunner struct{}
 
@@ -102,6 +107,9 @@ func toolArgv(req ToolRequest) []string {
 	case "resize":
 		return []string{"resize", "--image-opts", graph, size}
 	default:
+		if req.Target.BackingName == "" {
+			return []string{"create", "-f", "qcow2", "/proc/self/fd/3", size}
+		}
 		return []string{"create", "-f", "qcow2", "-u", "-F", "qcow2", "-b", req.Target.BackingName, "/proc/self/fd/3", size}
 	}
 }

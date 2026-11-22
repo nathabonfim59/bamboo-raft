@@ -72,6 +72,21 @@ class SystemdQuoteTest(unittest.TestCase):
             '"a%%b$c\\"d\\\\e"',
         )
 
+    def test_path_value_is_never_quoted(self):
+        # EnvironmentFile= and LoadCredential=<id>:<path> take the value
+        # verbatim: a quoted path is "not absolute" to systemd, which ignores
+        # the setting without failing the unit.
+        value = FILTERS.bbraft_node_systemd_path_value
+        self.assertEqual(value("/etc/bbraft/s3.env"), "/etc/bbraft/s3.env")
+        self.assertEqual(value("/etc/bb raft/s3.env"), "/etc/bb raft/s3.env")
+        self.assertEqual(value("/etc/a%b$c\"d\\e"), "/etc/a%%b$c\"d\\e")
+
+    def test_path_value_refuses_what_systemd_would_misread(self):
+        for bad in ["relative/s3.env", "", '"/etc/s3.env"', " /etc/s3.env", "/etc/s3.env ", "/etc/s3.env\\", "/etc/a\nb", "/etc/a\0b"]:
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    FILTERS.bbraft_node_systemd_path_value(bad)
+
     def test_line_breaks_are_rejected(self):
         for quote in (
             FILTERS.bbraft_node_systemd_exec_quote,

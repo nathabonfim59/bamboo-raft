@@ -51,10 +51,21 @@
       - (bbraft_server_retry_seconds | bbraft_positive_int) >= 1
       - (bbraft_server_reaper_seconds | bbraft_positive_int) >= 1
       - (bbraft_server_job_poll_seconds | bbraft_positive_int) >= 1
+      - (bbraft_server_snapshot_interval_seconds | bbraft_positive_int) >= 1
+      - (bbraft_server_snapshot_timeout_seconds | bbraft_positive_int) >= 1
+      - >-
+        (bbraft_server_node_lost_seconds | bbraft_nonnegative_int) == 0 or
+        (bbraft_server_node_lost_seconds | bbraft_nonnegative_int) >= 60
+      - (bbraft_server_data_retention_seconds | bbraft_nonnegative_int) >= 0
+      - >-
+        (bbraft_server_disk_low_percent | bbraft_nonnegative_int) == 0 or
+        ((bbraft_server_disk_low_percent | bbraft_nonnegative_int) >= 1 and
+        (bbraft_server_disk_low_percent | bbraft_nonnegative_int) <= 90)
     fail_msg: >-
       roles must be all or a comma-separated subset of api,lifecycle,nodehub
       without duplicates; user/group/service/key prefix must be plain names;
-      every interval must be at least 1
+      every interval must be at least 1; node loss is 0 or at least 60
+      seconds; data retention is 0 or more; disk pressure is 0 or 1-90 percent
     quiet: true
 
 - name: Normalize numeric settings to validated integers
@@ -63,6 +74,11 @@
     bbraft_server_retry_seconds_int: "{{ bbraft_server_retry_seconds | bbraft_positive_int }}"
     bbraft_server_reaper_seconds_int: "{{ bbraft_server_reaper_seconds | bbraft_positive_int }}"
     bbraft_server_job_poll_seconds_int: "{{ bbraft_server_job_poll_seconds | bbraft_positive_int }}"
+    bbraft_server_snapshot_interval_seconds_int: "{{ bbraft_server_snapshot_interval_seconds | bbraft_positive_int }}"
+    bbraft_server_snapshot_timeout_seconds_int: "{{ bbraft_server_snapshot_timeout_seconds | bbraft_positive_int }}"
+    bbraft_server_node_lost_seconds_int: "{{ bbraft_server_node_lost_seconds | bbraft_nonnegative_int }}"
+    bbraft_server_data_retention_seconds_int: "{{ bbraft_server_data_retention_seconds | bbraft_nonnegative_int }}"
+    bbraft_server_disk_low_percent_int: "{{ bbraft_server_disk_low_percent | bbraft_nonnegative_int }}"
 
 - name: Work out which credential files the selected roles need
   ansible.builtin.set_fact:
@@ -253,3 +269,45 @@
     quiet: true
   no_log: true
   when: bbraft_server_node_tokens | length > 0
+
+# The object store is optional. When enabled, every value comes from the
+# inventory and the secret is written alone to its own file. The assertion is
+# no_log because it reads the secret; diagnostics name the setting, never the
+# value.
+- name: Object-store settings are complete when enabled
+  ansible.builtin.assert:
+    that:
+      - bbraft_server_s3_enabled | bool
+      - bbraft_server_s3_endpoint is string
+      - bbraft_server_s3_endpoint is not search("\\s")
+      - (bbraft_server_s3_endpoint | length == 0) or (bbraft_server_s3_endpoint is match('^https?://'))
+      - bbraft_server_s3_region is string
+      - bbraft_server_s3_region is not search("\\s")
+      - (bbraft_server_s3_region | length > 0) or (bbraft_server_s3_endpoint | length == 0)
+      - bbraft_server_s3_bucket is string
+      - bbraft_server_s3_bucket | length > 0
+      - bbraft_server_s3_bucket is not search("\\s")
+      - bbraft_server_s3_access_key_id is string
+      - bbraft_server_s3_access_key_id | length > 0
+      - bbraft_server_s3_access_key_id is not search("\\s")
+      - bbraft_server_s3_secret_access_key is string
+      - bbraft_server_s3_secret_access_key | length > 0
+      - bbraft_server_s3_secret_access_key is not search("\\n")
+      - bbraft_server_s3_secret_access_key is not search("\\r")
+      - bbraft_server_s3_secret_access_key | trim == bbraft_server_s3_secret_access_key
+      - bbraft_server_s3_dir is string
+      - bbraft_server_s3_dir | length > 0
+      - bbraft_server_s3_env_file is string
+      - bbraft_server_s3_secret_file is string
+      - bbraft_server_s3_env_file != bbraft_server_s3_secret_file
+      - bbraft_server_s3_env_file.startswith(bbraft_server_s3_dir ~ '/')
+      - bbraft_server_s3_secret_file.startswith(bbraft_server_s3_dir ~ '/')
+    fail_msg: >-
+      with bbraft_server_s3_enabled the bucket, access key id and secret
+      access key are required; the endpoint is empty for AWS or an
+      http(s)://host[:port] URL, and a custom endpoint also needs a region.
+      Values are single-line without whitespace, the secret has no surrounding
+      whitespace, and both files live under bbraft_server_s3_dir
+    quiet: true
+  no_log: true
+  when: bbraft_server_s3_enabled | bool

@@ -43,11 +43,18 @@ type APIClient interface {
 	SaveSnapshot(ctx context.Context, req api.SavedSnapshotSaveRequest) (api.SavedSnapshotSavingResponse, error)
 	GetSavedSnapshot(ctx context.Context, name string) (api.SavedSnapshotInfoResponse, error)
 	DeleteSavedSnapshot(ctx context.Context, name string) (api.SavedSnapshotDeletedResponse, error)
+	ListSnapshots(ctx context.Context, sandboxID string, query url.Values) (api.SnapshotListResponse, error)
+	GetLatestSandboxSnapshot(ctx context.Context, sandboxID string) (api.SnapshotLatestResponse, error)
 
 	StopSandbox(ctx context.Context, id string, force bool) (api.SandboxActionResponse, error)
 	GetSandboxStop(ctx context.Context, sandboxID, stopID string) (api.StopOperationResponse, error)
 	ResumeSandbox(ctx context.Context, id string, req api.ResumeSandboxRequest) (api.SandboxActionResponse, error)
+	ForkSandbox(ctx context.Context, id string, req api.ForkSandboxRequest) (api.SandboxActionResponse, error)
+	RecoverSandbox(ctx context.Context, id string) (api.RecoverResponse, error)
 	UpdateSandbox(ctx context.Context, id string, req api.UpdateSandboxRequest) (api.SandboxInfoResponse, error)
+	CreateSnapshotShare(ctx context.Context, name string) (api.SnapshotShareCreatedResponse, error)
+	ListSnapshotShares(ctx context.Context, name string) (api.SnapshotShareListResponse, error)
+	RevokeSnapshotShare(ctx context.Context, name, shareID string) (api.SnapshotShareRevokedResponse, error)
 
 	// NewRequest builds an authenticated request against path (which must
 	// start with "/") with the client's base URL. The caller owns the body.
@@ -446,5 +453,65 @@ func (c *Client) DeleteSavedSnapshot(ctx context.Context, name string) (api.Save
 	var out api.SavedSnapshotDeletedResponse
 	path := "/api/v1/saved-snapshots/" + url.PathEscape(name)
 	err := c.do(ctx, http.MethodDelete, path, nil, nil, nil, &out, api.TypeSavedSnapshotDeleted)
+	return out, err
+}
+
+// ListSnapshots implements APIClient. An empty sandboxID lists the whole
+// account.
+func (c *Client) ListSnapshots(ctx context.Context, sandboxID string, query url.Values) (api.SnapshotListResponse, error) {
+	var out api.SnapshotListResponse
+	path := api.PathSnapshots
+	if sandboxID != "" {
+		path = "/api/v1/sandboxes/" + url.PathEscape(sandboxID) + "/snapshots"
+	}
+	err := c.do(ctx, http.MethodGet, path, query, nil, nil, &out, api.TypeSnapshotList)
+	return out, err
+}
+
+// GetLatestSandboxSnapshot implements APIClient.
+func (c *Client) GetLatestSandboxSnapshot(ctx context.Context, sandboxID string) (api.SnapshotLatestResponse, error) {
+	var out api.SnapshotLatestResponse
+	path := "/api/v1/sandboxes/" + url.PathEscape(sandboxID) + "/snapshots/latest"
+	err := c.do(ctx, http.MethodGet, path, nil, nil, nil, &out, api.TypeSnapshotLatest)
+	return out, err
+}
+
+// ForkSandbox implements APIClient.
+func (c *Client) ForkSandbox(ctx context.Context, id string, req api.ForkSandboxRequest) (api.SandboxActionResponse, error) {
+	var out api.SandboxActionResponse
+	path := "/api/v1/sandboxes/" + url.PathEscape(id) + "/fork"
+	err := c.do(ctx, http.MethodPost, path, nil, nil, req, &out, api.TypeSandboxForking)
+	return out, err
+}
+
+// RecoverSandbox implements APIClient.
+func (c *Client) RecoverSandbox(ctx context.Context, id string) (api.RecoverResponse, error) {
+	var out api.RecoverResponse
+	path := "/api/v1/sandboxes/" + url.PathEscape(id) + "/recover"
+	err := c.do(ctx, http.MethodPost, path, nil, nil, nil, &out, api.TypeSandboxRecovering)
+	return out, err
+}
+
+// CreateSnapshotShare implements APIClient.
+func (c *Client) CreateSnapshotShare(ctx context.Context, name string) (api.SnapshotShareCreatedResponse, error) {
+	var out api.SnapshotShareCreatedResponse
+	path := "/api/v1/saved-snapshots/" + url.PathEscape(name) + "/shares"
+	err := c.do(ctx, http.MethodPost, path, nil, nil, nil, &out, api.TypeSnapshotShareCreated)
+	return out, err
+}
+
+// ListSnapshotShares implements APIClient.
+func (c *Client) ListSnapshotShares(ctx context.Context, name string) (api.SnapshotShareListResponse, error) {
+	var out api.SnapshotShareListResponse
+	path := "/api/v1/saved-snapshots/" + url.PathEscape(name) + "/shares"
+	err := c.do(ctx, http.MethodGet, path, nil, nil, nil, &out, api.TypeSnapshotShareList)
+	return out, err
+}
+
+// RevokeSnapshotShare implements APIClient.
+func (c *Client) RevokeSnapshotShare(ctx context.Context, name, shareID string) (api.SnapshotShareRevokedResponse, error) {
+	var out api.SnapshotShareRevokedResponse
+	path := "/api/v1/saved-snapshots/" + url.PathEscape(name) + "/shares/" + url.PathEscape(shareID)
+	err := c.do(ctx, http.MethodDelete, path, nil, nil, nil, &out, api.TypeSnapshotShareRevoked)
 	return out, err
 }

@@ -406,6 +406,11 @@ func (m *Manager) launchJailed(ctx context.Context, v *vm, img storage.Image, ni
 	if rec, ok := m.jail.Record(v.id); ok {
 		return nil, fmt.Errorf("%w: %s attempt %s", errJailConflict, v.id, rec.Attempt)
 	}
+	// A maintenance QEMU killed mid-session leaves its NBD socket, which
+	// the jailer's control-directory check refuses.
+	if err := m.store.RemovePhase2Scratch(v.id); err != nil {
+		return nil, err
+	}
 	v.mu.Lock()
 	meta := v.meta
 	v.mu.Unlock()
@@ -549,9 +554,13 @@ func (m *Manager) settleJailDetached(v *vm, proc VMProcess) error {
 // settleJail releases v's jail reservation after its QEMU is proven dead,
 // before network, accounting or durable record changes. A nil error means
 // v holds no reservation; any error retains everything. A record of another
-// attempt is a conflict, never success.
+// attempt is a conflict, never success. Without a jailer it removes the QMP
+// socket a non-jailed proc left behind (removeStaleQMPSocket).
 func (m *Manager) settleJail(ctx context.Context, v *vm, proc VMProcess) error {
 	if m.jail == nil {
+		if proc != nil {
+			m.removeStaleQMPSocket(v.id)
+		}
 		return nil
 	}
 	if err := ctx.Err(); err != nil {

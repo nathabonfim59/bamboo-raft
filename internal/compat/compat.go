@@ -217,6 +217,8 @@ var undocumentedErrorResponses = map[string]map[int]undocumentedError{
 			"invalid_name",
 			"invalid_query",
 			"unknown_environment",
+			"count_requires_from",
+			"count_with_fail_fast",
 		}},
 		// Approved by the orchestrator: a create-from whose saved snapshot
 		// is missing, foreign, not ready or has an unknown legacy disk.
@@ -248,7 +250,60 @@ var undocumentedErrorResponses = map[string]map[int]undocumentedError{
 			"invalid_env",
 			"unknown_environment",
 		}},
+		// Every resume conflict, snapshots_disabled included (a stopped
+		// sandbox created with snapshots off has no disk).
+		http.StatusConflict: {Codes: []string{
+			"conflict",
+			"sandbox_not_ready",
+			"sandbox_resuming",
+			"sandbox_running_stop_first",
+			"sandbox_stopping",
+			"snapshots_disabled",
+			"type_too_small",
+			// Resume on another node: expired stored data, and
+			// neither a local disk nor a completed generation.
+			"snapshot_data_expired",
+			"resume_failed",
+		}},
 		http.StatusInternalServerError: {Codes: []string{"http_500"}},
+	},
+	"fork": {
+		// The pinned fork table declares 400/401/404/409/503. A fork body
+		// can be malformed or name an unsupported environment (same codes as
+		// create) and the operation takes no query parameters.
+		http.StatusBadRequest: {Codes: []string{
+			"invalid_json",
+			"invalid_env",
+			"invalid_query",
+			"unknown_environment",
+		}},
+		// A source whose pinned generation vanished between the read and the
+		// admission transaction is a missing snapshot, not a missing
+		// sandbox.
+		http.StatusNotFound: {Codes: []string{
+			"not_found",
+			"snapshot_not_found",
+		}},
+		// Every fork conflict: the source's state and flags, a too-small
+		// type, a vanished snapshot and the two idempotency refusals.
+		http.StatusConflict: {Codes: []string{
+			"conflict",
+			"fork_failed",
+			"idempotency_in_progress",
+			"idempotency_key_reused",
+			"sandbox_resuming",
+			"sandbox_stopping",
+			"snapshot_data_expired",
+			"snapshots_disabled",
+			"type_too_small",
+		}},
+		http.StatusInternalServerError: {Codes: []string{"http_500"}},
+		// A queued fork that finds no room is out of capacity; failFast
+		// answers no_ready_machine. Both carry the retry hint.
+		http.StatusServiceUnavailable: {
+			Codes:                    []string{"no_ready_machine", "out_of_capacity"},
+			RequireRetryAfterSeconds: true,
+		},
 	},
 	"deleteSandbox": {
 		http.StatusInternalServerError: {Codes: []string{"http_500"}},
@@ -331,6 +386,27 @@ var undocumentedErrorResponses = map[string]map[int]undocumentedError{
 		http.StatusInternalServerError: {Codes: []string{"http_500"}},
 	},
 	"deleteSavedSnapshot": {
+		http.StatusInternalServerError: {Codes: []string{"http_500"}},
+	},
+	"recover": {
+		http.StatusUnauthorized: {Codes: []string{"unauthorized"}},
+		http.StatusNotFound:     {Codes: []string{"not_found"}},
+		http.StatusConflict: {Codes: []string{
+			"no_machine",
+			"too_soon",
+			"recover_unsupported",
+			"sandbox_is_reachable",
+			"reset_failed",
+		}},
+		http.StatusInternalServerError: {Codes: []string{"http_500"}},
+	},
+	"listSnapshots": {
+		http.StatusInternalServerError: {Codes: []string{"http_500"}},
+	},
+	"listSandboxSnapshots": {
+		http.StatusInternalServerError: {Codes: []string{"http_500"}},
+	},
+	"getLatestSandboxSnapshot": {
 		http.StatusInternalServerError: {Codes: []string{"http_500"}},
 	},
 }

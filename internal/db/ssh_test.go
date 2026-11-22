@@ -801,8 +801,8 @@ func TestSSHMigrationEmptyAndNullable(t *testing.T) {
 	if _, err := provider.Up(t.Context()); err != nil {
 		t.Fatalf("re-apply: %v", err)
 	}
-	if got := phase1SchemaVersion(t, s); got != 6 {
-		t.Fatalf("schema version after re-apply: %d, want 6", got)
+	if got, want := phase1SchemaVersion(t, s), phase2LatestMigration(t); got != want {
+		t.Fatalf("schema version after re-apply: %d, want %d", got, want)
 	}
 	if n := count(t, s, `SELECT count(*) FROM information_schema.columns
 		WHERE table_schema = current_schema() AND table_name = 'sandboxes'
@@ -844,6 +844,11 @@ func TestSSHMigrationPopulatedPolicies(t *testing.T) {
 		}
 		if got := phase1SchemaVersion(t, s); got != 6 {
 			t.Fatalf("schema version after refused rollback: %d, want 6", got)
+		}
+		// Later migrations were rolled back before the refusal: restore them
+		// before reading through the Store, whose queries scan their columns.
+		if _, err := provider.Up(t.Context()); err != nil {
+			t.Fatalf("re-apply later migrations: %v", err)
 		}
 		after := sshCurrent(t, s, own, sbx.ID)
 		sshWant(t, after, sshEndpointIPv4, sshHostKeyA)

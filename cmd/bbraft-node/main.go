@@ -32,6 +32,8 @@ import (
 	nodenet "github.com/nathabonfim59/bamboo-raft/internal/node/net"
 	"github.com/nathabonfim59/bamboo-raft/internal/node/qemu"
 	"github.com/nathabonfim59/bamboo-raft/internal/nodelink"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore/s3"
 	"github.com/nathabonfim59/bamboo-raft/internal/version"
 )
 
@@ -200,6 +202,25 @@ func runWithDeps(ctx context.Context, args []string, stderr io.Writer, d deps) (
 		log.Warn("-node.cpu-allow-host is a dev/test opt-in: -cpu host is permitted; never enable it in production")
 	}
 
+	// Phase 2: build the shared object store before any manager state exists.
+	// The interface stays nil when S3 is unconfigured, which turns Phase 2
+	// off; a configured but unusable store stops the node here. The
+	// configuration object redacts its secret, and only non-secret fields are
+	// logged.
+	var objects objstore.Store
+	if o.s3Configured {
+		objects, err = s3.New(ctx, o.s3Config)
+		if err != nil {
+			return fmt.Errorf("object store: %w", err)
+		}
+		log.Info("object store configured",
+			"endpoint", o.s3Config.Endpoint,
+			"region", o.s3Config.Region,
+			"bucket", o.s3Config.Bucket,
+			"path_style", o.s3Config.PathStyle,
+		)
+	}
+
 	mode, err := qemu.ParseNestedMode(o.cpuNested)
 	if err != nil {
 		return err
@@ -253,6 +274,8 @@ func runWithDeps(ctx context.Context, args []string, stderr io.Writer, d deps) (
 
 	var jm *jailer.Manager
 	var qemuVersion string
+	// The probe QEMU's Phase 2 schema check; nil defers it to the first VM.
+	var phase2 *qemu.Phase2Support
 	if jail != nil {
 		// Production: read-only host proofs, then the one cgroup mutation,
 		// then the reclaimer, the jailer with that reclaimer as its policy,
@@ -267,6 +290,7 @@ func runWithDeps(ctx context.Context, args []string, stderr io.Writer, d deps) (
 		}
 		jm, qemuVersion = ev.jailer, ev.evidence.QEMUVersion
 		host = ev.evidence.Host
+		phase2 = ev.evidence.Phase2
 	} else {
 		if err := d.checkHost(ctx, log); err != nil {
 			return err
@@ -286,6 +310,7 @@ func runWithDeps(ctx context.Context, args []string, stderr io.Writer, d deps) (
 		if err != nil {
 			return fmt.Errorf("enforced CPU %s cannot be realized: %w", cpu.String(), err)
 		}
+		phase2 = evidence.Phase2
 		log.Info("cpu realized",
 			"cpu_option", cpu.String(),
 			"status", evidence.Status,
@@ -319,19 +344,24 @@ func runWithDeps(ctx context.Context, args []string, stderr io.Writer, d deps) (
 		)
 	}
 	cfg := node.Config{
-		NodeID:         o.nodeID,
-		DataDir:        o.dataDir,
-		ImageDir:       o.imageDir,
-		DefaultImage:   o.defaultImage,
-		CPUModel:       o.cpuModel,
-		AllowHostCPU:   o.cpuAllowHost,
-		Capacity:       capacity,
-		HostVCPUs:      uint32(facts.vcpus),
-		DiskOvercommit: o.diskOvercommit,
-		BootTimeout:    o.bootTimeout,
-		Log:            log,
-		Nested:         mode,
-		CPUFeatures:    cpu.Features,
+		NodeID:          o.nodeID,
+		DataDir:         o.dataDir,
+		ImageDir:        o.imageDir,
+		DefaultImage:    o.defaultImage,
+		MinCID:          o.vsockMinCID,
+		MaxCID:          o.vsockMaxCID,
+		CPUModel:        o.cpuModel,
+		AllowHostCPU:    o.cpuAllowHost,
+		Capacity:        capacity,
+		HostVCPUs:       uint32(facts.vcpus),
+		DiskOvercommit:  o.diskOvercommit,
+		BootTimeout:     o.bootTimeout,
+		Log:             log,
+		Nested:          mode,
+		CPUFeatures:     cpu.Features,
+		Store:           objects,
+		ChunkCacheBytes: int64(o.chunkCacheBytes),
+		Phase2:          phase2,
 	}
 	if jm != nil {
 		admitted := host

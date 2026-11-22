@@ -44,7 +44,67 @@ type ipAddr struct {
 	IfName   string `json:"ifname"`
 	AddrInfo []struct {
 		Local string `json:"local"`
+		// PrefixLen is absent in hand-made fixtures; an address without one is a
+		// host address (/32), never the whole address space.
+		PrefixLen *int `json:"prefixlen,omitzero"`
 	} `json:"addr_info,omitzero"`
+}
+
+// hostAddr is one IPv4 address of a host interface other than the node's own
+// bridge, with the network it is connected to.
+type hostAddr struct {
+	// Iface is the interface name.
+	Iface string
+	// Addr is the address as configured, host bits included (10.42.0.2/16).
+	Addr netip.Prefix
+}
+
+// hostAddrs lists the IPv4 addresses the host holds on every interface except
+// the node's own bridge, which legitimately carries the gateway. Loopback and
+// unparsable entries are skipped: neither can overlap a private guest prefix.
+func (m *Manager) hostAddrs(ctx context.Context) ([]hostAddr, error) {
+	out, err := m.output(ctx, "ip", "-j", "-4", "addr", "show")
+	if err != nil {
+		return nil, fmt.Errorf("nodenet: list host addresses: %w", err)
+	}
+	var links []ipAddr
+	if err := json.Unmarshal(out, &links); err != nil {
+		return nil, fmt.Errorf("nodenet: decode host addresses: %w", err)
+	}
+	var addrs []hostAddr
+	for _, link := range links {
+		if link.IfName == m.cfg.Bridge {
+			continue
+		}
+		for _, info := range link.AddrInfo {
+			local, err := netip.ParseAddr(info.Local)
+			if err != nil || !local.Is4() || local.IsLoopback() {
+				continue
+			}
+			bits := 32
+			if info.PrefixLen != nil && *info.PrefixLen >= 0 && *info.PrefixLen <= 32 {
+				bits = *info.PrefixLen
+			}
+			addrs = append(addrs, hostAddr{Iface: link.IfName, Addr: netip.PrefixFrom(local, bits)})
+		}
+	}
+	return addrs, nil
+}
+
+// guestPrefixConflict returns an error naming the first host address that is
+// inside the guest prefix, or whose connected network overlaps it. A guest in
+// such a prefix could be handed an address the host already owns, and an SSH
+// ingress DNAT to it would reach a host service.
+func guestPrefixConflict(guest netip.Prefix, addrs []hostAddr) error {
+	for _, a := range addrs {
+		if guest.Contains(a.Addr.Addr()) || guest.Overlaps(a.Addr) {
+			return fmt.Errorf("nodenet: host interface %s holds %s, which overlaps the guest prefix %s: "+
+				"guests could be given host addresses; choose a different -node.network-prefix "+
+				"(and -node.network-gateway) that no host interface uses",
+				a.Iface, a.Addr, guest)
+		}
+	}
+	return nil
 }
 
 // run executes a host command, preferring the context's error over a start
@@ -284,7 +344,8 @@ func (m *Manager) applyRules(ctx context.Context) error {
 // CheckHost verifies the facilities Setup depends on, without changing
 // anything: the ip and nft binaries (probed with ip -Version and nft --version,
 // the spellings those tools actually support), IPv4 forwarding, the ingress
-// address being local, the bridge name not being taken by another kind of link,
+// address being local, no other host interface holding an address inside (or a
+// connected network overlapping) the guest prefix, the bridge name not being taken by another kind of link,
 // and the TAP and vhost-net devices. Production always uses vhost-net, so a
 // missing /dev/vhost-net is an error, not a silent userspace fallback. Node
 // startup calls it and fails closed.
@@ -309,6 +370,15 @@ func (m *Manager) CheckHost(ctx context.Context) error {
 				probe.binary, probe.binary, strings.Join(probe.args, " "), err)
 		}
 	}
+	// The host's own addresses must not overlap the guest prefix. Checked before
+	// anything else about the network so a clash is reported as such.
+	addrs, err := m.hostAddrs(ctx)
+	if err != nil {
+		return err
+	}
+	if err := guestPrefixConflict(m.cfg.Prefix, addrs); err != nil {
+		return err
+	}
 	forward, err := m.readSysctl(ctx, "net/ipv4/ip_forward")
 	if err != nil {
 		return fmt.Errorf("nodenet: read net.ipv4.ip_forward: %w", err)
@@ -316,7 +386,7 @@ func (m *Manager) CheckHost(ctx context.Context) error {
 	if strings.TrimSpace(string(forward)) != "1" {
 		return errors.New("nodenet: net.ipv4.ip_forward must be 1: the node routes its guests")
 	}
-	if err := m.checkLocalAddr(ctx, m.cfg.IngressAddr); err != nil {
+	if err := checkLocalAddr(m.cfg.IngressAddr, addrs); err != nil {
 		return err
 	}
 	kind, err := m.linkKind(ctx, m.cfg.Bridge)
@@ -342,26 +412,13 @@ func (m *Manager) devices() []string { return []string{tunDevice, vhostNetDevice
 // checkLocalAddr verifies that the configured ingress address belongs to one of
 // the host's interfaces. DNAT to an address the node does not own would accept
 // nothing, which is a configuration error rather than a silent no-op.
-func (m *Manager) checkLocalAddr(ctx context.Context, addr netip.Addr) error {
+func checkLocalAddr(addr netip.Addr, addrs []hostAddr) error {
 	if !addr.IsValid() {
 		return nil
 	}
-	out, err := m.output(ctx, "ip", "-j", "-4", "addr", "show")
-	if err != nil {
-		return fmt.Errorf("nodenet: list host addresses: %w", err)
-	}
-	var addrs []ipAddr
-	if err := json.Unmarshal(out, &addrs); err != nil {
-		return fmt.Errorf("nodenet: decode host addresses: %w", err)
-	}
-	for _, link := range addrs {
-		if link.IfName == m.cfg.Bridge {
-			continue
-		}
-		for _, info := range link.AddrInfo {
-			if local, err := netip.ParseAddr(info.Local); err == nil && local == addr {
-				return nil
-			}
+	for _, a := range addrs {
+		if a.Addr.Addr() == addr {
+			return nil
 		}
 	}
 	return fmt.Errorf("nodenet: ingress address %s is not assigned to a host interface", addr)

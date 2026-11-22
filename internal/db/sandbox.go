@@ -81,6 +81,24 @@ type Sandbox struct {
 	SnapshotID     *uuid.UUID
 	SnapshotPin    bool
 	FromSnapshotID string
+	// FromManifestKey is the object-store generation manifest the first boot
+	// restores the disk from; empty for a fresh disk or a node-local restore.
+	FromManifestKey string
+	// ChainID names the sandbox's current snapshot chain. Resume and
+	// recovery continue it; a fork or create starts a new one.
+	ChainID uuid.UUID
+	// SnapshotsEnabled is false for sandboxes created with snapshots off: the
+	// worker never uploads their disk.
+	SnapshotsEnabled bool
+	// NextSnapshotAt is when the snapshot worker should take the next
+	// generation; nil means due now.
+	NextSnapshotAt *time.Time
+	// DiskNodeID is the node holding the disk locally; nil means the disk only
+	// exists in the object store.
+	DiskNodeID *string
+	// HydratedAt, DataExpiredAt and LastRecoverAt record disk hydration from
+	// the object store, expiry of the stored data and the last recovery.
+	HydratedAt, DataExpiredAt, LastRecoverAt *time.Time
 	// SSH is the endpoint+host-key pair a successful AddSSHKey produced for
 	// the current boot. It is nil until the API stores one and is cleared by
 	// every state change that leaves the ready-ish states.
@@ -111,7 +129,9 @@ const sandboxCols = `id, owner_id, state, machine_type, name, labels, node_id,
 	desired_vcpus, desired_memory_mib, desired_disk_gib,
 	ttl_seconds, subdomain, stopped_at, stop_operation_id, lifecycle_generation,
 	version, expires_at, error_reason, snapshot_id, snapshot_pin, from_snapshot_id,
-	created_at, updated_at, deleted_at, ssh_endpoint, ssh_host_key`
+	created_at, updated_at, deleted_at, ssh_endpoint, ssh_host_key,
+	chain_id, snapshots_enabled, next_snapshot_at, disk_node_id,
+	hydrated_at, data_expired_at, last_recover_at, from_manifest_key`
 
 func scanSandbox(row scanner) (Sandbox, error) {
 	var (
@@ -135,7 +155,9 @@ func scanSandbox(row scanner) (Sandbox, error) {
 		&s.Version, &s.ExpiresAt, &s.ErrorReason,
 		&s.SnapshotID, &s.SnapshotPin, &s.FromSnapshotID,
 		&s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
-		&sshEndpoint, &sshHostKey)
+		&sshEndpoint, &sshHostKey,
+		&s.ChainID, &s.SnapshotsEnabled, &s.NextSnapshotAt, &s.DiskNodeID,
+		&s.HydratedAt, &s.DataExpiredAt, &s.LastRecoverAt, &s.FromManifestKey)
 	if err != nil {
 		return Sandbox{}, err
 	}
@@ -177,6 +199,9 @@ type CreateSandboxParams struct {
 	NodeID      string
 	Reserve     Resources
 	MaxAttempts int
+	// SnapshotsEnabled turns periodic object-store snapshots on or off for
+	// the sandbox; nil means on.
+	SnapshotsEnabled *bool
 
 	// IdempotencyKey and RequestSHA256 together opt into exactly-once
 	// create. RequestSHA256 is the hash of the raw request body.
@@ -189,6 +214,25 @@ type CreateSandboxParams struct {
 	// increments its pin counter before the reservation. NodeID must be the
 	// artifact's recorded node.
 	Restore *SnapshotSource
+
+	// FromManifest, when set, creates the sandbox from one completed
+	// object-store generation: the row keeps the manifest key, the provision
+	// job boots CreateVM from_manifest and records SourceGenerationID (which
+	// must name the generation whose manifest_key is FromManifest) so the
+	// chunk collector keeps its chunks while the job is active. The
+	// transaction locks the generation row FOR SHARE and refuses with
+	// [ErrSnapshotNotFound] unless it is completed, unpurged and has that
+	// manifest key, and with [ErrSnapshotDiskTooSmall] when Reserve.DiskGiB
+	// is smaller than its disk. It does NOT check the generation's owner:
+	// the caller authorizes the source (a share deploys another account's
+	// generation). Exclusive with Restore.
+	FromManifest       string
+	SourceGenerationID *uuid.UUID
+
+	// ShareID, when set, is the snapshot_shares row that authorized a
+	// cross-account restore. The create records one use of it in the same
+	// transaction (a code revoked meanwhile answers [ErrSnapshotNotFound]).
+	ShareID string
 }
 
 // MaxTTLSeconds is the Phase 0.5 upper bound for create TTLSeconds (30
@@ -248,38 +292,20 @@ const idempotencyRetention = 24 * time.Hour
 // [ErrIdempotencyInProgress] if an unserialized writer wins the insert (map it
 // to API 409 idempotency_in_progress).
 func (s *Store) CreateSandbox(ctx context.Context, p CreateSandboxParams) (CreateSandboxResult, error) {
-	if err := validateTTL(p.ExpiresAt, p.TTLSeconds); err != nil {
-		return CreateSandboxResult{}, err
-	}
-	labels, err := marshalStringMap(p.Labels)
+	prep, err := s.prepareCreate(p)
 	if err != nil {
 		return CreateSandboxResult{}, err
 	}
-	envSealed, err := s.sealEnv(p.Env, p.Owner, p.ID)
-	if err != nil {
-		return CreateSandboxResult{}, err
-	}
-	if p.MachineType == "" {
-		p.MachineType = "default"
-	}
-
-	var (
-		out     CreateSandboxResult
-		payload string
-	)
-	if p.MaxAttempts <= 0 {
-		p.MaxAttempts = DefaultMaxAttempts
-	}
-
+	var out CreateSandboxResult
 	err = s.runTx(ctx, "create sandbox", func(ctx context.Context, tx pgx.Tx) error {
 		// Replay lives inside the capacity transaction, after a per
 		// owner+key advisory lock: a racing duplicate waits here and
 		// then replays, never competing for the slot the winner took.
-		if p.IdempotencyKey != "" {
-			if err := lockCreateKeyTx(ctx, tx, p.Owner, p.IdempotencyKey); err != nil {
+		if prep.p.IdempotencyKey != "" {
+			if err := lockCreateKeyTx(ctx, tx, prep.p.Owner, prep.p.IdempotencyKey); err != nil {
 				return err
 			}
-			res, found, err := s.replayCreateTx(ctx, tx, p)
+			res, found, err := s.replayCreateTx(ctx, tx, prep.p)
 			if err != nil {
 				return err
 			}
@@ -288,124 +314,13 @@ func (s *Store) CreateSandbox(ctx context.Context, p CreateSandboxParams) (Creat
 				return nil
 			}
 		}
-
-		// A restore pins its exact generation before anything else so
-		// the artifact cannot be retired and cleaned up while this
-		// transaction is still reserving capacity.
-		var (
-			snapshotRowID  *uuid.UUID
-			fromSnapshotID string
-		)
-		if p.Restore != nil {
-			snapshot, err := lockRestoreSourceTx(ctx, tx, p.Owner, p.NodeID, p.Reserve, *p.Restore)
-			if err != nil {
-				return err
-			}
-			rowID := snapshot.ID
-			snapshotRowID = &rowID
-			fromSnapshotID = snapshot.ArtifactID
-		}
-
-		payload, err = marshalJobPayload(ProvisionPayload{
-			NodeID:       p.NodeID,
-			Resources:    p.Reserve,
-			FromSnapshot: fromSnapshotID,
-		})
+		res, err := createSandboxTx(ctx, tx, prep)
 		if err != nil {
 			return err
 		}
-
-		// Capacity next: the node row lock serializes concurrent
-		// reservations for the same node.
-		tag, err := tx.Exec(ctx, `
-			UPDATE nodes SET
-				reserved_vcpus = reserved_vcpus + $2,
-				reserved_memory_mib = reserved_memory_mib + $3,
-				reserved_disk_gib = reserved_disk_gib + $4,
-				updated_at = now()
-			WHERE id = $1
-			  AND reserved_vcpus + $2 <= total_vcpus
-			  AND reserved_memory_mib + $3 <= total_memory_mib
-			  AND reserved_disk_gib + $4 <= total_disk_gib`,
-			p.NodeID, p.Reserve.VCPUs, p.Reserve.MemoryMiB, p.Reserve.DiskGiB)
-		if err != nil {
-			return fmtError("create sandbox reserve", err)
-		}
-		if tag.RowsAffected() == 0 {
-			return noCapacityOrMissing(ctx, tx, p.NodeID)
-		}
-
-		var expires any
-		if p.ExpiresAt != nil {
-			expires = *p.ExpiresAt
-		}
-		var ttl any
-		if p.TTLSeconds != nil {
-			ttl = *p.TTLSeconds
-		}
-		var snapshotArg any
-		if snapshotRowID != nil {
-			snapshotArg = *snapshotRowID
-		}
-		row := tx.QueryRow(ctx, `
-			INSERT INTO sandboxes (id, owner_id, state, machine_type, name, labels, env_sealed,
-				node_id, reserved_vcpus, reserved_memory_mib, reserved_disk_gib,
-				desired_vcpus, desired_memory_mib, desired_disk_gib,
-				expires_at, ttl_seconds,
-				snapshot_id, snapshot_pin, from_snapshot_id, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11,
-				$9, $10, $11,
-				CASE WHEN $12::integer IS NULL THEN $13 ELSE now() + make_interval(secs => $12::integer) END,
-				$12,
-				$14, $15, $16, now())
-			RETURNING `+sandboxCols,
-			p.ID, p.Owner, StateProvisioning, p.MachineType, p.Name, labels, envSealed,
-			p.NodeID, p.Reserve.VCPUs, p.Reserve.MemoryMiB, p.Reserve.DiskGiB, ttl, expires,
-			snapshotArg, p.Restore != nil, fromSnapshotID)
-		out.Sandbox, err = scanSandbox(row)
-		if err != nil {
-			return fmtError("create sandbox insert", err)
-		}
-
-		if err := insertEventTx(ctx, tx, out.Sandbox, EventInput{Type: EventStatePrefix + string(StateProvisioning)}); err != nil {
-			return err
-		}
-		job, err := enqueueJobTx(ctx, tx, JobInput{
-			Kind:        JobProvision,
-			OwnerID:     p.Owner,
-			SandboxID:   &p.ID,
-			Payload:     payload,
-			MaxAttempts: p.MaxAttempts,
-		})
-		if err != nil {
-			return err
-		}
-		out.Job = job
-
-		if p.IdempotencyKey != "" {
-			// An expired key no longer replays: remove it so the
-			// primary key never blocks reuse of the key forever.
-			// The delete races nobody: only this transaction can
-			// insert the owner+key pair while holding it.
-			if _, err := tx.Exec(ctx, `
-				DELETE FROM idempotency_keys
-				WHERE owner_id = $1 AND key = $2 AND expires_at <= now()`,
-				p.Owner, p.IdempotencyKey); err != nil {
-				return fmtError("create sandbox idempotency purge", err)
-			}
-			_, err = tx.Exec(ctx, `
-				INSERT INTO idempotency_keys (owner_id, key, request_sha256, sandbox_id, expires_at)
-				VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5::float8))`,
-				p.Owner, p.IdempotencyKey, p.RequestSHA256, p.ID,
-				idempotencyRetention.Seconds())
-			if isUniqueViolation(err, "idempotency_keys_pkey") {
-				// A concurrent create with the same key committed
-				// first; the client retries and replays.
-				return ErrIdempotencyInProgress
-			}
-			if err != nil {
-				return fmtError("create sandbox idempotency insert", err)
-			}
+		out = res
+		if prep.p.IdempotencyKey != "" {
+			return insertCreateKeyTx(ctx, tx, prep.p, nil)
 		}
 		return nil
 	})
@@ -413,6 +328,200 @@ func (s *Store) CreateSandbox(ctx context.Context, p CreateSandboxParams) (Creat
 		return CreateSandboxResult{}, err
 	}
 	return out, nil
+}
+
+// preparedCreate is one validated create with its sealed env and encoded
+// labels, ready for [createSandboxTx].
+type preparedCreate struct {
+	p         CreateSandboxParams
+	labels    string
+	envSealed []byte
+}
+
+// prepareCreate validates and encodes one create outside any transaction and
+// fills its defaults.
+func (s *Store) prepareCreate(p CreateSandboxParams) (preparedCreate, error) {
+	if err := validateTTL(p.ExpiresAt, p.TTLSeconds); err != nil {
+		return preparedCreate{}, err
+	}
+	if p.Restore != nil && p.FromManifest != "" {
+		return preparedCreate{}, errors.New("db: create sandbox takes a saved snapshot or a manifest, not both")
+	}
+	if (p.FromManifest == "") != (p.SourceGenerationID == nil) {
+		return preparedCreate{}, errors.New("db: create from a manifest needs both the manifest key and its generation id")
+	}
+	labels, err := marshalStringMap(p.Labels)
+	if err != nil {
+		return preparedCreate{}, err
+	}
+	envSealed, err := s.sealEnv(p.Env, p.Owner, p.ID)
+	if err != nil {
+		return preparedCreate{}, err
+	}
+	if p.MachineType == "" {
+		p.MachineType = "default"
+	}
+	if p.MaxAttempts <= 0 {
+		p.MaxAttempts = DefaultMaxAttempts
+	}
+	return preparedCreate{p: p, labels: labels, envSealed: envSealed}, nil
+}
+
+// createSandboxTx reserves capacity on the chosen node and writes the
+// sandbox, its first event and the provision job inside the caller's
+// transaction. The idempotency key is the caller's.
+func createSandboxTx(ctx context.Context, tx pgx.Tx, prep preparedCreate) (CreateSandboxResult, error) {
+	p := prep.p
+	var out CreateSandboxResult
+
+	// A restore pins its exact generation before anything else so the
+	// artifact cannot be retired and cleaned up while this transaction is
+	// still reserving capacity.
+	var (
+		snapshotRowID  *uuid.UUID
+		fromSnapshotID string
+	)
+	if p.Restore != nil {
+		snapshot, err := lockRestoreSourceTx(ctx, tx, p.Owner, p.NodeID, p.Reserve, *p.Restore)
+		if err != nil {
+			return CreateSandboxResult{}, err
+		}
+		rowID := snapshot.ID
+		snapshotRowID = &rowID
+		fromSnapshotID = snapshot.ArtifactID
+	}
+	var image string
+	if p.FromManifest != "" {
+		var (
+			genOwner uuid.UUID
+			err      error
+		)
+		if image, genOwner, err = lockGenerationSourceTx(ctx, tx, *p.SourceGenerationID, p.FromManifest, p.Reserve); err != nil {
+			return CreateSandboxResult{}, err
+		}
+		// A generation may belong to another account only through an
+		// active share code, checked and use-counted here in the same
+		// transaction. Without one it is indistinguishable from a missing
+		// generation.
+		if p.ShareID != "" {
+			if err := consumeSnapshotGenerationShareTx(ctx, tx, p.ShareID, genOwner, *p.SourceGenerationID); err != nil {
+				return CreateSandboxResult{}, err
+			}
+		} else if genOwner != p.Owner {
+			return CreateSandboxResult{}, ErrSnapshotNotFound
+		}
+	}
+
+	payload, err := marshalJobPayload(ProvisionPayload{
+		NodeID:       p.NodeID,
+		Resources:    p.Reserve,
+		FromSnapshot: fromSnapshotID,
+		FromManifest: p.FromManifest,
+		Image:        image,
+	})
+	if err != nil {
+		return CreateSandboxResult{}, err
+	}
+
+	// Capacity next: the node row lock serializes concurrent reservations
+	// for the same node.
+	tag, err := tx.Exec(ctx, `
+		UPDATE nodes SET
+			reserved_vcpus = reserved_vcpus + $2,
+			reserved_memory_mib = reserved_memory_mib + $3,
+			reserved_disk_gib = reserved_disk_gib + $4,
+			updated_at = now()
+		WHERE id = $1
+		  AND reserved_vcpus + $2 <= total_vcpus
+		  AND reserved_memory_mib + $3 <= total_memory_mib
+		  AND reserved_disk_gib + $4 <= total_disk_gib`,
+		p.NodeID, p.Reserve.VCPUs, p.Reserve.MemoryMiB, p.Reserve.DiskGiB)
+	if err != nil {
+		return CreateSandboxResult{}, fmtError("create sandbox reserve", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return CreateSandboxResult{}, noCapacityOrMissing(ctx, tx, p.NodeID)
+	}
+
+	var expires any
+	if p.ExpiresAt != nil {
+		expires = *p.ExpiresAt
+	}
+	var ttl any
+	if p.TTLSeconds != nil {
+		ttl = *p.TTLSeconds
+	}
+	var snapshotArg any
+	if snapshotRowID != nil {
+		snapshotArg = *snapshotRowID
+	}
+	row := tx.QueryRow(ctx, `
+		INSERT INTO sandboxes (id, owner_id, state, machine_type, name, labels, env_sealed,
+			node_id, reserved_vcpus, reserved_memory_mib, reserved_disk_gib,
+			desired_vcpus, desired_memory_mib, desired_disk_gib,
+			expires_at, ttl_seconds,
+			snapshot_id, snapshot_pin, from_snapshot_id,
+			chain_id, snapshots_enabled, disk_node_id, from_manifest_key, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11,
+			$9, $10, $11,
+			CASE WHEN $12::integer IS NULL THEN $13 ELSE now() + make_interval(secs => $12::integer) END,
+			$12,
+			$14, $15, $16,
+			$17, COALESCE($18::boolean, true), $8, $19, now())
+		RETURNING `+sandboxCols,
+		p.ID, p.Owner, StateProvisioning, p.MachineType, p.Name, prep.labels, prep.envSealed,
+		p.NodeID, p.Reserve.VCPUs, p.Reserve.MemoryMiB, p.Reserve.DiskGiB, ttl, expires,
+		snapshotArg, p.Restore != nil, fromSnapshotID, uuid.NewV7(), p.SnapshotsEnabled, p.FromManifest)
+	out.Sandbox, err = scanSandbox(row)
+	if err != nil {
+		return CreateSandboxResult{}, fmtError("create sandbox insert", err)
+	}
+
+	if err := insertEventTx(ctx, tx, out.Sandbox, EventInput{Type: EventStatePrefix + string(StateProvisioning)}); err != nil {
+		return CreateSandboxResult{}, err
+	}
+	job, err := enqueueJobTx(ctx, tx, JobInput{
+		Kind:               JobProvision,
+		OwnerID:            p.Owner,
+		SandboxID:          &p.ID,
+		Payload:            payload,
+		MaxAttempts:        p.MaxAttempts,
+		SourceGenerationID: p.SourceGenerationID,
+	})
+	if err != nil {
+		return CreateSandboxResult{}, err
+	}
+	out.Job = job
+	return out, nil
+}
+
+// insertCreateKeyTx stores the idempotency key of a create (batch, when not
+// nil, lists every sandbox of a batch create in creation order). The caller
+// holds the owner+key advisory lock.
+func insertCreateKeyTx(ctx context.Context, tx pgx.Tx, p CreateSandboxParams, batch []string) error {
+	// An expired key no longer replays: remove it so the primary key never
+	// blocks reuse of the key forever. The delete races nobody: only this
+	// transaction can insert the owner+key pair while holding the lock.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM idempotency_keys
+		WHERE owner_id = $1 AND key = $2 AND expires_at <= now()`,
+		p.Owner, p.IdempotencyKey); err != nil {
+		return fmtError("create sandbox idempotency purge", err)
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO idempotency_keys (owner_id, key, request_sha256, sandbox_id, expires_at, batch_sandbox_ids)
+		VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5::float8), $6)`,
+		p.Owner, p.IdempotencyKey, p.RequestSHA256, p.ID,
+		idempotencyRetention.Seconds(), batch)
+	if isUniqueViolation(err, "idempotency_keys_pkey") {
+		// A concurrent create with the same key committed first; the
+		// client retries and replays.
+		return ErrIdempotencyInProgress
+	}
+	if err != nil {
+		return fmtError("create sandbox idempotency insert", err)
+	}
+	return nil
 }
 
 // lockCreateKeyTx serializes creates for one owner and idempotency key for
@@ -525,6 +634,10 @@ type TransitionParams struct {
 	ErrorReason     string
 	Event           EventInput
 	Job             *JobInput
+	// Hydrated sets hydrated_at to now and records a [EventSandboxHydrated]
+	// event in the same move: the disk of a restore from the object store is
+	// fully local (Restores are eager, so this goes with READY).
+	Hydrated bool
 }
 
 // ErrNoOwner rejects writes that would operate without an explicit owner.
@@ -554,10 +667,11 @@ func (s *Store) TransitionSandbox(ctx context.Context, p TransitionParams) (Sand
 				state = $3, version = version + 1, error_reason = $4,
 				ssh_endpoint = CASE WHEN $3 IN ('ready', 'idle', 'running') THEN ssh_endpoint ELSE NULL END,
 				ssh_host_key = CASE WHEN $3 IN ('ready', 'idle', 'running') THEN ssh_host_key ELSE NULL END,
+				hydrated_at = CASE WHEN $7 THEN now() ELSE hydrated_at END,
 				updated_at = now()
 			WHERE id = $1 AND owner_id = $6 AND version = $2 AND state = ANY($5) AND deleted_at IS NULL
 			RETURNING `+sandboxCols,
-			p.SandboxID, p.ExpectedVersion, p.To, p.ErrorReason, statesToStrings(p.FromStates), p.Owner)
+			p.SandboxID, p.ExpectedVersion, p.To, p.ErrorReason, statesToStrings(p.FromStates), p.Owner, p.Hydrated)
 		var err error
 		out, err = scanSandbox(row)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -570,6 +684,11 @@ func (s *Store) TransitionSandbox(ctx context.Context, p TransitionParams) (Sand
 		}
 		if err := insertEventTx(ctx, tx, out, p.Event); err != nil {
 			return err
+		}
+		if p.Hydrated {
+			if err := insertEventTx(ctx, tx, out, EventInput{Type: EventSandboxHydrated}); err != nil {
+				return err
+			}
 		}
 		if p.Job != nil {
 			if _, err := enqueueJobTx(ctx, tx, *p.Job); err != nil {

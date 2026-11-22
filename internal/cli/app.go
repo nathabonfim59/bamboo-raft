@@ -180,12 +180,15 @@ func NewApp(opts Options) *App {
 		newPushCommand(a),
 		newStopCommand(a),
 		newResumeCommand(a),
+		newForkCommand(a),
+		newRecoverCommand(a),
 		newExtendCommand(a),
 		newRenameCommand(a),
 		newSSHCommand(a),
 		newSCPCommand(a),
 		newDeleteCommand(a),
 		newSnapshotCommand(a),
+		newSnapshotsCommand(a),
 	)
 	for _, factory := range opts.Commands {
 		if factory != nil {

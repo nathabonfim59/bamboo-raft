@@ -126,7 +126,10 @@ func (s *Store) NodeIDs(ctx context.Context) ([]string, error) {
 // running under worker and token with a live lease, and while the sandbox
 // still matches the expected version and from-states. The job row is locked
 // FOR SHARE for the transaction, so a concurrent claim cannot retire the
-// lease mid-move. A sandbox guard mismatch answers ErrConflict/ErrNotFound; a
+// lease mid-move. A Hydrated move also records the job's source generation as
+// the sandbox's restore source in the same transaction as hydrated_at, so the
+// chunk collector keeps that generation until the sandbox has data of its
+// own. A sandbox guard mismatch answers ErrConflict/ErrNotFound; a
 // lost claim answers [ErrJobNotLeased]. A stale boot completion therefore
 // cannot move a deleted or re-owned sandbox.
 func (s *Store) TransitionSandboxJob(ctx context.Context, jobID uuid.UUID, worker string, token uuid.UUID, p TransitionParams) (Sandbox, error) {
@@ -152,10 +155,14 @@ func (s *Store) TransitionSandboxJob(ctx context.Context, jobID uuid.UUID, worke
 				state = $3, version = version + 1, error_reason = $4,
 				ssh_endpoint = CASE WHEN $3 IN ('ready', 'idle', 'running') THEN ssh_endpoint ELSE NULL END,
 				ssh_host_key = CASE WHEN $3 IN ('ready', 'idle', 'running') THEN ssh_host_key ELSE NULL END,
+				hydrated_at = CASE WHEN $7 THEN now() ELSE hydrated_at END,
+				restore_source_generation_id = CASE WHEN $7
+					THEN (SELECT source_generation_id FROM jobs WHERE id = $8)
+					ELSE restore_source_generation_id END,
 				updated_at = now()
 			WHERE id = $1 AND owner_id = $6 AND version = $2 AND state = ANY($5) AND deleted_at IS NULL
 			RETURNING `+sandboxCols,
-			p.SandboxID, p.ExpectedVersion, p.To, p.ErrorReason, statesToStrings(p.FromStates), p.Owner)
+			p.SandboxID, p.ExpectedVersion, p.To, p.ErrorReason, statesToStrings(p.FromStates), p.Owner, p.Hydrated, jobID)
 		var err error
 		out, err = scanSandbox(row)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -166,6 +173,11 @@ func (s *Store) TransitionSandboxJob(ctx context.Context, jobID uuid.UUID, worke
 		}
 		if err := insertEventTx(ctx, tx, out, p.Event); err != nil {
 			return err
+		}
+		if p.Hydrated {
+			if err := insertEventTx(ctx, tx, out, EventInput{Type: EventSandboxHydrated}); err != nil {
+				return err
+			}
 		}
 		if p.Job != nil {
 			if _, err := enqueueJobTx(ctx, tx, *p.Job); err != nil {

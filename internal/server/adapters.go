@@ -129,6 +129,11 @@ type admissionPlacer interface {
 	Admit(ctx context.Context, req scheduler.AdmitRequest) (db.CreateSandboxResult, error)
 }
 
+// batchAdmissionPlacer is scheduler's create-from-count surface.
+type batchAdmissionPlacer interface {
+	AdmitBatchFrom(ctx context.Context, reqs []scheduler.AdmitRequest) ([]db.CreateSandboxResult, error)
+}
+
 // snapshotRestoreResolver adapts the API restore policy to the scheduler's
 // budget-owning resolver interface. The API package owns the wire errors; the
 // scheduler only sees the resolved immutable source and machine shape.
@@ -157,29 +162,65 @@ func (r snapshotRestoreResolver) ResolveRestore(ctx context.Context, owner uuid.
 // contract. It is the only bridge between the two, so the API never sees a
 // node, hub or gateway.
 type apiAdmission struct {
-	placer admissionPlacer
+	placer  admissionPlacer
+	batches batchAdmissionPlacer
 }
 
 // Admit maps an API create to a scheduler admit and back. Replay, create-from
 // resolution and placement all run inside the scheduler's single failFast
 // budget; this adapter never reads a snapshot itself.
 func (a apiAdmission) Admit(ctx context.Context, request api.AdmissionRequest) (api.AdmissionResult, error) {
-	result, err := a.placer.Admit(ctx, scheduler.AdmitRequest{
-		ID:             request.SandboxID,
-		Owner:          request.Owner,
-		MachineType:    request.MachineType,
-		Name:           request.Name,
-		Labels:         request.Labels,
-		Env:            request.Env,
-		TTLSeconds:     request.TTLSeconds,
-		Reserve:        request.Resources,
-		FailFast:       request.FailFast,
-		IdempotencyKey: request.IdempotencyKey,
-		RequestSHA256:  request.RequestSHA256[:],
-		From:           request.From,
-		TypeExplicit:   request.TypeExplicit,
-	})
+	result, err := a.placer.Admit(ctx, schedulerRequest(request))
 	return admissionResult(result, err)
+}
+
+// AdmitBatch maps a create with count above one to the scheduler's
+// replay-first batch-from admission. Every request is one sandbox of the same
+// owner and saved snapshot; only the first carries the idempotency key.
+func (a apiAdmission) AdmitBatch(ctx context.Context, requests []api.AdmissionRequest) ([]api.AdmissionResult, error) {
+	if a.batches == nil {
+		return nil, errors.New("server: batch admission is not configured")
+	}
+	reqs := make([]scheduler.AdmitRequest, len(requests))
+	for i, request := range requests {
+		reqs[i] = schedulerRequest(request)
+	}
+	results, err := a.batches.AdmitBatchFrom(ctx, reqs)
+	if err != nil {
+		switch {
+		case errors.Is(err, scheduler.ErrNoCapacity):
+			return nil, errors.Join(db.ErrNoCapacity, err)
+		case errors.Is(err, scheduler.ErrNoNode):
+			return nil, errors.Join(api.ErrNoReadyMachine, err)
+		default:
+			return nil, err
+		}
+	}
+	out := make([]api.AdmissionResult, len(results))
+	for i, result := range results {
+		out[i] = api.AdmissionResult{Sandbox: result.Sandbox, Replayed: result.Replayed}
+	}
+	return out, nil
+}
+
+// schedulerRequest is the one mapping of an API create to a scheduler admit.
+func schedulerRequest(request api.AdmissionRequest) scheduler.AdmitRequest {
+	return scheduler.AdmitRequest{
+		ID:               request.SandboxID,
+		Owner:            request.Owner,
+		MachineType:      request.MachineType,
+		Name:             request.Name,
+		Labels:           request.Labels,
+		Env:              request.Env,
+		TTLSeconds:       request.TTLSeconds,
+		Reserve:          request.Resources,
+		FailFast:         request.FailFast,
+		IdempotencyKey:   request.IdempotencyKey,
+		RequestSHA256:    request.RequestSHA256[:],
+		From:             request.From,
+		TypeExplicit:     request.TypeExplicit,
+		SnapshotsEnabled: request.SnapshotsEnabled,
+	}
 }
 
 // admissionResult maps the scheduler's capacity and connectivity refusals

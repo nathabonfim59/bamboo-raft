@@ -393,3 +393,13 @@ func (g *Gateway) AttachProcess(req *nodev1.AttachProcessRequest, stream grpc.Se
 func (g *Gateway) ReadFile(req *nodev1.ReadFileRequest, stream grpc.ServerStreamingServer[nodev1.ReadFileResponse]) error {
 	return relay(req, stream, nodev1.NodeClient.ReadFile)
 }
+
+// SnapshotVM forwards to the node.
+func (g *Gateway) SnapshotVM(ctx context.Context, req *nodev1.SnapshotVMRequest) (*nodev1.Generation, error) {
+	return g.forward(ctx, req, nodev1.NodeClient.SnapshotVM)
+}
+
+// ResetVM forwards to the node.
+func (g *Gateway) ResetVM(ctx context.Context, req *nodev1.ResetVMRequest) (*nodev1.VM, error) {
+	return g.forward(ctx, req, nodev1.NodeClient.ResetVM)
+}

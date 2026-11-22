@@ -38,7 +38,13 @@
 # Exports at source time (planned topology, fixed names with collision refusal):
 # E2E_NODE_SSH_INGRESS_ADDR=192.0.2.1, E2E_NODE_SSH_INGRESS_IFACE=bbe2e-in0,
 # E2E_NODE_HOST_VETH_ADDR=192.0.2.1, E2E_NODE_CLIENT_ADDR=192.0.2.2 and
-# E2E_NODE_CLIENT_NETNS=bbe2e-client. The real node stays in the host netns and
+# E2E_NODE_CLIENT_NETNS=bbe2e-client, and the guest network the node is
+# rendered with: E2E_NODE_GUEST_PREFIX=10.88.0.0/16 and
+# E2E_NODE_GUEST_GATEWAY=10.88.0.1 (one source of truth; callers derive what
+# they expect of guest addresses from them). The prefix must not hold any
+# address of the host: e2e_node_guest_prefix_preflight refuses that, naming the
+# address (the host of a disposable VM may itself be a sandbox on a private
+# prefix). The real node stays in the host netns and
 # dials the server at SERVER_ADDR (normally 127.0.0.1:7701). The client reaches
 # SSH DNAT through the host veth, never loopback/OUTPUT. After sourcing, set
 # BBRAFT_API_URL and server.public-url to
@@ -53,6 +59,9 @@
 # network and root-state mutation in one throwaway VM. Never run on a host.
 # The caller owns disposable-VM setup/restore of net.ipv4.ip_forward=1; this
 # helper always fails closed if forwarding is off and never changes sysctls.
+# Optional input: E2E_NODE_EXTRA_VARS_FILE=<absolute JSON file> adds role
+# variables (for example the object-store file settings and node capacity)
+# to the render; unset, the render is exactly the fixed one.
 # Commands are timeout-bounded. Defaults: E2E_NODE_READY_TIMEOUT=300,
 # E2E_NODE_REGISTERED_TIMEOUT=120, E2E_NODE_STOP_TIMEOUT=120 (seconds).
 # Ansible: set E2E_NODE_ANSIBLE_PLAYBOOK to an existing ansible-playbook
@@ -74,8 +83,8 @@ _E2E_NODE_ANSIBLE_VERSION=2.22.0
 _E2E_NODE_UID_RANGE=900000-900999
 _E2E_NODE_HOST_ADDR=192.0.2.1
 _E2E_NODE_CLIENT_ADDR=192.0.2.2
-_E2E_NODE_GUEST_PREFIX=10.42.0.0/16
-_E2E_NODE_GUEST_GATEWAY=10.42.0.1
+_E2E_NODE_GUEST_PREFIX=10.88.0.0/16
+_E2E_NODE_GUEST_GATEWAY=10.88.0.1
 _E2E_NODE_CAP_MASK=00000000082c11eb
 _E2E_NODE_ENV_LIST=HOME,PATH,USER,LOGNAME,XDG_CONFIG_HOME,XDG_CACHE_HOME,SSH_AUTH_SOCK,TERM,LANG,BBRAFT_API_URL,BBRAFT_API_KEY,BBRAFT_ORG
 export E2E_NODE_HOST_VETH_ADDR=$_E2E_NODE_HOST_ADDR
@@ -83,6 +92,8 @@ export E2E_NODE_CLIENT_ADDR=$_E2E_NODE_CLIENT_ADDR
 export E2E_NODE_SSH_INGRESS_ADDR=$_E2E_NODE_HOST_ADDR
 export E2E_NODE_SSH_INGRESS_IFACE=bbe2e-in0
 export E2E_NODE_CLIENT_NETNS=bbe2e-client
+export E2E_NODE_GUEST_PREFIX=$_E2E_NODE_GUEST_PREFIX
+export E2E_NODE_GUEST_GATEWAY=$_E2E_NODE_GUEST_GATEWAY
 
 _e2e_node_error() {
 	printf 'E2E NODE FAIL: %s\n' "$*" >&2
@@ -202,8 +213,36 @@ _e2e_node_show() {
 	_e2e_node_root 30 systemctl show "$service.service" "$@"
 }
 
+# e2e_node_guest_prefix_check [PREFIX]: reads IPv4 addresses (address or
+# address/len, first field of a line) on stdin and fails, naming the address,
+# when one lies inside PREFIX (default: the guest prefix). A guest could then be
+# handed the host's own address and traffic meant for it would reach the host.
+e2e_node_guest_prefix_check() {
+	python3 -I -c '
+import ipaddress, sys
+net = ipaddress.ip_network(sys.argv[1])
+for line in sys.stdin:
+    fields = line.split()
+    if not fields:
+        continue
+    addr = ipaddress.ip_interface(fields[0]).ip
+    if addr in net:
+        print("host address %s lies inside the guest prefix %s" % (addr, net), file=sys.stderr)
+        sys.exit(1)
+' "${1:-$_E2E_NODE_GUEST_PREFIX}" || return 1
+}
+
+# e2e_node_guest_prefix_preflight: the check against this host's interfaces.
+e2e_node_guest_prefix_preflight() {
+	local addrs
+	addrs=$(ip -4 -o addr show | awk '{ print $4 }') || { _e2e_node_error 'cannot list host addresses'; return 1; }
+	printf '%s\n' "$addrs" | e2e_node_guest_prefix_check "$_E2E_NODE_GUEST_PREFIX" \
+		|| { _e2e_node_error "guest prefix $_E2E_NODE_GUEST_PREFIX overlaps the host (an interface address of this host lies inside it); the guest prefix cannot be used on this host"; return 1; }
+}
+
 _e2e_node_preflight() {
 	local show
+	e2e_node_guest_prefix_preflight || return 1
 	show=$(_e2e_node_show "$_e2e_node_service" -p LoadState) || { _e2e_node_error 'cannot query systemd'; return 1; }
 	[ "$show" = 'LoadState=not-found' ] || { _e2e_node_error "unit already exists: $show"; return 1; }
 	_e2e_node_root 30 python3 -I - "$_e2e_node_service" "$_e2e_node_unit_path" "$_e2e_node_data_dir" "$_e2e_node_config_dir" "$_e2e_node_stage_dir" "$_e2e_node_client_netns" <<'PY' || { _e2e_node_error 'root path/device/cgroup preflight refused'; return 1; }
@@ -299,8 +338,8 @@ _e2e_node_render() {
     bbraft_node_default_image: "{{ e2e.image_id }}"
     bbraft_node_network_bridge: "{{ e2e.bridge }}"
     hardening_vm_bridge_interfaces: ["{{ e2e.bridge }}"]
-    bbraft_node_network_prefix: "10.42.0.0/16"
-    bbraft_node_network_gateway: "10.42.0.1"
+    bbraft_node_network_prefix: "{{ e2e.guest_prefix }}"
+    bbraft_node_network_gateway: "{{ e2e.guest_gateway }}"
     bbraft_node_ssh_ingress_addr: "192.0.2.1"
     bbraft_node_ssh_ingress_iface: "{{ e2e.host_if }}"
     bbraft_node_ssh_port_range: "30000-30010"
@@ -326,10 +365,11 @@ YAML
 		"$_e2e_node_service" "$E2E_NODE_ID" "$_e2e_node_server_addr" "$_e2e_node_data_dir" \
 		"$_e2e_node_image_root" "$_e2e_node_config_dir" "$_e2e_node_binary_path" \
 		"$_e2e_node_unit_path" "$_e2e_node_rendered_unit" "$E2E_NODE_IMAGE_ID" \
-		"$_e2e_node_bridge" "$_e2e_node_host_if" <<'PY' || return 1
+		"$_e2e_node_bridge" "$_e2e_node_host_if" "$_E2E_NODE_GUEST_PREFIX" "$_E2E_NODE_GUEST_GATEWAY" <<'PY' || return 1
 import hashlib, json, sys
 (out, binary, image, token, io_device, template, service, node_id, server, data_dir,
- image_root, config_dir, binary_path, unit, rendered_unit, image_id, bridge, host_if) = sys.argv[1:]
+ image_root, config_dir, binary_path, unit, rendered_unit, image_id, bridge, host_if,
+ guest_prefix, guest_gateway) = sys.argv[1:]
 # Values arrive as argv from this shell's private attempt state; they were
 # never exported, so the child environment must not be consulted.
 for value in (service, node_id, server, data_dir, image_root, config_dir,
@@ -342,6 +382,7 @@ vars_doc = {"e2e": {
     "images": image_root, "config": config_dir, "binary_path": binary_path, "unit": unit,
     "binary_src": binary, "binary_sha256": sha, "token_src": token,
     "image_src": image, "image_id": image_id, "bridge": bridge, "host_if": host_if,
+    "guest_prefix": guest_prefix, "guest_gateway": guest_gateway,
     "io_device": io_device, "template": template, "rendered_unit": rendered_unit}}
 with open(out, "x") as f:
     json.dump(vars_doc, f, indent=2, sort_keys=True)
@@ -379,8 +420,16 @@ with os.fdopen(fd, "wb") as f:
 	fi
 	version=$("${ansible_cmd[@]}" --version 2>&1) || { _e2e_node_error 'cannot execute pinned ansible-playbook'; return 1; }
 	[[ $version == *"[core $_E2E_NODE_ANSIBLE_VERSION]"* ]] || { _e2e_node_error "ansible-core $_E2E_NODE_ANSIBLE_VERSION required"; return 1; }
+	# E2E_NODE_EXTRA_VARS_FILE (optional, absolute regular file of JSON role
+	# variables) is applied after the fixed variables above, for callers that
+	# need role settings this driver does not own (object store, capacity).
+	local -a extra_vars=()
+	if [ -n "${E2E_NODE_EXTRA_VARS_FILE:-}" ]; then
+		[[ $E2E_NODE_EXTRA_VARS_FILE == /* ]] && [ -f "$E2E_NODE_EXTRA_VARS_FILE" ] && [ ! -L "$E2E_NODE_EXTRA_VARS_FILE" ] || { _e2e_node_error 'E2E_NODE_EXTRA_VARS_FILE must be an absolute regular file'; return 1; }
+		extra_vars=(-e "@$E2E_NODE_EXTRA_VARS_FILE")
+	fi
 	ANSIBLE_CONFIG=$ansible/ansible.cfg ANSIBLE_ROLES_PATH=$ansible/roles \
-		"${ansible_cmd[@]}" -i "$ansible/roles/bbraft_node/tests/inventory.yml" "$play" -e "@$vars" >"$_e2e_node_evidence_dir/ansible-render.log" 2>&1 || { _e2e_node_error "role render failed; see $_e2e_node_evidence_dir/ansible-render.log"; return 1; }
+		"${ansible_cmd[@]}" -i "$ansible/roles/bbraft_node/tests/inventory.yml" "$play" -e "@$vars" ${extra_vars[@]+"${extra_vars[@]}"} >"$_e2e_node_evidence_dir/ansible-render.log" 2>&1 || { _e2e_node_error "role render failed; see $_e2e_node_evidence_dir/ansible-render.log"; return 1; }
 	[ -f "$_e2e_node_rendered_unit" ] || { _e2e_node_error 'role rendered no unit'; return 1; }
 	if grep -q '^NetworkNamespacePath=' "$_e2e_node_rendered_unit"; then _e2e_node_error 'test-only NetworkNamespacePath is forbidden'; return 1; fi
 }

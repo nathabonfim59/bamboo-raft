@@ -130,6 +130,97 @@ func TestResolveSnapshotRestoreRequiresIdentity(t *testing.T) {
 	}
 }
 
+// shareRestoreFake implements both name and code resolution.
+type shareRestoreFake struct {
+	name    db.SnapshotSource
+	share   db.SnapshotSource
+	err     error
+	gotCode string
+}
+
+func (f *shareRestoreFake) SnapshotRestoreSource(context.Context, uuid.UUID, string) (db.SnapshotSource, error) {
+	return f.name, f.err
+}
+
+func (f *shareRestoreFake) SnapshotShareSource(_ context.Context, code string) (db.SnapshotSource, error) {
+	f.gotCode = code
+	return f.share, f.err
+}
+
+func TestResolveSnapshotRestoreGenerationAndShare(t *testing.T) {
+	owner := uuid.NewV7()
+	sharer := uuid.NewV7()
+	generationID := uuid.NewV7()
+	generation := db.SnapshotSource{
+		RowID: uuid.NewV7(), OwnerID: owner, Name: "base", SourceSandboxID: "bx_1",
+		ArtifactID:   "snap-" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		NodeID:       "node-a",
+		MachineType:  "default",
+		DiskGiB:      51,
+		Generation:   3,
+		GenerationID: &generationID,
+		ManifestKey:  "bbraft/chains/x/generations/0000000003.json",
+		Image:        "guest.qcow2",
+		DiskBytes:    51 << 30,
+	}
+	t.Run("generation backed", func(t *testing.T) {
+		target, apiErr := ResolveSnapshotRestore(t.Context(), &shareRestoreFake{name: generation}, owner, "base", false, "")
+		if apiErr != nil {
+			t.Fatalf("unexpected error: %s", apiErr.Code)
+		}
+		if !target.Source.GenerationBacked() || target.Source.ManifestKey != generation.ManifestKey {
+			t.Fatalf("source = %+v, want generation-backed", target.Source)
+		}
+		if target.MachineType != "default" || target.Resources.DiskGiB != 51 {
+			t.Fatalf("target = %+v", target)
+		}
+	})
+	t.Run("generation without manifest", func(t *testing.T) {
+		broken := generation
+		broken.ManifestKey = ""
+		_, apiErr := ResolveSnapshotRestore(t.Context(), &shareRestoreFake{name: broken}, owner, "base", false, "")
+		if apiErr == nil || apiErr.Code != apierr.CodeSnapshotNotFound {
+			t.Fatalf("error = %v, want snapshot_not_found", apiErr)
+		}
+	})
+	shareID := "shr_" + "0123456789abcdef0123456789abcdef"
+	shared := generation
+	shared.OwnerID = sharer
+	shared.ShareID = shareID
+	code := ShareCodePrefix + "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv"
+	t.Run("share code", func(t *testing.T) {
+		fake := &shareRestoreFake{share: shared}
+		target, apiErr := ResolveSnapshotRestore(t.Context(), fake, owner, code, false, "")
+		if apiErr != nil {
+			t.Fatalf("unexpected error: %s", apiErr.Code)
+		}
+		if fake.gotCode != code {
+			t.Fatalf("resolved code %q, want %q", fake.gotCode, code)
+		}
+		if target.Source.OwnerID != sharer || target.Source.ShareID != shareID {
+			t.Fatalf("source = %+v, want the sharer's code", target.Source)
+		}
+	})
+	t.Run("share without share id", func(t *testing.T) {
+		_, apiErr := ResolveSnapshotRestore(t.Context(), &shareRestoreFake{share: generation}, owner, code, false, "")
+		if apiErr == nil || apiErr.Code != apierr.CodeSnapshotNotFound {
+			t.Fatalf("error = %v, want snapshot_not_found", apiErr)
+		}
+	})
+	t.Run("share on a name-only resolver", func(t *testing.T) {
+		_, apiErr := ResolveSnapshotRestore(t.Context(), snapshotRestoreFake{source: generation}, owner, code, false, "")
+		if apiErr == nil || apiErr.Code != apierr.CodeSnapshotNotFound {
+			t.Fatalf("error = %v, want snapshot_not_found", apiErr)
+		}
+	})
+	t.Run("wrong share code", func(t *testing.T) {
+		_, apiErr := ResolveSnapshotRestore(t.Context(), &shareRestoreFake{err: db.ErrSnapshotNotFound}, owner, code, false, "")
+		if apiErr == nil || apiErr.Code != apierr.CodeSnapshotNotFound {
+			t.Fatalf("error = %v, want snapshot_not_found", apiErr)
+		}
+	})
+}
+
 func apiErrStatus(e *apierr.Error) int {
 	if e == nil {
 		return 0

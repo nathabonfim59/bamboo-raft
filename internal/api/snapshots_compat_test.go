@@ -123,6 +123,12 @@ func TestSavedSnapshotCompatBytes(t *testing.T) {
 			body: `{"sandboxId":"bx_23456789","name":"web"}`, status: http.StatusConflict,
 		},
 		{
+			name: "409 snapshots disabled", store: &snapshotCompatStore{accept: func(context.Context, db.AcceptSnapshotSaveParams) (db.SavedSnapshot, error) {
+				return db.SavedSnapshot{}, db.ErrSnapshotsDisabled
+			}},
+			body: `{"sandboxId":"bx_23456789","name":"web"}`, status: http.StatusConflict,
+		},
+		{
 			name: "500", store: &snapshotCompatStore{accept: func(context.Context, db.AcceptSnapshotSaveParams) (db.SavedSnapshot, error) {
 				return db.SavedSnapshot{}, errors.New("driver")
 			}},

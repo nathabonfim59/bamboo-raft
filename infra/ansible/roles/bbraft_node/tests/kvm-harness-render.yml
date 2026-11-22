@@ -15,6 +15,11 @@
 # /etc/bbraft-kt-<a>, stage /var/lib/bbraft-kt-stage-<a> (staged binaries),
 # unit /run/systemd/system/bbraft-kt-<a>.service. The harness refuses any
 # existing object of these names before installing.
+#
+# The attempts in kt_s3_attempts (kvm-harness-vars.yml: link, direct) are
+# rendered with bbraft_node_s3, so their units carry the role's object store
+# wiring (EnvironmentFile=, LoadCredential=, the chunk cache flag); the
+# harness writes the two files those lines name once it has started Garage.
 - name: Render the A10 jailed KVM harness units
   hosts: localhost
   connection: local

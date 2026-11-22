@@ -68,6 +68,9 @@ func (w *Worker) stopSandbox(ctx context.Context, job db.Job, lease *Lease) erro
 	if sbx.State != db.StateArchiving {
 		return permanent("sandbox not archiving")
 	}
+	// The sandbox left the ready states: the snapshot worker's refusal
+	// memory for it goes.
+	w.precondWarned.forget(sandboxID)
 
 	// A stop that raced the initial provision must let that boot finish (or
 	// terminally fail) before StopVM: the disk it wants to retain is the one
@@ -117,15 +120,96 @@ func (w *Worker) stopSandbox(ctx context.Context, job db.Job, lease *Lease) erro
 	}
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
+			if !sbx.SnapshotsEnabled {
+				// An earlier attempt of this erasing stop already deleted
+				// the VM: the missing disk is the goal, not a failure.
+				return w.eraseStopped(ctx, job, lease, guard, opCtx, sbx, op)
+			}
 			return w.stopDiskMissing(ctx, job, lease, guard, opCtx, sbx, op)
 		}
 		return w.failStopAttempt(ctx, job, lease, owner, op, classify(err))
+	}
+	if !sbx.SnapshotsEnabled {
+		return w.eraseStopped(ctx, job, lease, guard, opCtx, sbx, op)
+	}
+	if w.objectStore != nil {
+		if proceed, err := w.finalGeneration(ctx, job, lease, guard, opCtx, sbx, op); !proceed {
+			return err
+		}
 	}
 
 	// The node confirmed the VM off. Finalize under the live claim; a PATCH
 	// that bumped the version during the RPC only costs one requeue.
 	return w.finalizeStop(ctx, job, lease, owner, sandboxID, db.FinalizeStopParams{
 		Owner: owner, SandboxID: sandboxID, StopID: op.ID, ExpectedVersion: sbx.Version,
+	})
+}
+
+// finalGeneration writes the stopped disk to the object store as the
+// sandbox's final generation before the stop finalizes. It runs AFTER StopVM
+// confirmed the VM off, so the manifest is exactly the kept disk (an offline
+// read, nothing written after the cut is lost) and a retry that finds the VM
+// already stopped just cuts again (unchanged chunks are not uploaded twice).
+// proceed reports whether the stop may finalize; otherwise err is the
+// handler's result:
+//
+//   - completed, or nothing to cut (sandbox gone or without a node): proceed;
+//   - FAILED_PRECONDITION (a node without an object store): proceed as in
+//     Phase 1, with one warning;
+//   - a failed SnapshotVM: the stop goes failing and retries, unless force
+//     was requested, which finalizes keeping the previous generation;
+//   - a GC sweep, a pending row of an abandoned attempt or a database
+//     failure: a plain retry, the stop is not marked failing;
+//   - a lost lease or shutdown: redelivery owns the stop.
+func (w *Worker) finalGeneration(ctx context.Context, job db.Job, lease *Lease, guard *db.SandboxGuard, opCtx context.Context, sbx db.Sandbox, op db.StopOperation) (bool, error) {
+	att := w.takeGeneration(ctx, lease, guard, opCtx, sbx)
+	switch att.outcome {
+	case generationCompleted, generationSkipped:
+		return true, nil
+	case generationRefused:
+		// One line per stop (it proceeds at once), outside the periodic
+		// worker's refusal memory so a stopped sandbox leaves no entry.
+		w.log.Warn("node cannot snapshot sandbox; stopping without a final generation",
+			"sandbox", sbx.ID, "node", derefNode(sbx.NodeID))
+		return true, nil
+	case generationAbandoned:
+		if lease.Lost() || ctx.Err() != nil {
+			return false, nil
+		}
+		return false, retry("sandbox guard lost", w.backoff(job.Attempts))
+	case generationSweeping:
+		return false, retry(att.reason, gcSweepRetry)
+	case generationInFlight, generationStoreError:
+		return false, retry(att.reason, w.backoff(job.Attempts))
+	}
+	if op.ForceRequested {
+		w.log.Warn("final snapshot failed; forced stop keeps the previous generation",
+			"sandbox", sbx.ID, "node", derefNode(sbx.NodeID), "reason", att.reason)
+		return true, nil
+	}
+	return false, w.failStopAttempt(ctx, job, lease, sbx.OwnerID, op, "snapshot failed")
+}
+
+// eraseStopped ends the stop of a sandbox created with snapshots off: its
+// disk is erased instead of kept. DeleteVM runs under the guard once StopVM
+// confirmed the VM off (or an earlier attempt already deleted it); only then
+// does the finalization release the disk reservation and clear the disk's
+// node. A failed DeleteVM makes the stop failing and retrying like a failed
+// StopVM.
+func (w *Worker) eraseStopped(ctx context.Context, job db.Job, lease *Lease, guard *db.SandboxGuard, opCtx context.Context, sbx db.Sandbox, op db.StopOperation) error {
+	err := w.deleteVMUnderGuard(opCtx, guard, sbx)
+	if guard.Err() != nil {
+		return retry("sandbox guard lost", w.backoff(job.Attempts))
+	}
+	if lease.Lost() || ctx.Err() != nil {
+		return nil // redelivery repeats the idempotent DeleteVM
+	}
+	if err != nil {
+		return w.failStopAttempt(ctx, job, lease, sbx.OwnerID, op, classify(err))
+	}
+	return w.finalizeStop(ctx, job, lease, sbx.OwnerID, sbx.ID, db.FinalizeStopParams{
+		Owner: sbx.OwnerID, SandboxID: sbx.ID, StopID: op.ID, ExpectedVersion: sbx.Version,
+		DiskErased: true,
 	})
 }
 
@@ -231,6 +315,10 @@ func (w *Worker) stopVMConfirmed(ctx context.Context, nodeID, sandboxID string, 
 // emitted for the whole outcome — the persisted row is the dedupe boundary.
 // This outcome is never retried or reconciled into a requeue; transient
 // failures elsewhere on the stop path keep their normal retries.
+//
+// One missing VM is not a lost disk: when the sandbox keeps no local disk
+// and the object store holds a completed generation (diskInStore), the stop
+// archives it with the disk only in the store instead.
 func (w *Worker) stopDiskMissing(ctx context.Context, job db.Job, lease *Lease, guard *db.SandboxGuard, opCtx context.Context, sbx db.Sandbox, op db.StopOperation) error {
 	owner := sbx.OwnerID
 	// StopVM's NOT_FOUND alone is not proof: confirm with the canonical
@@ -254,6 +342,16 @@ func (w *Worker) stopDiskMissing(ctx context.Context, job db.Job, lease *Lease, 
 		return nil // redelivery replays the fenced outcome idempotently
 	}
 	p := db.FinalizeStopParams{Owner: owner, SandboxID: sbx.ID, StopID: op.ID, ExpectedVersion: sbx.Version}
+	if inStore, err := w.diskInStore(ctx, sbx); err != nil {
+		return retry("generation read failed", w.backoff(job.Attempts))
+	} else if inStore {
+		// The stop took over a restore from the object store before anything
+		// existed on the new node: the disk was never local, and the
+		// store still holds it. The sandbox is archived with no local disk
+		// and the next resume restores the same generation.
+		p.DiskInStore = true
+		return w.finalizeStop(ctx, job, lease, owner, sbx.ID, p)
+	}
 	_, _, applied, err := w.store.FinalizeSandboxStopMissingDisk(ctx, job.ID, w.workerID, job.LeaseToken, p)
 	switch {
 	case err == nil:
@@ -299,6 +397,19 @@ func (w *Worker) stopDiskMissing(ctx context.Context, job db.Job, lease *Lease, 
 	default:
 		return retry("missing-disk finalization failed", w.backoff(job.Attempts))
 	}
+}
+
+// diskInStore reports whether a stop whose VM is confirmed missing can still
+// archive the sandbox from the object store: an object store is configured,
+// snapshots are on, the sandbox keeps no local disk (disk_node_id NULL) and
+// its data has a completed generation. The finalization rechecks this under
+// the row lock.
+func (w *Worker) diskInStore(ctx context.Context, sbx db.Sandbox) (bool, error) {
+	if w.objectStore == nil || !sbx.SnapshotsEnabled || sbx.DiskNodeID != nil || sbx.DataExpiredAt != nil {
+		return false, nil
+	}
+	_, ok, err := w.store.LatestGeneration(ctx, sbx.OwnerID, sbx.ID)
+	return ok, err
 }
 
 // failStopAttempt records one failed archival attempt on the canonical

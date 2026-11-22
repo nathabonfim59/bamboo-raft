@@ -55,6 +55,18 @@ func (m *Manager) CreateVM(ctx context.Context, req *nodev1.CreateVMRequest) (*n
 	if joined {
 		return m.waitExisting(ctx, v)
 	}
+	// Phase 2 restores are validated before any reservation or record exists:
+	// a refused request leaves no VM.
+	var restore *restoreSource
+	if req.GetFromManifest() != "" {
+		if err := m.checkFromManifest(req); err != nil {
+			return nil, err
+		}
+		var err error
+		if restore, err = m.loadRestore(ctx, req); err != nil {
+			return nil, err
+		}
+	}
 	var snapshotRelease func()
 	if from := req.GetFromSnapshot(); from != "" {
 		var err error
@@ -63,7 +75,7 @@ func (m *Manager) CreateVM(ctx context.Context, req *nodev1.CreateVMRequest) (*n
 			return nil, err
 		}
 	}
-	v, owner, err := m.joinCreate(req, snapshotRelease)
+	v, owner, err := m.joinCreate(req, snapshotRelease, restore)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +141,9 @@ func (m *Manager) joinExisting(id string) (*vm, bool, error) {
 // say — and only validates and reserves for a genuinely new id. owner
 // reports whether the caller claimed the record's boot (and holds its first
 // ticket) or is joining an existing one.
-func (m *Manager) joinCreate(req *nodev1.CreateVMRequest, snapshotRelease func()) (_ *vm, owner bool, err error) {
+// A from_manifest create passes its checked manifest (loadRestore) as
+// restore; it decides the image and the smallest disk.
+func (m *Manager) joinCreate(req *nodev1.CreateVMRequest, snapshotRelease func(), restore *restoreSource) (_ *vm, owner bool, err error) {
 	// joinCreate owns the reservation on every path. A genuinely new child
 	// transfers it to the boot worker; an existing id or an error releases it.
 	defer func() {
@@ -180,6 +194,10 @@ func (m *Manager) joinCreate(req *nodev1.CreateVMRequest, snapshotRelease func()
 		}
 		minimumDiskGiB = ceilGiB(snap.Meta.VirtualSize)
 		source = &snap
+	} else if restore != nil {
+		// loadRestore proved the image is installed and matches.
+		img = restore.image
+		minimumDiskGiB = max(img.RootVirtualSizeGiB, ceilGiB(restore.manifest.DiskBytes))
 	} else {
 		var err error
 		img, err = m.imageFor(req.GetImage())
@@ -239,6 +257,8 @@ func (m *Manager) joinCreate(req *nodev1.CreateVMRequest, snapshotRelease func()
 		SandboxID:       id,
 		Image:           img.ID,
 		FromSnapshot:    req.GetFromSnapshot(),
+		FromManifest:    restore.key(),
+		RestoreChunks:   restore.chunks(),
 		Resources:       storageResources(res),
 		Env:             maps.Clone(req.GetEnv()),
 		Hostname:        req.GetHostname(),
@@ -255,6 +275,7 @@ func (m *Manager) joinCreate(req *nodev1.CreateVMRequest, snapshotRelease func()
 		computeHeld:     true,
 		snapshotRelease: snapshotRelease,
 		snapshotSource:  source,
+		restore:         restore,
 	}
 	snapshotRelease = nil // the boot worker now owns the source pin
 	m.reserved = total
@@ -417,6 +438,11 @@ func (m *Manager) waitBoot(ctx context.Context, v *vm, ticket uint64) (*nodev1.V
 				// the delete observes ABORTED, never a resurrected VM.
 				return nil, status.Errorf(codes.Aborted, "sandbox %s was deleted while booting", v.id)
 			}
+			if re, ok := errors.AsType[*restoreError](bootErr); ok {
+				// A failed restore is a failed boot with its own code
+				// (object store outage UNAVAILABLE, a bad chunk INTERNAL).
+				return nil, re.grpcStatus()
+			}
 			msg := cmp.Or(errorText(bootErr), errMsg, "boot failed")
 			return nil, status.Errorf(codes.Internal, "boot failed: %s", msg)
 		default:
@@ -489,15 +515,26 @@ func (m *Manager) boot(ctx context.Context, v *vm, img storage.Image) {
 // same BootTimeout-bounded worker, and an aborted one returns to STOPPED
 // instead of removing the disk.
 func (m *Manager) runBoot(ctx context.Context, v *vm, img storage.Image, myGen uint64) error {
-	ctx, cancel := context.WithTimeout(ctx, m.cfg.BootTimeout)
-	defer cancel()
+	workerCtx := ctx
+	deadline := time.Now().Add(m.cfg.BootTimeout)
+	diskCtx, cancelDisk := context.WithDeadline(workerCtx, deadline)
+	defer cancelDisk()
 
 	if !v.startKeep {
-		if err := m.createVMDisk(ctx, v, img); err != nil {
+		if err := m.createVMDisk(diskCtx, v, img); err != nil {
 			return m.failBoot(v, fmt.Errorf("create disk: %w", err))
 		}
+		if v.restore != nil {
+			// An eager restore is as long as the disk is large: only the
+			// worker's own context (the last waiter, DeleteVM, shutdown)
+			// bounds it, and BootTimeout starts again once it is done.
+			if err := m.restoreDisk(workerCtx, v); err != nil {
+				return m.failBoot(v, err)
+			}
+			deadline = time.Now().Add(m.cfg.BootTimeout)
+		}
 	} else {
-		persisted, err := m.startDiskPhase(ctx, v)
+		persisted, err := m.startDiskPhase(diskCtx, v)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				// The last waiter left, a delete fence or the manager
@@ -509,6 +546,8 @@ func (m *Manager) runBoot(ctx context.Context, v *vm, img storage.Image, myGen u
 			return err
 		}
 	}
+	ctx, cancel := context.WithDeadline(workerCtx, deadline)
+	defer cancel()
 	// The network lease belongs to the bounded shared boot worker, before the
 	// launch intent: nothing durable about the machine exists until the
 	// network it will run on is allocated, and a failure below releases it
@@ -575,6 +614,10 @@ func (m *Manager) runBoot(ctx context.Context, v *vm, img storage.Image, myGen u
 	if err := m.store.CommitRunning(v.id, proc.PID()); err != nil {
 		return m.failBoot(v, fmt.Errorf("record process identity: %w", err))
 	}
+	// QEMU runs paused (-S) until the dirty bitmap is in place (D2).
+	if err := m.startGuest(ctx, v.id, proc); err != nil {
+		return m.failBoot(v, err)
+	}
 
 	conn, err := m.dialer.Dial(ctx, v.meta.VsockCID)
 	if err != nil {
@@ -618,8 +661,7 @@ func (m *Manager) runBoot(ctx context.Context, v *vm, img storage.Image, myGen u
 		return m.failBoot(v, fmt.Errorf("record ready metadata: %w", err))
 	}
 	v.state = nodev1.VMState_VM_STATE_READY
-	v.meta.StartedAtUnixMs = now
-	v.meta.StoppedAtUnixMs = 0
+	v.readyCommitted(now)
 	v.mu.Unlock()
 	if m.afterReady != nil {
 		// Test seam: the point where a late ready-write used to race a
@@ -1096,8 +1138,20 @@ func (m *Manager) DeleteVM(ctx context.Context, req *nodev1.DeleteVMRequest) (*n
 	v.del = att
 	cancel := v.bootCancel
 	bootDone := v.bootDone
+	maintCancel := v.maintCancel
+	snapCancel := v.snapCancel
 	v.mu.Unlock()
 	m.mu.Unlock()
+	if maintCancel != nil {
+		// A maintenance session holds the operation gate: fence it like a
+		// boot so it kills its QEMU and releases the gate promptly.
+		maintCancel(errMaintenanceFenced)
+	}
+	if snapCancel != nil {
+		// So does a live snapshot's read: it tears its cut down (on its own
+		// cleanup context) and releases the gate.
+		snapCancel(errSnapshotFenced)
+	}
 	defer func() {
 		m.mu.Lock()
 		if m.fence[id] == token {

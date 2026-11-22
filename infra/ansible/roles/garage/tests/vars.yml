@@ -1,0 +1,9 @@
+# Test-only overrides. The render test runs unprivileged, so the credential
+# files belong to the controller user instead of root. The role defaults stay
+# root:root and are the only ownership a real host can produce.
+garage_credentials_dir_owner: "{{ ansible_facts['user_id'] }}"
+garage_credentials_dir_group: "{{ ansible_facts['user_id'] }}"
+garage_credentials_owner: "{{ ansible_facts['user_id'] }}"
+garage_credentials_group: "{{ ansible_facts['user_id'] }}"
+garage_secret_owner: "{{ ansible_facts['user_id'] }}"
+garage_secret_group: "{{ ansible_facts['user_id'] }}"

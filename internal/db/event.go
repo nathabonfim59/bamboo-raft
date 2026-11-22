@@ -12,6 +12,10 @@ import (
 // "state.ready" for a move to ready.
 const EventStatePrefix = "state."
 
+// EventSandboxHydrated is recorded when a sandbox restored from an
+// object-store manifest has its whole disk local.
+const EventSandboxHydrated = "sandbox.hydrated"
+
 // EventInput is one lifecycle event to record with a write.
 type EventInput struct {
 	Type string

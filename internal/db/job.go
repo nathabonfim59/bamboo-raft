@@ -29,6 +29,16 @@ const (
 	// JobDeleteSnapshot removes one retired or deleted snapshot artifact
 	// from its recorded node. DeleteSnapshot is idempotent.
 	JobDeleteSnapshot JobKind = "snapshot.delete"
+
+	// JobSnapshot takes one generation of a sandbox into the object store.
+	JobSnapshot JobKind = "sandbox.snapshot"
+	// JobRecover power-cycles an unresponsive sandbox VM via ResetVM.
+	JobRecover JobKind = "sandbox.recover"
+
+	// JobFork takes the source generation of a fork and hands the fork
+	// sandbox to its provision job. The API cannot cut a generation (that
+	// needs the source's guard and a node call), so the fork is this job.
+	JobFork JobKind = "sandbox.fork"
 )
 
 // JobState is the queue lifecycle of one job.
@@ -69,6 +79,11 @@ type Job struct {
 	LastError   string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+
+	// SourceGenerationID is the object-store generation a restore, fork or
+	// resume job reads from; the chunk collector keeps it while the job is
+	// queued or running.
+	SourceGenerationID *uuid.UUID
 }
 
 // ProvisionPayload is the payload of [JobProvision].
@@ -79,6 +94,14 @@ type ProvisionPayload struct {
 	// for a normal create. The job handler must still validate it against
 	// the canonical sandbox row.
 	FromSnapshot string
+	// FromManifest is the object-store generation manifest the boot restores
+	// the disk from (CreateVM from_manifest); empty otherwise. Like
+	// FromSnapshot it must match the canonical row. Image is that
+	// generation's image, which tells a node without an object store apart
+	// from a node missing the image when CreateVM answers
+	// FAILED_PRECONDITION.
+	FromManifest string
+	Image        string
 	// Generation is the sandbox lifecycle generation this boot belongs to.
 	// The initial create writes 0; a resume increments it. A provision
 	// worker must never complete a boot for a different generation.
@@ -107,6 +130,16 @@ type ResumePayload struct {
 	Resources   Resources
 	FromStopID  string
 	Generation  int64
+
+	// Resume on another node. FromManifest, when not empty, makes
+	// this a cross-node resume: the node restores the disk with CreateVM
+	// from_manifest (the chain's last completed generation) instead of
+	// starting a kept disk with StartVM. Image is that generation's image.
+	// EvictNode is the node whose local copy of the disk this resume
+	// orphaned (an open vm_evictions row); the job deletes it after READY.
+	FromManifest string
+	Image        string
+	EvictNode    string
 }
 
 // DeleteVMPayload is the payload of [JobDeleteVM].
@@ -137,6 +170,23 @@ type DeleteSnapshotPayload struct {
 	ArtifactID string
 }
 
+// RecoverPayload is the payload of [JobRecover]. NodeID and Generation capture
+// the sandbox boot that recovery was accepted for, so the worker skips if the
+// sandbox moved nodes or restarted before the job ran.
+type RecoverPayload struct {
+	NodeID     string
+	Generation int64
+}
+
+// ForkPayload is the payload of [JobFork]. SourceID is the sandbox whose chain
+// the fork reads; NodeID is the node the fork sandbox reserved. The worker
+// resolves the generation under the source's guard and then presents it to
+// [Store.StartFork], which validates both fields against the canonical rows.
+type ForkPayload struct {
+	SourceID string
+	NodeID   string
+}
+
 // JobInput describes a job to enqueue inside a Store operation.
 type JobInput struct {
 	Kind        JobKind
@@ -145,10 +195,14 @@ type JobInput struct {
 	SnapshotID  *uuid.UUID
 	Payload     string // JSON object from one of the payload types
 	MaxAttempts int    // <= 0 means DefaultMaxAttempts
+
+	// SourceGenerationID records the generation the job reads from.
+	SourceGenerationID *uuid.UUID
 }
 
 const jobCols = `id, kind, owner_id, sandbox_id, snapshot_id, payload, state, attempts, max_attempts,
-	run_after, leased_by, leased_until, lease_token, last_error, created_at, updated_at`
+	run_after, leased_by, leased_until, lease_token, last_error, created_at, updated_at,
+	source_generation_id`
 
 func scanJob(row scanner) (Job, error) {
 	var (
@@ -158,7 +212,7 @@ func scanJob(row scanner) (Job, error) {
 	)
 	err := row.Scan(&j.ID, &j.Kind, &j.OwnerID, &j.SandboxID, &j.SnapshotID, &payload, &j.State,
 		&j.Attempts, &j.MaxAttempts, &j.RunAfter, &j.LeasedBy, &j.LeasedUntil, &token,
-		&j.LastError, &j.CreatedAt, &j.UpdatedAt)
+		&j.LastError, &j.CreatedAt, &j.UpdatedAt, &j.SourceGenerationID)
 	if err == nil {
 		j.Payload = string(payload)
 		if token != nil {
@@ -220,10 +274,12 @@ func enqueueJobTx(ctx context.Context, tx pgx.Tx, in JobInput) (Job, error) {
 		in.MaxAttempts = DefaultMaxAttempts
 	}
 	row := tx.QueryRow(ctx, `
-		INSERT INTO jobs (id, kind, owner_id, sandbox_id, snapshot_id, payload, max_attempts)
-		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+		INSERT INTO jobs (id, kind, owner_id, sandbox_id, snapshot_id, payload, max_attempts,
+			source_generation_id)
+		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
 		RETURNING `+jobCols,
-		uuid.NewV7(), in.Kind, in.OwnerID, in.SandboxID, in.SnapshotID, in.Payload, in.MaxAttempts)
+		uuid.NewV7(), in.Kind, in.OwnerID, in.SandboxID, in.SnapshotID, in.Payload, in.MaxAttempts,
+		in.SourceGenerationID)
 	j, err := scanJob(row)
 	if err != nil {
 		return Job{}, fmtError("enqueue job", err)

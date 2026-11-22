@@ -1652,3 +1652,48 @@ func TestSetupFailsClosedWhenTapIsUnavailable(t *testing.T) {
 		t.Errorf("state files = %v, want none", got)
 	}
 }
+
+// TestSetupSkipsHostLocalAddresses is the defence in depth behind CheckHost: if
+// the start-up check was bypassed (an interface appeared later), a guest is
+// still never given an address a host interface holds. The bridge's own
+// addresses are not host-local: the gateway is skipped on its own.
+func TestSetupSkipsHostLocalAddresses(t *testing.T) {
+	cfg := netTestConfig(t)
+	m, runner, _ := netTestManager(t, cfg)
+	runner.out["ip -j -4 addr show"] = netTestOutput{data: []byte(
+		`[{"ifname":"enp0s2","addr_info":[{"local":"10.42.0.2","prefixlen":16},{"local":"10.42.0.3","prefixlen":32}]},` +
+			`{"ifname":"bbraft0","addr_info":[{"local":"10.42.0.1","prefixlen":16},{"local":"10.42.0.4","prefixlen":32}]}]`)}
+
+	var got []netip.Addr
+	for _, id := range []string{"bx_abcdefgh", "bx_22222222"} {
+		lease, err := m.Setup(t.Context(), id)
+		if err != nil {
+			t.Fatalf("Setup %s: %v", id, err)
+		}
+		got = append(got, lease.GuestIP)
+		lease.Close()
+	}
+	// 10.42.0.2 and .3 belong to enp0s2; .4 is on the bridge, so it is free.
+	want := []netip.Addr{netip.MustParseAddr("10.42.0.4"), netip.MustParseAddr("10.42.0.5")}
+	if !slices.Equal(got, want) {
+		t.Errorf("guest addresses = %v, want %v", got, want)
+	}
+}
+
+// TestSetupFailsClosedWhenHostAddressesAreUnknown proves an allocation is
+// refused rather than guessed when the host's addresses cannot be listed.
+func TestSetupFailsClosedWhenHostAddressesAreUnknown(t *testing.T) {
+	cfg := netTestConfig(t)
+	m, runner, _ := netTestManager(t, cfg)
+	runner.out["ip -j -4 addr show"] = netTestOutput{err: errors.New("ip: boom")}
+
+	if _, err := m.Setup(t.Context(), "bx_abcdefgh"); err == nil || !strings.Contains(err.Error(), "host addresses") {
+		t.Fatalf("Setup = %v, want a host addresses error", err)
+	}
+	if _, ok := m.Allocation("bx_abcdefgh"); ok {
+		t.Error("a refused allocation was recorded")
+	}
+	if got := runner.commands(); len(got) != 0 {
+		t.Errorf("a refused allocation changed the host: %v", got)
+	}
+}

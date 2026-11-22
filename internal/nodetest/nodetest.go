@@ -34,6 +34,8 @@ type Options struct {
 	FenceWatch time.Duration
 	// Phase1 selects the Phase 1 case groups (phase1.go).
 	Phase1 Phase1
+	// Phase2 selects the Phase 2 case groups and the object store (phase2.go).
+	Phase2 Phase2
 }
 
 // Run runs the suite against client.
@@ -72,6 +74,7 @@ func Run(t *testing.T, client nodev1.NodeClient, opts Options) {
 	t.Run("PutFileBadPath", func(t *testing.T) { s.testPutFileBadPath(t, id) })
 	t.Run("Snapshot", func(t *testing.T) { s.testSnapshot(t, id) })
 	s.runPhase1(t, id)
+	s.runPhase2(t)
 }
 
 type suite struct {

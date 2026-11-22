@@ -10,9 +10,12 @@ import (
 )
 
 // ReapOnce runs one maintenance round: fail stale claims, accept TTL
-// auto-stops, accept stopped-retention deletions, walk every terminally
-// failed job page from the oldest, and reconcile node VM inventories. Tests
-// call it directly; Run calls it on the reaper interval.
+// auto-stops, expire the stored data of sandboxes stopped past the
+// data-retention window, accept stopped-retention deletions, walk every
+// terminally failed job page from the oldest, fail pending snapshot
+// generations past their deadline, move the sandboxes of lost nodes, and
+// reconcile node VM inventories. Tests call it directly; Run calls it on the
+// reaper interval.
 func (w *Worker) ReapOnce(ctx context.Context) {
 	if n, err := w.store.FailStaleJobs(ctx); err != nil {
 		w.log.Warn("fail stale jobs failed", "reason", classify(err))
@@ -20,8 +23,12 @@ func (w *Worker) ReapOnce(ctx context.Context) {
 		w.log.Warn("failed jobs with expired leases", "count", n)
 	}
 	w.reapTTL(ctx)
+	w.reapDataExpiry(ctx)
 	w.reapStoppedRetention(ctx)
 	w.reconcileFailedJobs(ctx)
+	w.reconcilePendingGenerations(ctx)
+	w.reapLostNodes(ctx)
+	w.reapDiskPressure(ctx)
 	w.reconcileVMs(ctx)
 }
 
@@ -172,6 +179,8 @@ func (w *Worker) reconcileFailedJob(ctx context.Context, job db.Job) {
 		w.reconcileFailedResume(ctx, job)
 	case db.JobDeleteVM:
 		w.reconcileFailedDelete(ctx, job)
+	case db.JobFork:
+		w.reconcileFailedFork(ctx, job)
 	}
 }
 
@@ -416,15 +425,22 @@ func (w *Worker) reconcileFailedResume(ctx context.Context, job db.Job) {
 		Resources:   sbx.Desired,
 		FromStopID:  derefStopID(sbx.StopOperationID),
 		Generation:  sbx.LifecycleGeneration,
+		// A cross-node resume keeps its restore source and the
+		// copy it orphaned: the generation is bound to the row above, and
+		// only its admission chose them.
+		FromManifest: failed.FromManifest,
+		Image:        failed.Image,
+		EvictNode:    failed.EvictNode,
 	})
 	if err != nil {
 		return
 	}
 	if _, _, err := w.store.EnqueueJobIfAbsent(ctx, db.JobInput{
-		Kind:      db.JobResume,
-		OwnerID:   owner,
-		SandboxID: &sandboxID,
-		Payload:   string(payload),
+		Kind:               db.JobResume,
+		OwnerID:            owner,
+		SandboxID:          &sandboxID,
+		Payload:            string(payload),
+		SourceGenerationID: job.SourceGenerationID,
 	}); err != nil {
 		w.log.Warn("retry resume enqueue failed", "sandbox", sandboxID, "reason", classify(err))
 	}

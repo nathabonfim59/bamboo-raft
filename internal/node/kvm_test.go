@@ -2,9 +2,11 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,6 +19,7 @@ import (
 	"github.com/nathabonfim59/bamboo-raft/internal/node/storage"
 	"github.com/nathabonfim59/bamboo-raft/internal/nodelink"
 	"github.com/nathabonfim59/bamboo-raft/internal/nodetest"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore/memstore"
 	"github.com/nathabonfim59/bamboo-raft/internal/proto/nodev1"
 )
 
@@ -29,6 +32,11 @@ import (
 // The frozen suite includes Snapshot. FenceWatch is at least the bounded boot
 // time. Once BBRAFT_TEST_KVM=1 is set, a missing image directory, missing QEMU
 // binary or missing /dev/kvm or /dev/vhost-vsock fails instead of skipping.
+//
+// BBRAFT_TEST_QEMU_PREFIX=<prefix> (optional; make check never needs it) puts
+// <prefix>/bin first on PATH for the test, so the KVM tests run against that
+// QEMU and qemu-img instead of the distro's. internal/node/qemu10.sh builds
+// the pinned upstream QEMU 10.0 into such a prefix and prints it.
 func requireKVM(t *testing.T) (imageDir string) {
 	t.Helper()
 	if os.Getenv("BBRAFT_TEST_KVM") != "1" {
@@ -44,10 +52,44 @@ func requireKVM(t *testing.T) (imageDir string) {
 	if os.Geteuid() == 0 {
 		t.Fatal("the node refuses to run QEMU as root; run the tests as the node service user")
 	}
+	kvmUseQEMUPrefix(t)
 	if err := qemu.CheckHost(t.Context(), slog.New(slog.DiscardHandler)); err != nil {
 		t.Fatalf("KVM host check: %v", err)
 	}
 	return imageDir
+}
+
+// kvmUseQEMUPrefix applies BBRAFT_TEST_QEMU_PREFIX: an absolute prefix whose
+// bin/ holds qemu-system-x86_64 and qemu-img goes first on PATH for this test
+// (and the node it starts: the unjailed launcher resolves both by name). A
+// set but unusable prefix fails instead of silently testing the distro QEMU.
+func kvmUseQEMUPrefix(t *testing.T) {
+	t.Helper()
+	prefix := os.Getenv("BBRAFT_TEST_QEMU_PREFIX")
+	if prefix == "" {
+		return
+	}
+	bin, err := kvmQEMUPrefixBin(prefix)
+	if err != nil {
+		t.Fatalf("BBRAFT_TEST_QEMU_PREFIX: %v", err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// kvmQEMUPrefixBin returns prefix's bin directory after checking that prefix
+// is an absolute clean path whose bin/ holds executable qemu-system-x86_64
+// and qemu-img.
+func kvmQEMUPrefixBin(prefix string) (string, error) {
+	if !filepath.IsAbs(prefix) || filepath.Clean(prefix) != prefix {
+		return "", fmt.Errorf("%q is not an absolute clean path", prefix)
+	}
+	bin := filepath.Join(prefix, "bin")
+	for _, tool := range []string{"qemu-system-x86_64", "qemu-img"} {
+		if info, err := os.Stat(filepath.Join(bin, tool)); err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+			return "", fmt.Errorf("%q has no executable bin/%s (%v); build it with internal/node/qemu10.sh", prefix, tool, err)
+		}
+	}
+	return bin, nil
 }
 
 // kvmCPUOverride maps BBRAFT_TEST_CPU_MODEL to Manager CPU settings. Unset
@@ -67,9 +109,16 @@ func kvmCPUOverride() (string, bool) {
 
 func newKVMManager(t *testing.T, imageDir string) *Manager {
 	t.Helper()
+	return newKVMManagerWith(t, imageDir, nil)
+}
+
+// newKVMManagerWith is newKVMManager with configure applied to the Config
+// just before New (for example an object store).
+func newKVMManagerWith(t *testing.T, imageDir string, configure func(*Config)) *Manager {
+	t.Helper()
 	capacity := &nodev1.Resources{Vcpus: 16, MemoryMib: 32 << 10, DiskGib: 200}
 	cpuModel, allowHostCPU := kvmCPUOverride()
-	m, err := New(t.Context(), Config{
+	cfg := Config{
 		NodeID:       "kvm-test",
 		DataDir:      t.TempDir(),
 		ImageDir:     imageDir,
@@ -82,7 +131,11 @@ func newKVMManager(t *testing.T, imageDir string) *Manager {
 		// the real-TAP A8 gate; production launches always set Network.
 		AllowUserNetworking: true,
 		Log:                 slog.New(slog.DiscardHandler),
-	})
+	}
+	if configure != nil {
+		configure(&cfg)
+	}
+	m, err := New(t.Context(), cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -227,15 +280,22 @@ func TestKVMCPUInfoModelTruthful(t *testing.T) {
 	}
 }
 
+// TestKVMConformanceDirect runs the whole suite, Phase 2 snapshots and
+// restores against a memstore, in process.
 func TestKVMConformanceDirect(t *testing.T) {
 	imageDir := requireKVM(t)
-	m := newKVMManager(t, imageDir)
+	store := memstore.New()
+	m := newKVMManagerWith(t, imageDir, func(cfg *Config) {
+		cfg.Store = store
+		cfg.ChunkCacheBytes = 1 << 30
+	})
 	client := startNodeClient(t, &harness{mg: m})
 	nodetest.Run(t, client, nodetest.Options{
 		BootTimeout: 2 * time.Minute,
 		FenceWatch:  2 * time.Minute,
 		// Processes uses the assembled A5 guest slice; SSH belongs to A8.
 		Phase1: nodetest.Phase1{Stop: true, Processes: true, Files: true},
+		Phase2: nodetest.Phase2{Snapshots: true, Reset: true, Store: store},
 	})
 }
 
@@ -293,15 +353,21 @@ func waitKVMLink(t *testing.T, hub *nodelink.Hub) *nodelink.Link {
 	return link
 }
 
+// TestKVMConformanceLink is TestKVMConformanceDirect through nodelink.
 func TestKVMConformanceLink(t *testing.T) {
 	imageDir := requireKVM(t)
-	m := newKVMManager(t, imageDir)
+	store := memstore.New()
+	m := newKVMManagerWith(t, imageDir, func(cfg *Config) {
+		cfg.Store = store
+		cfg.ChunkCacheBytes = 1 << 30
+	})
 	link := waitKVMLink(t, startKVMHub(t, m))
 	nodetest.Run(t, link.Client, nodetest.Options{
 		BootTimeout: 2 * time.Minute,
 		FenceWatch:  2 * time.Minute,
 		// Processes uses the assembled A5 guest slice; SSH belongs to A8.
 		Phase1: nodetest.Phase1{Stop: true, Processes: true, Files: true},
+		Phase2: nodetest.Phase2{Snapshots: true, Reset: true, Store: store},
 	})
 }
 

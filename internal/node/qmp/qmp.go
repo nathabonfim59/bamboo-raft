@@ -9,9 +9,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -141,6 +144,11 @@ type reply struct {
 type writeRequest struct {
 	data []byte
 	ctx  context.Context
+	// id and files are set only by ExecuteWithFiles: the writer attaches the
+	// files' descriptors to the frame with SCM_RIGHTS, and reports a failure
+	// that happened before any byte was written to the request id.
+	id    uint64
+	files []*os.File
 }
 
 type message struct {
@@ -278,6 +286,51 @@ func (c *Client) Greeting() Greeting { return c.greeting }
 // Execute runs one QMP command. args and result may be nil. QMP error replies
 // are returned as *Error and leave the connection usable.
 func (c *Client) Execute(ctx context.Context, command string, args, result any) error {
+	return c.execute(ctx, command, args, result, nil)
+}
+
+// ExecuteWithFiles runs one QMP command and passes files to QEMU with
+// SCM_RIGHTS on the same write as the command's first byte, which is how
+// QEMU's add-fd and getfd receive descriptors. args and result may be nil;
+// at least one file is required. Frames keep Execute's ordering: each
+// command is written whole by the single writer, so the descriptors arrive
+// with exactly this command.
+//
+// The caller owns files: the client never closes them, and the caller may
+// close them once ExecuteWithFiles returned. Each descriptor is pinned only
+// while the kernel copies it into the message, so a file closed concurrently
+// is reported as an error and never replaced by a recycled descriptor
+// number. A file that cannot be resolved before the write fails the call
+// without writing anything and leaves the connection usable. The connection
+// must be a unix socket.
+func (c *Client) ExecuteWithFiles(ctx context.Context, command string, args, result any, files ...*os.File) error {
+	if _, ok := c.conn.(*net.UnixConn); !ok {
+		return fmt.Errorf("qmp: %s: passing files needs a unix socket connection", command)
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("qmp: %s: no files to pass", command)
+	}
+	if len(files) > maxPassedFiles {
+		return fmt.Errorf("qmp: %s: %d files exceed the limit of %d per command", command, len(files), maxPassedFiles)
+	}
+	for i, f := range files {
+		if f == nil {
+			return fmt.Errorf("qmp: %s: file %d is nil", command, i)
+		}
+	}
+	// Fail fast on a file that is already closed; the writer resolves the
+	// descriptors again under the files' own references.
+	if err := withRawFDs(files, nil, func([]int) error { return nil }); err != nil {
+		return fmt.Errorf("qmp: %s: %w", command, err)
+	}
+	return c.execute(ctx, command, args, result, files)
+}
+
+// maxPassedFiles bounds the descriptors of one command. QEMU's socket
+// chardev accepts at most 16 descriptors per message (TCP_MAX_FDS).
+const maxPassedFiles = 16
+
+func (c *Client) execute(ctx context.Context, command string, args, result any, files []*os.File) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -311,7 +364,7 @@ func (c *Client) Execute(ctx context.Context, command string, args, result any) 
 	data = append(data, '\n')
 
 	select {
-	case c.writeCh <- writeRequest{data: data, ctx: ctx}:
+	case c.writeCh <- writeRequest{data: data, ctx: ctx, id: id, files: files}:
 	case <-ctx.Done():
 		c.remove(id)
 		return ctx.Err()
@@ -467,6 +520,19 @@ func (c *Client) writeLoop() {
 			if err := wr.ctx.Err(); err != nil {
 				continue
 			}
+			if len(wr.files) > 0 {
+				written, err := c.writeFilesWithContext(wr)
+				if err != nil && !written {
+					// Nothing reached the socket: only this request fails.
+					c.deliverErr(wr.id, err)
+					continue
+				}
+				if err != nil {
+					c.fail(err)
+					return
+				}
+				continue
+			}
 			if err := c.writeWithContext(wr); err != nil {
 				c.fail(err)
 				return
@@ -492,6 +558,84 @@ func (c *Client) writeWithContext(wr writeRequest) error {
 		return fmt.Errorf("qmp: write: %w", err)
 	}
 	return nil
+}
+
+// writeFilesWithContext writes one frame with wr.files attached as
+// SCM_RIGHTS to its first byte, interruptible by wr.ctx like
+// writeWithContext. written reports whether any byte may have reached the
+// socket: an error with written false left the stream untouched.
+func (c *Client) writeFilesWithContext(wr writeRequest) (written bool, err error) {
+	uc, ok := c.conn.(*net.UnixConn)
+	if !ok {
+		return false, errors.New("qmp: passing files needs a unix socket connection")
+	}
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(wr.ctx, func() {
+		c.conn.SetWriteDeadline(time.Now())
+		close(interrupted)
+	})
+	defer func() {
+		if !stop() {
+			<-interrupted
+		}
+		c.conn.SetWriteDeadline(time.Time{})
+	}()
+	var n int
+	resolveErr := withRawFDs(wr.files, nil, func(fds []int) error {
+		// From here on a failure may have left part of the frame in the
+		// stream, so it poisons the connection like any write error.
+		written = true
+		var werr error
+		n, _, werr = uc.WriteMsgUnix(wr.data, unix.UnixRights(fds...), nil)
+		return werr
+	})
+	if resolveErr != nil && !written {
+		return false, fmt.Errorf("qmp: pass files: %w", resolveErr)
+	}
+	if resolveErr != nil {
+		return true, fmt.Errorf("qmp: write: %w", resolveErr)
+	}
+	// A stream socket may accept only part of the frame; the descriptors
+	// travelled with the first part, the rest is plain data.
+	if n < len(wr.data) {
+		if _, err := c.conn.Write(wr.data[n:]); err != nil {
+			return true, fmt.Errorf("qmp: write: %w", err)
+		}
+	}
+	return true, nil
+}
+
+// withRawFDs calls fn with the raw descriptors of files while every file's
+// descriptor is pinned by its own reference (os.File's RawConn.Control), so
+// no descriptor number can be closed and recycled while fn runs.
+func withRawFDs(files []*os.File, fds []int, fn func([]int) error) error {
+	if len(files) == 0 {
+		return fn(fds)
+	}
+	rc, err := files[0].SyscallConn()
+	if err != nil {
+		return fmt.Errorf("file %s: %w", files[0].Name(), err)
+	}
+	var inner error
+	if err := rc.Control(func(fd uintptr) {
+		inner = withRawFDs(files[1:], append(fds, int(fd)), fn)
+	}); err != nil {
+		// Control fails only when the file can no longer be referenced:
+		// it was closed. Report it as os.ErrClosed, like os.File does.
+		return fmt.Errorf("file %s: %w (%w)", files[0].Name(), os.ErrClosed, err)
+	}
+	return inner
+}
+
+// deliverErr fails one pending request without touching the connection.
+func (c *Client) deliverErr(id uint64, err error) {
+	c.mu.Lock()
+	ch := c.pending[id]
+	delete(c.pending, id)
+	c.mu.Unlock()
+	if ch != nil {
+		ch <- reply{err: err}
+	}
 }
 
 func (c *Client) fail(cause error) {

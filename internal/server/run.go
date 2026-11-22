@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/nathabonfim59/bamboo-raft/internal/api"
 	"github.com/nathabonfim59/bamboo-raft/internal/db"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore/s3"
 	"github.com/nathabonfim59/bamboo-raft/internal/server/config"
 )
 
@@ -90,6 +93,11 @@ type Options struct {
 	Listeners Listeners
 	// StoreOpener optionally supplies role stores for tests.
 	StoreOpener StoreOpener
+	// ObjectStore optionally supplies the installation's object store,
+	// bypassing the S3 settings in cfg.ObjectStore (tests inject a
+	// memstore). Nil uses the configured bucket; when that is nil too the
+	// server runs in Phase 1 mode: no snapshot uploads, local stop/resume.
+	ObjectStore objstore.Store
 	// APIHooks optionally register accepted route packages.
 	APIHooks APIHooks
 	// InventoryInterval overrides the nodehub inventory poll interval.
@@ -134,15 +142,20 @@ func Run(ctx context.Context, cfg *config.Config, options Options) error {
 
 	defer options.Listeners.closeFor(cfg.Roles)
 
+	objects, err := openObjectStore(ctx, cfg, options.ObjectStore)
+	if err != nil {
+		return err
+	}
+
 	openStore := options.storeOpener(cfg)
 	if cfg.Roles.Has(config.RoleAPI) {
 		start("api", func(ctx context.Context) error {
-			return runAPI(ctx, cfg, logger, options, openStore, shutdownTimeout)
+			return runAPI(ctx, cfg, logger, options, openStore, shutdownTimeout, objects != nil)
 		})
 	}
 	if cfg.Roles.Has(config.RoleLifecycle) {
 		start("lifecycle", func(ctx context.Context) error {
-			return runLifecycle(ctx, cfg, logger, openStore)
+			return runLifecycle(ctx, cfg, logger, openStore, objects)
 		})
 	}
 	if cfg.Roles.Has(config.RoleNodeHub) {
@@ -181,4 +194,22 @@ func (o Options) storeOpener(cfg *config.Config) StoreOpener {
 		}
 		return store, nil
 	}
+}
+
+// openObjectStore resolves the installation's object store: an injected store
+// wins, no configured bucket means Phase 1 mode (nil), and otherwise it
+// connects to the configured S3 bucket. A failed connection fails start-up;
+// the error never carries credentials.
+func openObjectStore(ctx context.Context, cfg *config.Config, injected objstore.Store) (objstore.Store, error) {
+	if injected != nil {
+		return injected, nil
+	}
+	if cfg == nil || cfg.ObjectStore == nil {
+		return nil, nil
+	}
+	store, err := s3.New(ctx, *cfg.ObjectStore)
+	if err != nil {
+		return nil, fmt.Errorf("server: object store: %w", err)
+	}
+	return store, nil
 }

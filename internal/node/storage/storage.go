@@ -10,8 +10,12 @@
 //	  vm.json               durable manifest, mode 0600 (contains the VM env)
 //	  disk.qcow2            private qcow2 overlay over the verified image
 //	  qmp.sock, serial.log  created by QEMU itself
+//	  phase2.json           Phase 2 snapshot state, mode 0600 (phase2state.go)
+//	  last-manifest         local copy of the last snapshot manifest, mode 0600
 //	snapshots/staging/<sha256(id)>/    incomplete private copies; cleaned on restart
 //	snapshots/committed/<sha256(id)>/  durable disk.qcow2 and snapshot.json
+//	  fleece.qcow2          a live snapshot's temporary fleece image (fleece.go)
+//	phase2/fleece-<size>.qcow2  standalone fleece templates, one per virtual size
 //	orphans/<name>-<unix>/  quarantined VM dirs; never touched again by the node
 //
 // Identifiers never become unchecked filesystem paths: sandbox ids are
@@ -32,6 +36,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nathabonfim59/bamboo-raft/internal/ids"
@@ -89,6 +94,12 @@ type Store struct {
 	lockFile *os.File
 	// tc holds the tool self-check's test seams (zero: production).
 	tc toolCheckHooks
+	// phase2Mu serializes the read-modify-write updates of every VM's
+	// phase2.json (phase2state.go).
+	phase2Mu sync.Mutex
+	// fleeceMu serializes the check and creation of fleece templates
+	// (fleece.go).
+	fleeceMu sync.Mutex
 }
 
 // Open creates the layout if needed and takes the exclusive node lock. A

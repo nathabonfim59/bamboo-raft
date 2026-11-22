@@ -231,6 +231,18 @@ func NewCreateSandboxResponse(status CreateStatus, ttl *int, s Sandbox) CreateSa
 	}
 }
 
+// NewCreateSandboxBatchResponse builds the create envelope of a request with
+// count above one: every sandbox in creation order, and the first one in
+// sandbox.
+func NewCreateSandboxBatchResponse(status CreateStatus, ttl *int, sandboxes []Sandbox) CreateSandboxResponse {
+	out := NewCreateSandboxResponse(status, ttl, Sandbox{})
+	if len(sandboxes) > 0 {
+		out.Sandbox = sandboxes[0]
+	}
+	out.Sandboxes = sandboxes
+	return out
+}
+
 // HostedPortInfo is one entry of the hostedPorts create response field. It is
 // part of the pinned shape but hosting is outside the Phase 0.5 subset.
 type HostedPortInfo struct {

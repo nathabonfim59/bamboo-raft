@@ -11,6 +11,7 @@ tool (
 require (
 	github.com/getkin/kin-openapi v0.153.0
 	github.com/jackc/pgx/v5 v5.12.0
+	github.com/klauspost/compress v1.20.5
 	github.com/mdlayher/vsock v1.4.0
 	github.com/pressly/goose/v3 v3.29.0
 	github.com/spf13/cobra v1.10.2

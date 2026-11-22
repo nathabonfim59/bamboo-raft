@@ -210,6 +210,81 @@
     group: "{{ bbraft_node_modules_load_group }}"
     mode: "{{ bbraft_node_modules_load_mode }}"
 
+# Remote S3 mode owns both files. They have the same shape as Garage's on the
+# same host: the env file is non-secret and the secret stays in a separate
+# root-only file that systemd passes to the node as a credential.
+- name: Write the remote object store settings
+  ansible.builtin.copy:
+    dest: "{{ bbraft_node_s3_managed_env_file }}"
+    owner: "{{ bbraft_node_data_owner }}"
+    group: "{{ bbraft_node_data_group }}"
+    mode: "{{ bbraft_node_secret_mode }}"
+    content: |
+      # Managed by bamboo-raft infra/ansible (role bbraft_node). Non-secret
+      # settings; the secret is a separate root-only file.
+      BBRAFT_S3_ENDPOINT={{ bbraft_node_s3.endpoint }}
+      BBRAFT_S3_REGION={{ bbraft_node_s3.region }}
+      BBRAFT_S3_BUCKET={{ bbraft_node_s3.bucket }}
+      BBRAFT_S3_PATH_STYLE={{ bbraft_node_s3.path_style | lower }}
+      BBRAFT_S3_ACCESS_KEY_ID={{ bbraft_node_s3.access_key_id }}
+  no_log: true
+  notify: Restart bbraft-node
+  when:
+    - bbraft_node_s3 | length > 0
+    - not ansible_check_mode
+
+- name: Write the remote object store secret
+  ansible.builtin.copy:
+    dest: "{{ bbraft_node_s3_managed_secret_file }}"
+    owner: "{{ bbraft_node_data_owner }}"
+    group: "{{ bbraft_node_data_group }}"
+    mode: "{{ bbraft_node_secret_mode }}"
+    content: |
+      {{ bbraft_node_s3_secret_access_key }}
+  no_log: true
+  diff: false
+  notify: Restart bbraft-node
+  when:
+    - bbraft_node_s3 | length > 0
+    - not ansible_check_mode
+
+# The node reads the env file through EnvironmentFile= and the secret through
+# LoadCredential=. Both must already be private regular files when the unit is
+# installed, so a drifted or foreign-created file never reaches the service.
+- name: Read the configured object store files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+  loop:
+    - "{{ bbraft_node_s3_env_file_effective }}"
+    - "{{ bbraft_node_s3_secret_file_effective }}"
+  register: bbraft_node_s3_stats
+  when:
+    - bbraft_node_s3_configured | bool
+    - not ansible_check_mode
+
+- name: The object store files are private regular files owned by the service
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+      - item.stat.pw_name == bbraft_node_data_owner
+      - item.stat.gr_name == bbraft_node_data_group
+      - item.stat.mode in ['0600', '0400']
+    fail_msg: >-
+      {{ item.item }} must be a regular root-owned file with mode 0600 or
+      stricter: the node reads the env file as root and systemd copies the
+      secret to the service; a symlink, foreign owner or looser mode is refused
+    quiet: true
+  loop: "{{ bbraft_node_s3_stats.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - bbraft_node_s3_configured | bool
+    - not ansible_check_mode
+
 - name: Write the hardened systemd unit
   ansible.builtin.template:
     src: bbraft-node.service.j2

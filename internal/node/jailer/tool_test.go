@@ -440,6 +440,12 @@ func TestToolSpecValidate(t *testing.T) {
 			return s
 		}(),
 		"info raw": func() ToolSpec { s := jailerToolSpec("/usr/bin/qemu-img", rd); s.Driver = "raw"; return s }(),
+		// A standalone create (no backing) is the Phase 2 fleece template.
+		"create standalone template": func() ToolSpec {
+			s := jailerToolSpec("/usr/bin/qemu-img", rw)
+			s.Op, s.TargetAccess, s.Size, s.TargetPath = ToolCreate, AccessOwnerRW, 10<<30, StandaloneCreateDir+"/fleece-10737418240.qcow2"
+			return s
+		}(),
 	}
 	for name, spec := range valid {
 		t.Run("valid/"+name, func(t *testing.T) {
@@ -449,11 +455,23 @@ func TestToolSpecValidate(t *testing.T) {
 		})
 	}
 	invalid := map[string]func(*ToolSpec){
-		"info owner-rw":     func(s *ToolSpec) { s.TargetAccess = AccessOwnerRW },
-		"resize group-ro":   func(s *ToolSpec) { s.Op, s.Size = ToolResize, 1<<30 },
-		"create shared":     func(s *ToolSpec) { s.Op, s.TargetAccess, s.Size, s.BackingName = ToolCreate, AccessShared, 1<<30, "b" },
-		"resize zero size":  func(s *ToolSpec) { s.Op, s.TargetAccess, s.Target = ToolResize, AccessOwnerRW, rw },
+		"info owner-rw":    func(s *ToolSpec) { s.TargetAccess = AccessOwnerRW },
+		"resize group-ro":  func(s *ToolSpec) { s.Op, s.Size = ToolResize, 1<<30 },
+		"create shared":    func(s *ToolSpec) { s.Op, s.TargetAccess, s.Size, s.BackingName = ToolCreate, AccessShared, 1<<30, "b" },
+		"resize zero size": func(s *ToolSpec) { s.Op, s.TargetAccess, s.Target = ToolResize, AccessOwnerRW, rw },
+		// A VM overlay create still needs its backing: a standalone create
+		// is only allowed under phase2/ in the data root.
 		"create no backing": func(s *ToolSpec) { s.Op, s.TargetAccess, s.Target, s.Size = ToolCreate, AccessOwnerRW, rw, 1<<30 },
+		"create no backing in images root": func(s *ToolSpec) {
+			s.Op, s.TargetAccess, s.Target, s.Size = ToolCreate, AccessOwnerRW, rw, 1<<30
+			s.TargetRoot, s.TargetPath = TargetRootImages, StandaloneCreateDir+"/t.qcow2"
+		},
+		"create no backing phase2 prefix only": func(s *ToolSpec) {
+			s.Op, s.TargetAccess, s.Target, s.Size, s.TargetPath = ToolCreate, AccessOwnerRW, rw, 1<<30, StandaloneCreateDir+"x/t.qcow2"
+		},
+		"create no backing phase2 dir itself": func(s *ToolSpec) {
+			s.Op, s.TargetAccess, s.Target, s.Size, s.TargetPath = ToolCreate, AccessOwnerRW, rw, 1<<30, StandaloneCreateDir
+		},
 		"resize raw": func(s *ToolSpec) {
 			s.Op, s.TargetAccess, s.Target, s.Size, s.Driver = ToolResize, AccessOwnerRW, rw, 1<<30, "raw"
 		},
@@ -520,6 +538,9 @@ func TestToolArgsAreFixed(t *testing.T) {
 		"create": {spec(ToolCreate, func(s *ToolSpec) {
 			s.Target, s.TargetAccess, s.Size, s.BackingName = rw, AccessOwnerRW, 10737418240, "/var/lib/bbraft/images/v1/root.qcow2"
 		}), []string{"create", "-f", "qcow2", "-u", "-F", "qcow2", "-b", "/var/lib/bbraft/images/v1/root.qcow2", "/proc/self/fd/3", "10737418240"}},
+		"create standalone": {spec(ToolCreate, func(s *ToolSpec) {
+			s.Target, s.TargetAccess, s.Size, s.TargetPath = rw, AccessOwnerRW, 10737418240, StandaloneCreateDir+"/fleece-10737418240.qcow2"
+		}), []string{"create", "-f", "qcow2", "/proc/self/fd/3", "10737418240"}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -276,17 +276,18 @@ func checkPinIdentity(f *os.File, dev, ino uint64) error {
 	return nil
 }
 
-// controlSockets returns the control directory's only permitted entry, the
-// attempt's QMP socket owned by uid. The directory is VM-writable: at most
-// one entry beyond the supported one is read, so an attacker-sized
-// directory is refused, not walked.
+// controlSockets returns the control directory's only permitted entries,
+// the attempt's QMP socket and a maintenance session's NBD socket, each a
+// socket owned by uid. The directory is VM-writable: at most one entry
+// beyond the supported ones is read, so an attacker-sized directory is
+// refused, not walked.
 func controlSockets(control *os.File, uid uint32) ([]string, error) {
-	entries, err := control.ReadDir(2)
+	entries, err := control.ReadDir(3)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("read control: %w", err)
 	}
-	if len(entries) > 1 {
-		return nil, errors.New("control directory holds more than its QMP socket; preserving it")
+	if len(entries) > 2 {
+		return nil, errors.New("control directory holds more than its QMP and NBD sockets; preserving it")
 	}
 	var sockets []string
 	for _, entry := range entries {
@@ -295,7 +296,7 @@ func controlSockets(control *os.File, uid uint32) ([]string, error) {
 			return nil, fmt.Errorf("control entry %s: %w", entry.Name(), err)
 		}
 		st, _ := info.Sys().(*syscall.Stat_t)
-		if entry.Name() != qemu.QMPFilename || info.Mode()&os.ModeSocket == 0 || st == nil || st.Uid != uid {
+		if (entry.Name() != qemu.QMPFilename && entry.Name() != storage.NBDSocketName) || info.Mode()&os.ModeSocket == 0 || st == nil || st.Uid != uid {
 			return nil, fmt.Errorf("foreign control entry %q; preserving it", entry.Name())
 		}
 		sockets = append(sockets, entry.Name())

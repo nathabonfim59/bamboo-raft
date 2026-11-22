@@ -197,11 +197,15 @@ func waitNewLink(t *testing.T, hub *nodelink.Hub, id string, old *nodelink.Link)
 // command's process group at the node) and 16 MiB PutFile in 1 MiB chunks.
 func TestConformanceThroughGateway(t *testing.T) {
 	hub, hubAddr := startHub(t)
-	startFake(t, hubAddr, "node-a")
+	fake := nodefake.New("node-a", t.TempDir())
+	startNode(t, hubAddr, "node-a", nodeSecret, fake)
 	waitLink(t, hub, "node-a")
 	gwAddr := startGateway(t, hub)
 	client := dialGateway(t, gwAddr, "node-a")
-	nodetest.Run(t, client, nodetest.Options{Phase1: nodetest.AllPhase1})
+	nodetest.Run(t, client, nodetest.Options{
+		Phase1: nodetest.AllPhase1,
+		Phase2: nodetest.Phase2{Snapshots: true, Reset: true, Store: fake.Store},
+	})
 }
 
 func TestNewValidation(t *testing.T) {

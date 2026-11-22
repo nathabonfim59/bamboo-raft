@@ -14,6 +14,11 @@ rules in one place:
   internal/server/config: a plaintext node listener is allowed only on
   loopback or private addresses, and the internal gateway must be loopback
   unless it has TLS.
+* ``bbraft_positive_int`` and ``bbraft_nonnegative_int`` validate interval
+  and percentage inputs without Jinja's silent truncation.
+* ``bbraft_systemd_abs_path`` renders a verbatim absolute path for the two
+  systemd settings that do not unquote their value (``EnvironmentFile=`` and
+  ``LoadCredential=``).
 * ``bbraft_public_url_valid``, ``bbraft_gateway_dial``,
   ``bbraft_dial_valid``, ``bbraft_dial_is_loopback`` and
   ``bbraft_gateway_server_name_valid`` mirror the accepted public URL,
@@ -351,6 +356,57 @@ def bbraft_positive_int(value):
     return number
 
 
+def bbraft_systemd_abs_path(value):
+    """Render one absolute path verbatim for EnvironmentFile= or LoadCredential=.
+
+    systemd does not unquote those two settings, so a quoted value is not a
+    path: it logs ``path is not absolute, ignoring`` or ``Credential source
+    ... not valid, ignoring`` and starts the unit without the setting. This
+    filter therefore returns the path unquoted and refuses anything that
+    cannot be rendered safely: a relative path, whitespace, a quote, a
+    backslash, a line break, NUL, a ``.`` or ``..`` element, or a trailing
+    slash. Specifier expansion still applies, so every ``%`` becomes ``%%``.
+    """
+    text = str(value)
+    if not text.startswith("/"):
+        raise ValueError(f"path must be absolute: {text!r}")
+    if text.endswith("/"):
+        raise ValueError(f"path must not end with a slash: {text!r}")
+    for ch in text:
+        if ch == "\0":
+            raise ValueError(f"path contains a NUL: {text!r}")
+        if ch in "\"'\\":
+            raise ValueError(f"path contains a quote or backslash: {text!r}")
+        if _go_is_space(ch):
+            raise ValueError(f"path contains whitespace: {text!r}")
+    if any(part in (".", "..") for part in text.split("/")):
+        raise ValueError(f"path contains a . or .. element: {text!r}")
+    return text.replace("%", "%%")
+
+
+def bbraft_nonnegative_int(value):
+    """Return a nonnegative decimal integer, without truncating input.
+
+    Used for settings where zero disables the feature (data retention, node
+    loss, disk pressure). YAML integers and ASCII-decimal strings are
+    accepted; floats, bools, strings with a fraction/exponent/spaces and
+    non-ASCII digits are rejected.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"expected a nonnegative integer, got boolean {value!r}")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value and all(
+        ch in "0123456789" for ch in value
+    ):
+        number = int(value)
+    else:
+        raise ValueError(f"expected a nonnegative decimal integer, got {value!r}")
+    if number < 0:
+        raise ValueError(f"expected a nonnegative integer, got {number}")
+    return number
+
+
 def bbraft_effective_key_ids(keys):
     """Return the ids auth.LoadKeysFile will use.
 
@@ -377,5 +433,7 @@ class FilterModule:
             "bbraft_dial_is_loopback": bbraft_dial_is_loopback,
             "bbraft_gateway_server_name_valid": bbraft_gateway_server_name_valid,
             "bbraft_positive_int": bbraft_positive_int,
+            "bbraft_nonnegative_int": bbraft_nonnegative_int,
+            "bbraft_systemd_abs_path": bbraft_systemd_abs_path,
             "bbraft_effective_key_ids": bbraft_effective_key_ids,
         }

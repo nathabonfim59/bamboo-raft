@@ -95,6 +95,7 @@ func lifecycleSandbox(owner uuid.UUID) db.Sandbox {
 		MachineType: "default", Name: "job", TTLSeconds: new(3600),
 		StopOperationID: &stopID, StoppedAt: &stopped,
 		CreatedAt: coreFixedNow, UpdatedAt: coreFixedNow,
+		SnapshotsEnabled: true, // the database default
 	}
 }
 
@@ -729,6 +730,11 @@ func TestResumeSandboxFailures(t *testing.T) {
 		{"conflict archived", db.StateArchived, db.ErrConflict, `{}`, http.StatusConflict, apierr.CodeConflict},
 		{"superseded", db.StateArchived, db.ErrStopSuperseded, `{}`, http.StatusConflict, apierr.CodeConflict},
 		{"store fault", db.StateArchived, errors.New("node down"), `{}`, http.StatusInternalServerError, apierr.CodeInternal},
+		// resume on another node.
+		{"data expired", db.StateArchived, db.ErrSnapshotDataExpired, `{}`, http.StatusConflict, apierr.CodeSnapshotDataExpired},
+		{"nothing to restore", db.StateArchived, db.ErrNoRestorableData, `{}`, http.StatusConflict, apierr.CodeResumeFailed},
+		{"snapshots disabled", db.StateArchived, db.ErrSnapshotsDisabled, `{}`, http.StatusConflict, apierr.CodeSnapshotsDisabled},
+		{"generation purged meanwhile", db.StateArchived, db.ErrSnapshotNotFound, `{}`, http.StatusConflict, apierr.CodeConflict},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

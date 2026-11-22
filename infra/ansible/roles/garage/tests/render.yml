@@ -1,0 +1,114 @@
+# Renders the two host credential files into a temporary tree and asserts
+# their exact content and modes. No package, user, Garage process or systemd
+# unit is touched: only tasks/credentials.yml runs, with a fake garage CLI.
+- name: Render the garage credential files
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars.yml
+  vars:
+    garage_binary: "{{ playbook_dir }}/fixtures/garage"
+    garage_config: /nonexistent/garage.toml
+    garage_bucket: bbraft
+    garage_key_name: bbraft
+  tasks:
+    - name: Temporary root
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: garage-test
+      register: garage_test_root
+
+    - name: Point the credential files at the temporary tree
+      ansible.builtin.set_fact:
+        garage_credentials_file: "{{ garage_test_root.path }}/etc bbraft/s3.env"
+        garage_secret_file: "{{ garage_test_root.path }}/etc bbraft/s3-secret-access-key"
+
+    - name: Render the credential files
+      ansible.builtin.include_role:
+        name: garage
+        tasks_from: credentials
+
+    - name: Stat the rendered credential files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: true
+      loop:
+        - "{{ garage_credentials_file }}"
+        - "{{ garage_secret_file }}"
+      register: garage_test_stats
+
+    - name: Both files are regular and private to their owner
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - item.stat.mode == '0600'
+          - item.stat.pw_name == ansible_facts['user_id']
+          - item.stat.gr_name == ansible_facts['user_id']
+        fail_msg: "{{ item.item }} must be a regular 0600 file owned by the service user"
+        quiet: true
+      loop: "{{ garage_test_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Read both rendered files
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ garage_credentials_file }}"
+        - "{{ garage_secret_file }}"
+      register: garage_test_slurped
+      no_log: true
+
+    - name: The environment file carries exactly the five non-secret settings
+      ansible.builtin.assert:
+        that:
+          - (garage_test_env.splitlines() | select('match', '^BBRAFT_S3_') | list) ==
+            ['BBRAFT_S3_ENDPOINT=http://127.0.0.1:3900',
+             'BBRAFT_S3_REGION=garage',
+             'BBRAFT_S3_BUCKET=bbraft',
+             'BBRAFT_S3_PATH_STYLE=true',
+             'BBRAFT_S3_ACCESS_KEY_ID=GKtestaccesskeyid']
+          - "'SECRET' not in garage_test_env"
+        fail_msg: "the environment file must hold the five non-secret settings and never the secret"
+        quiet: true
+      vars:
+        garage_test_env: "{{ garage_test_slurped.results[0].content | b64decode }}"
+
+    - name: The secret file holds the secret alone
+      ansible.builtin.assert:
+        that:
+          - garage_test_secret == 'SENTINEL-garage-secret-7a1c\n'
+        fail_msg: "the secret file must contain the key secret on one line, nothing else"
+        quiet: true
+      vars:
+        garage_test_secret: "{{ garage_test_slurped.results[1].content | b64decode }}"
+      no_log: true
+
+    - name: Render again to prove idempotence
+      ansible.builtin.include_role:
+        name: garage
+        tasks_from: credentials
+
+    - name: Stat the credential files after the rerun
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: true
+      loop:
+        - "{{ garage_credentials_file }}"
+        - "{{ garage_secret_file }}"
+      register: garage_test_rerun_stats
+
+    - name: A rerun changes neither file
+      ansible.builtin.assert:
+        that:
+          - (garage_test_rerun_stats.results | map(attribute='stat.checksum') | list) ==
+            (garage_test_stats.results | map(attribute='stat.checksum') | list)
+        fail_msg: "a second credential render changed a file; the tasks are not idempotent"
+        quiet: true
+
+    - name: Remove the temporary root
+      ansible.builtin.file:
+        path: "{{ garage_test_root.path }}"
+        state: absent

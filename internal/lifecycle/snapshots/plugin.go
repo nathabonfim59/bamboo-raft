@@ -12,6 +12,7 @@ import (
 	"errors"
 	"log/slog"
 	"maps"
+	"math"
 	"sync"
 	"time"
 
@@ -50,6 +51,10 @@ type Store interface {
 	// jobs. It is never an optional capability.
 	SavingSnapshots(ctx context.Context, after *db.SnapshotCleanupCursor, limit int) ([]db.SavedSnapshot, *db.SnapshotCleanupCursor, error)
 
+	// LatestGeneration resolves the newest completed generation of a
+	// stopped source for a generation-backed save.
+	LatestGeneration(ctx context.Context, owner uuid.UUID, sandboxID string) (db.Generation, bool, error)
+
 	PurgeableSnapshots(ctx context.Context, after *db.SnapshotCleanupCursor, limit int) ([]db.SavedSnapshot, *db.SnapshotCleanupCursor, error)
 	CleanupArtifactsOnNode(ctx context.Context, nodeID string, after *db.SnapshotCleanupCursor, limit int) ([]db.SavedSnapshot, *db.SnapshotCleanupCursor, error)
 	SavedSnapshotByArtifact(ctx context.Context, artifactID string) (db.SavedSnapshot, bool, error)
@@ -62,6 +67,14 @@ type Store interface {
 
 var _ Store = (*db.Store)(nil)
 
+// GenerationCutter cuts a fresh generation of a ready sandbox under its
+// per-sandbox guard. *lifecycle.Worker implements it; the server binds the
+// plugin to the worker after both exist. A nil cutter keeps the node-local
+// saved-snapshot path (no object store configured).
+type GenerationCutter interface {
+	CutGeneration(ctx context.Context, lease *lifecycle.Lease, owner uuid.UUID, sandboxID string) (db.Generation, error)
+}
+
 // Options configures the frozen job plugin.
 type Options struct {
 	Store            Store
@@ -72,6 +85,9 @@ type Options struct {
 	InventoryTimeout time.Duration
 	RetryBase        time.Duration
 	MaxBackoff       time.Duration
+	// Cutter, when set, makes an object-store save pin a generation instead
+	// of a node artifact.
+	Cutter GenerationCutter
 }
 
 // Plugin owns the immutable saved-snapshot handlers.
@@ -84,6 +100,7 @@ type Plugin struct {
 	inventoryTimeout time.Duration
 	retryBase        time.Duration
 	maxBackoff       time.Duration
+	cutter           GenerationCutter
 	handlers         map[db.JobKind]lifecycle.Handler
 }
 
@@ -111,6 +128,7 @@ func New(opts Options) (*Plugin, error) {
 		inventoryTimeout: cmp.Or(opts.InventoryTimeout, DefaultInventoryTimeout),
 		retryBase:        cmp.Or(opts.RetryBase, DefaultRetryBase),
 		maxBackoff:       cmp.Or(opts.MaxBackoff, DefaultMaxBackoff),
+		cutter:           opts.Cutter,
 	}
 	p.handlers = map[db.JobKind]lifecycle.Handler{
 		db.JobSaveSnapshot:   p.save,
@@ -197,6 +215,9 @@ func (p *Plugin) save(ctx context.Context, job db.Job, lease *lifecycle.Lease) e
 	var payload db.SaveSnapshotPayload
 	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
 		return permanent("invalid save payload")
+	}
+	if p.cutter != nil {
+		return p.saveGeneration(ctx, job, lease, payload)
 	}
 	snap, err := p.store.SavedSnapshot(ctx, job.OwnerID, payload.SnapshotID)
 	if errors.Is(err, db.ErrNotFound) {
@@ -361,6 +382,132 @@ func (p *Plugin) saveOnNode(ctx context.Context, client lifecycle.NodeClient, sa
 		}
 	}
 	return 0, status.Error(codes.AlreadyExists, "snapshot id collision")
+}
+
+// validateGenerationSaveJob binds one generation-backed save job to its saved
+// row. Unlike a node-local save it never requires a node: the row has no node
+// artifact, and a stopped source may have no local disk at all.
+func validateGenerationSaveJob(job db.Job, payload db.SaveSnapshotPayload, snap db.SavedSnapshot) error {
+	if !db.ValidSnapshotArtifactID(payload.ArtifactID) || !db.ValidSnapshotArtifactID(snap.ArtifactID) {
+		return errors.New("snapshot artifact id is not canonical")
+	}
+	if job.SnapshotID == nil || *job.SnapshotID != payload.SnapshotID || snap.ID != payload.SnapshotID {
+		return errors.New("snapshot job id mismatch")
+	}
+	if job.SandboxID == nil || *job.SandboxID == "" || payload.VMID != *job.SandboxID ||
+		snap.SandboxID != *job.SandboxID {
+		return errors.New("snapshot job sandbox mismatch")
+	}
+	if snap.OwnerID != job.OwnerID {
+		return errors.New("snapshot row owner mismatch")
+	}
+	if snap.ArtifactID != payload.ArtifactID || snap.Generation != payload.Generation {
+		return errors.New("snapshot row generation mismatch")
+	}
+	return nil
+}
+
+// saveGeneration runs one object-store save: it pins the generation a READY
+// source captures now, or the latest completed generation of a STOPPED source
+// (whose stop already took the final offline generation). CutGeneration takes
+// the per-sandbox guard itself, so this path never holds it here.
+func (p *Plugin) saveGeneration(ctx context.Context, job db.Job, lease *lifecycle.Lease, payload db.SaveSnapshotPayload) error {
+	snap, err := p.store.SavedSnapshot(ctx, job.OwnerID, payload.SnapshotID)
+	if errors.Is(err, db.ErrNotFound) {
+		return permanent("snapshot missing")
+	}
+	if err != nil {
+		return retry("snapshot read failed", p.backoff(job.Attempts))
+	}
+	if err := validateGenerationSaveJob(job, payload, snap); err != nil {
+		return permanent("snapshot job does not match artifact")
+	}
+	if snap.Status != db.SnapshotSaving {
+		return nil // already done or terminally failed
+	}
+	if job.SandboxID == nil {
+		return permanent("missing sandbox id")
+	}
+	sbx, err := p.store.SandboxAny(ctx, job.OwnerID, *job.SandboxID)
+	if errors.Is(err, db.ErrNotFound) {
+		return p.failSnapshot(ctx, job, snap, "source missing")
+	}
+	if err != nil {
+		return retry("source read failed", p.backoff(job.Attempts))
+	}
+	if sbx.ID != *job.SandboxID || sbx.OwnerID != job.OwnerID {
+		return permanent("source sandbox does not match artifact")
+	}
+	if sbx.DeletedAt != nil {
+		return p.failSnapshot(ctx, job, snap, "source deleted")
+	}
+
+	var gen db.Generation
+	switch {
+	case readySourceState(sbx.State):
+		gen, err = p.cutter.CutGeneration(ctx, lease, job.OwnerID, sbx.ID)
+		if err != nil {
+			switch {
+			case errors.Is(err, lifecycle.ErrCutAborted):
+				return nil
+			case errors.Is(err, lifecycle.ErrCutSnapshotBusy):
+				return retry("snapshot in flight", p.backoff(job.Attempts))
+			case errors.Is(err, lifecycle.ErrCutSnapshotRefused):
+				return p.failSnapshot(ctx, job, snap, "node_cannot_snapshot")
+			case errors.Is(err, lifecycle.ErrCutSnapshotFailed):
+				return p.failSnapshot(ctx, job, snap, "snapshot_failed")
+			case errors.Is(err, lifecycle.ErrCutSourceUnavailable):
+				return p.failSnapshot(ctx, job, snap, "source_not_ready")
+			default:
+				return retry("generation cut failed", p.backoff(job.Attempts))
+			}
+		}
+		if lease.Lost() || ctx.Err() != nil {
+			// The claim or worker died while the cut ran. Never complete the
+			// saved row; redelivery or reconciliation owns the outcome.
+			return nil
+		}
+	case sbx.State == db.StateArchived:
+		// A stopped source pins the newest completed generation: the stop's
+		// final offline generation is the latest. A source with none cannot
+		// be saved.
+		latest, ok, err := p.store.LatestGeneration(ctx, job.OwnerID, sbx.ID)
+		if err != nil {
+			return retry("generation read failed", p.backoff(job.Attempts))
+		}
+		if !ok {
+			return p.failSnapshot(ctx, job, snap, "no_generation")
+		}
+		gen = latest
+	default:
+		return p.failSnapshot(ctx, job, snap, "source not ready")
+	}
+
+	if gen.ID == uuid.Nil() || gen.Status != db.GenerationCompleted || gen.ContentBytes > math.MaxInt64 {
+		return p.failSnapshot(ctx, job, snap, "generation_invalid")
+	}
+	size := int64(gen.ContentBytes)
+	_, _, err = p.store.CompleteSnapshotSave(ctx, db.CompleteSnapshotSaveParams{
+		Owner:        job.OwnerID,
+		SnapshotID:   snap.ID,
+		ArtifactID:   snap.ArtifactID,
+		Generation:   snap.Generation,
+		SizeBytes:    &size,
+		GenerationID: new(gen.ID),
+		JobID:        job.ID,
+		Worker:       job.LeasedBy,
+		Token:        job.LeaseToken,
+	})
+	switch {
+	case errors.Is(err, db.ErrJobNotLeased):
+		return nil
+	case errors.Is(err, db.ErrSnapshotNotFound):
+		return p.failSnapshot(ctx, job, snap, "generation_missing")
+	case err != nil:
+		return retry("snapshot completion failed", p.backoff(job.Attempts))
+	default:
+		return nil
+	}
 }
 
 // delete runs one snapshot.delete job. It re-reads the immutable row, refuses

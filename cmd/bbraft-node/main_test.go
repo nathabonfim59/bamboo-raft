@@ -302,6 +302,42 @@ func TestRunOvercommitWiring(t *testing.T) {
 	}
 }
 
+// TestRunVSockCIDRangeWiring drives -node.vsock-cid-range and its env
+// fallback into the manager Config; the empty default leaves both bounds zero
+// so the Manager applies its own default range.
+func TestRunVSockCIDRangeWiring(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		env     map[string]string
+		wantMin uint32
+		wantMax uint32
+	}{
+		{name: "default"},
+		{name: "flag", args: []string{"-node.vsock-cid-range=100-200"}, wantMin: 100, wantMax: 200},
+		{name: "env", env: map[string]string{"BBRAFT_NODE_VSOCK_CID_RANGE": "300-400"}, wantMin: 300, wantMax: 400},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := map[string]string{"BBRAFT_NODE_TOKEN": "tok"}
+			maps.Copy(env, tt.env)
+			d, s := devDeps(env)
+			d.serve = func(context.Context, nodelink.DialConfig, *grpc.Server) error {
+				s.add("serve")
+				close(s.serveCalled)
+				return nil
+			}
+			if err := runWithDeps(t.Context(), tt.args, io.Discard, d); err != nil {
+				t.Fatal(err)
+			}
+			if s.nodeCfg.MinCID != tt.wantMin || s.nodeCfg.MaxCID != tt.wantMax {
+				t.Fatalf("manager MinCID..MaxCID = %d..%d, want %d..%d",
+					s.nodeCfg.MinCID, s.nodeCfg.MaxCID, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
 func TestRunServeErrorStillShutsDown(t *testing.T) {
 	d, s := devDeps(map[string]string{"BBRAFT_NODE_TOKEN": "tok"})
 	want := errors.New("link loop failed")

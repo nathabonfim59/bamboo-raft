@@ -179,36 +179,5 @@
 
 # --- Credentials for bbraft (host only) -------------------------------------
 
-- name: Read the key's secret
-  ansible.builtin.command: garage -c {{ garage_config }} key info {{ garage_key_name }} --show-secret
-  register: garage_key_secret
-  changed_when: false
-  check_mode: false   # read-only probe; must run in --check too
-  no_log: true
-  when: not ansible_check_mode
-
-- name: bbraft config directory
-  ansible.builtin.file:
-    path: "{{ garage_credentials_file | dirname }}"
-    state: directory
-    owner: root
-    group: root
-    mode: "0750"
-
-- name: Write the S3 credentials for bbraft
-  ansible.builtin.copy:
-    dest: "{{ garage_credentials_file }}"
-    owner: root
-    group: root
-    mode: "0600"
-    content: |
-      # Managed by bamboo-raft infra/ansible (role garage). Secret; never copy
-      # into the repository.
-      BBRAFT_S3_ENDPOINT=http://{{ garage_s3_bind }}
-      BBRAFT_S3_REGION={{ garage_region }}
-      BBRAFT_S3_BUCKET={{ garage_bucket }}
-      BBRAFT_S3_PATH_STYLE=true
-      BBRAFT_S3_ACCESS_KEY_ID={{ garage_key_secret.stdout | regex_search('Key ID:\s*(\S+)', '\1') | first }}
-      BBRAFT_S3_SECRET_ACCESS_KEY={{ garage_key_secret.stdout | regex_search('Secret key:\s*(\S+)', '\1') | first }}
-  no_log: true
-  when: not ansible_check_mode
+- name: Write the S3 settings and secret files
+  ansible.builtin.import_tasks: credentials.yml

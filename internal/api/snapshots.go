@@ -98,7 +98,7 @@ type savedSnapshotHandlers struct {
 // save serves POST /api/v1/saved-snapshots. The body is strict
 // {sandboxId,name}; the name and source checks produce the finite matrix:
 // invalid_json, invalid_name, unauthorized, not_found, sandbox_not_ready,
-// save_in_progress and http_500.
+// snapshot_data_expired, save_in_progress and http_500.
 func (h *savedSnapshotHandlers) save(w http.ResponseWriter, r *http.Request) {
 	owner, apiErr := coreOwner(r)
 	if apiErr != nil {
@@ -263,6 +263,12 @@ func (h *savedSnapshotHandlers) saveFailure(ctx context.Context, err error) *api
 	case errors.Is(err, db.ErrSnapshotSourceNotReady):
 		return apierr.New(http.StatusConflict, apierr.CodeSandboxNotReady,
 			"the sandbox is not ready to be saved")
+	case errors.Is(err, db.ErrSnapshotsDisabled):
+		return apierr.New(http.StatusConflict, apierr.CodeSnapshotsDisabled,
+			"snapshots are disabled for this sandbox")
+	case errors.Is(err, db.ErrSnapshotDataExpired):
+		return apierr.New(http.StatusConflict, apierr.CodeSnapshotDataExpired,
+			"the sandbox's stored data expired; it cannot be saved").Retryable(false)
 	default:
 		h.logger.ErrorContext(ctx, "api: saved snapshot save failed", "error", coreErrorName(err))
 		return coreInternal()

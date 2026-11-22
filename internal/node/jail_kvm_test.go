@@ -31,6 +31,11 @@ package node
 //	  BBRAFT_TEST_KVM_JAIL_UNITS=$units BBRAFT_TEST_KVM_JAIL_BIN=$dir \
 //	  "$dir/node.test" -test.run '^TestKVMJail' -test.v -test.timeout 90m
 //
+// Phase 2 conformance (Link and Direct) also needs the pinned garage binary on
+// PATH and BBRAFT_TEST_S3_GARAGE=1 (jail-acceptance.sh sets it): see
+// jail_kvm_phase2_test.go for how the node's namespace reaches Garage and how
+// the role-rendered unit gets its S3 settings.
+//
 // Ownership: every unit, drop-in, config/data/stage dir, netns and cgroup
 // is attempt-unique; the harness refuses to start if any object of that
 // identity exists or is loaded, captures each object's identity right after
@@ -47,6 +52,7 @@ import (
 	"time"
 
 	"github.com/nathabonfim59/bamboo-raft/internal/nodetest"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore/s3/s3test"
 	"github.com/nathabonfim59/bamboo-raft/internal/proto/nodev1"
 )
 
@@ -137,8 +143,13 @@ func jailKVMRootfsBytes(t *testing.T, c nodev1.NodeClient, id string) uint64 {
 	return n
 }
 
-// TestKVMJailAcceptance runs Phase 1 conformance, SSH and the jail
-// inspection over Link (production main) and Direct (test helper).
+// TestKVMJailAcceptance runs Phase 1 and Phase 2 conformance (snapshots,
+// restores, reset against a real Garage), SSH, the jail inspection and the
+// inspection of a maintenance QEMU over Link (production main) and Direct
+// (test helper). Phase 2 needs the garage binary on PATH and
+// BBRAFT_TEST_S3_GARAGE=1 (jail-acceptance.sh sets it); the node reaches the
+// bucket through a forwarder inside its namespace and reads its S3 settings
+// from the role-rendered unit (jail_kvm_phase2_test.go).
 func TestKVMJailAcceptance(t *testing.T) {
 	env := jailKVMRequire(t)
 	for _, tc := range []struct {
@@ -149,14 +160,25 @@ func TestKVMJailAcceptance(t *testing.T) {
 		{name: "Direct", direct: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// Garage first: its cleanup then runs after the attempt's teardown.
+			s3cfg := s3test.StartGarage(t)
+			upstream, err := jailKVMGarageUpstream(s3cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := jailKVMS3Store(t, s3cfg)
 			tp := kvmNetNewTopology(t, "j"+strings.ToLower(tc.name[:1]))
 			tp.createNamespaces(t, true)
 			a := env.attempt(t, strings.ToLower(tc.name), tp)
 			a.stage(t)
+			fwd := a.startS3Forwarder(t, upstream)
+			a.writeS3(t, s3cfg)
 			var client nodev1.NodeClient
 			if tc.direct {
 				a.install(t, a.directExec(t))
+				a.assertS3Loaded(t)
 				inv := a.start(t)
+				a.assertS3Credential(t, inv)
 				a.assertBoundary(t, inv)
 				// The helper logs the same startup phases (including the
 				// local-CID exclusion from node.New) and is ready only after
@@ -166,20 +188,34 @@ func TestKVMJailAcceptance(t *testing.T) {
 			} else {
 				hub := a.startHub(t)
 				a.install(t, nil)
+				a.assertS3Loaded(t)
 				inv := a.start(t)
+				a.assertS3Credential(t, inv)
 				a.assertBoundary(t, inv)
 				a.assertStartupLog(t, inv)
 				client = a.waitLink(t, hub).Client
 			}
 			tp.client = client
-			t.Run("AllPhase1", func(t *testing.T) {
+			// The Phase 2 restore path one step at a time, with numbers, before
+			// the all-in-one suite: a failure says which step the jail breaks.
+			// Its VMs are deleted by the subtest's own cleanups, so none of
+			// them holds capacity when AllPhase1 starts; the offer is logged
+			// once to show it (nodetest keeps up to four VMs alive at once,
+			// so the jailed runs use one vCPU each: 4 vCPUs fit the node's
+			// offer where 4 x 2 did not).
+			t.Run("RestoreSteps", func(t *testing.T) { a.restoreSteps(t, client, store) })
+			a.logOffer(t, client, "before AllPhase1")
+			if !t.Run("AllPhase1", func(t *testing.T) {
 				nodetest.Run(t, client, nodetest.Options{
-					Resources:   &nodev1.Resources{Vcpus: 2, MemoryMib: 2048, DiskGib: 10},
+					Resources:   &nodev1.Resources{Vcpus: 1, MemoryMib: 2048, DiskGib: 10},
 					BootTimeout: 3 * time.Minute,
 					FenceWatch:  3 * time.Minute,
 					Phase1:      nodetest.AllPhase1,
+					Phase2:      nodetest.Phase2{Snapshots: true, Reset: true, Store: store},
 				})
-			})
+			}) {
+				a.logNodeJournal(t)
+			}
 			tp.sshAcceptance(t, client, a.rendered.DataDir+"/net")
 			t.Run("JailInspection", func(t *testing.T) {
 				const ida, idb = "bx_aaaaaaaa", "bx_bbbbbbbb"
@@ -210,6 +246,9 @@ func TestKVMJailAcceptance(t *testing.T) {
 					}
 				}
 			})
+			if !t.Run("MaintenanceInspection", func(t *testing.T) { a.maintenanceInspection(t, client, fwd) }) {
+				a.logNodeJournal(t)
+			}
 			tp.assertNoSandboxResources(t, a.rendered.DataDir+"/net")
 		})
 	}

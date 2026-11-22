@@ -64,6 +64,9 @@ func (w *Worker) resumeSandbox(ctx context.Context, job db.Job, lease *Lease) er
 	if p.NodeID != derefNode(sbx.NodeID) || p.Resources != sbx.Desired || p.MachineType != sbx.MachineType {
 		return permanent("job payload does not match sandbox")
 	}
+	if p.FromManifest != "" {
+		return w.resumeElsewhere(ctx, job, lease, guard, opCtx, sbx, p)
+	}
 
 	env, err := w.store.DecryptSandboxEnvForNode(ctx, owner, sandboxID)
 	if err != nil {
@@ -106,14 +109,21 @@ func (w *Worker) resumeSandbox(ctx context.Context, job db.Job, lease *Lease) er
 			status.Error(codes.Internal, "StartVM returned a non-ready VM"))
 	}
 
-	// Success: verify nothing superseded this generation while the RPC ran,
-	// then finalize under the claim.
-	sbx, err = w.readResumeTarget(ctx, job, owner, sandboxID, p)
+	_, err = w.finalizeResumeReady(ctx, job, guard, opCtx, p)
+	return err
+}
+
+// finalizeResumeReady finalizes a resume whose VM answered READY: it verifies
+// nothing superseded this generation while the RPC ran, then finalizes under
+// the claim. finalized reports that this call committed the READY state.
+func (w *Worker) finalizeResumeReady(ctx context.Context, job db.Job, guard *db.SandboxGuard, opCtx context.Context, p db.ResumePayload) (finalized bool, _ error) {
+	owner, sandboxID := job.OwnerID, *job.SandboxID
+	sbx, err := w.readResumeTarget(ctx, job, owner, sandboxID, p)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if sbx.State != db.StateProvisioning {
-		return nil
+		return false, nil
 	}
 	if sbx.DeletedAt != nil {
 		// The VM is running for a deleted row: the deletion owns everything,
@@ -122,30 +132,30 @@ func (w *Worker) resumeSandbox(ctx context.Context, job db.Job, lease *Lease) er
 		if err := w.deleteVMUnderGuard(opCtx, guard, sbx); err != nil {
 			w.log.Warn("deleted-sandbox compensation failed", "sandbox", sbx.ID, "reason", classify(err))
 		}
-		return nil
+		return false, nil
 	}
 	_, err = w.store.FinalizeSandboxResume(ctx, job.ID, w.workerID, job.LeaseToken, db.FinalizeResumeParams{
 		Owner: owner, SandboxID: sandboxID, Generation: p.Generation, Version: sbx.Version,
 	})
 	switch {
 	case err == nil:
-		return nil
+		return true, nil
 	case errors.Is(err, db.ErrJobNotLeased), errors.Is(err, db.ErrNotFound):
-		return nil
+		return false, nil
 	case errors.Is(err, db.ErrConflict):
 		// A racing PATCH can bump the version while the row still wants this
 		// boot: retry so a fresh attempt finalizes, and only stop for an
 		// authoritative newer outcome.
 		decided, derr := w.resumeConflictDecided(ctx, job, owner, sandboxID, p.Generation)
 		if derr != nil {
-			return derr
+			return false, derr
 		}
 		if decided {
-			return nil
+			return false, nil
 		}
-		return retry("resume finalization conflict", w.backoff(job.Attempts))
+		return false, retry("resume finalization conflict", w.backoff(job.Attempts))
 	default:
-		return retry("resume finalization failed", w.backoff(job.Attempts))
+		return false, retry("resume finalization failed", w.backoff(job.Attempts))
 	}
 }
 

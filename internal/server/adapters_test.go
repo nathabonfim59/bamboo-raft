@@ -717,3 +717,19 @@ func TestRestoreLookupCallerCancelIsPreserved(t *testing.T) {
 		t.Fatal("caller cancel was classified as a capacity refusal")
 	}
 }
+
+func (s *fakeRestoreStore) CreateSandboxes(context.Context, []db.CreateSandboxParams) ([]db.CreateSandboxResult, error) {
+	return nil, errors.New("fakeRestoreStore: batch create not used")
+}
+
+func (s *fakeRestoreStore) ReplayCreateSandboxBatch(context.Context, uuid.UUID, string, []byte) ([]db.CreateSandboxResult, bool, error) {
+	return nil, false, nil
+}
+
+func (s *blockingRestoreStore) CreateSandboxes(context.Context, []db.CreateSandboxParams) ([]db.CreateSandboxResult, error) {
+	return nil, errors.New("blockingRestoreStore: batch create not used")
+}
+
+func (s *blockingRestoreStore) ReplayCreateSandboxBatch(context.Context, uuid.UUID, string, []byte) ([]db.CreateSandboxResult, bool, error) {
+	return nil, false, nil
+}

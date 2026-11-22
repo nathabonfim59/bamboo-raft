@@ -371,6 +371,14 @@ func TestKVMJailDirectHelper(t *testing.T) {
 		t.Fatalf("node networking: check host: %v", err)
 	}
 	log.Info("vm networking ready", "network_mode", "tap", "bridge", s.Network.Bridge, "prefix", s.Network.Prefix)
+	// The object store the way bbraft-node gets it: -s3.* resolved from the
+	// unit's BBRAFT_S3_* environment (the role-rendered EnvironmentFile and
+	// credential), reaching the bucket through the netns forwarder.
+	store, err := jailKVMDirectObjectStore(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.Info("object store configured")
 	admitted := host
 	mgr, err := New(ctx, Config{
 		NodeID: s.NodeID, DataDir: s.DataDir, ImageDir: s.ImageDir, DefaultImage: s.DefaultImage,
@@ -378,6 +386,7 @@ func TestKVMJailDirectHelper(t *testing.T) {
 		BootTimeout: s.BootTimeout, Log: log, Nested: s.Nested, CPUFeatures: cpu.Features,
 		Jailer: jm, QemuVersion: ev.QEMUVersion, HostCPU: &admitted, JailBinary: s.QEMUBinary,
 		JailToolBinary: s.ToolBinary, JailIO: s.IO, Network: network,
+		Store: store, ChunkCacheBytes: int64(s.ChunkCacheBytes), Phase2: ev.Phase2,
 	})
 	if err != nil {
 		t.Fatalf("node: %v", err)

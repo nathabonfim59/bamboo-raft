@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -755,8 +756,22 @@ type fakeQMPServer struct {
 	// onPowerdown runs when system_powerdown arrives (under mu); StopVM
 	// tests use it to emulate a guest honoring the ACPI request.
 	onPowerdown func()
-	quit        chan struct{}
-	quitOnce    sync.Once
+	// reboots lists every set-action reboot value in arrival order, and
+	// resets counts system_reset commands; resetErr makes system_reset fail.
+	// order records set-action and system_reset as they arrive, so a reset
+	// test can assert their interleaving.
+	reboots  []string
+	resets   int
+	resetErr error
+	order    []string
+	// onReset runs after a successful system_reset, outside mu; ResetVM tests
+	// use it to emulate the guest machine restarting.
+	onReset  func()
+	quit     chan struct{}
+	quitOnce sync.Once
+	// p2 models the Phase 2 QMP surface: rootdisk's dirty bitmaps, the
+	// prelaunch state of a paused launch and the schema (phase2_launch_test.go).
+	p2 bitmapFakeState
 }
 
 func startFakeQMP(t *testing.T, name string) *fakeQMPServer {
@@ -811,17 +826,71 @@ func (s *fakeQMPServer) handle(conn net.Conn) {
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		var req struct {
-			Execute string `json:"execute"`
-			ID      uint64 `json:"id"`
+			Execute   string         `json:"execute"`
+			Arguments jsontext.Value `json:"arguments"`
+			ID        uint64         `json:"id"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
 			return
+		}
+		// The reset surface is answered here, before the general lock, so the
+		// command order stays exact and onReset can call back into the
+		// manager without holding the fake's lock.
+		switch req.Execute {
+		case "set-action":
+			var a struct {
+				Reboot string `json:"reboot"`
+			}
+			if len(req.Arguments) > 0 {
+				if err := json.Unmarshal(req.Arguments, &a); err != nil {
+					writeQMPError(conn, req.ID, "bad set-action arguments: "+err.Error())
+					return
+				}
+			}
+			s.mu.Lock()
+			s.reboots = append(s.reboots, a.Reboot)
+			s.order = append(s.order, "set-action:"+a.Reboot)
+			s.mu.Unlock()
+			writeQMPResult(conn, req.ID, map[string]any{})
+			continue
+		case "system_reset":
+			s.mu.Lock()
+			resetErr, onReset := s.resetErr, s.onReset
+			s.order = append(s.order, "system_reset")
+			if resetErr == nil {
+				s.resets++
+			}
+			s.mu.Unlock()
+			if resetErr != nil {
+				writeQMPError(conn, req.ID, resetErr.Error())
+				continue
+			}
+			if onReset != nil {
+				onReset()
+			}
+			writeQMPResult(conn, req.ID, map[string]any{})
+			continue
 		}
 		var result any = map[string]any{}
 		status := "running"
 		s.mu.Lock()
 		if s.paused || s.startPaused && s.cont == 0 {
 			status = "paused"
+		}
+		if s.p2.prelaunch && s.cont == 0 {
+			status = "prelaunch"
+		}
+		if r, qerr, ok := s.p2.handleLocked(req.Execute, req.Arguments); ok {
+			s.mu.Unlock()
+			msg := map[string]any{"return": r, "id": req.ID}
+			if qerr != "" {
+				msg = map[string]any{"error": map[string]any{"class": "GenericError", "desc": qerr}, "id": req.ID}
+			}
+			raw, _ := json.Marshal(msg)
+			if _, err := conn.Write(append(raw, '\n')); err != nil {
+				return
+			}
+			continue
 		}
 		switch req.Execute {
 		case "stop":
@@ -874,6 +943,40 @@ func (s *fakeQMPServer) handle(conn net.Conn) {
 			return
 		}
 	}
+}
+
+// writeQMPResult answers one QMP request with a result.
+func writeQMPResult(conn net.Conn, id uint64, result any) {
+	raw, _ := json.Marshal(map[string]any{"return": result, "id": id})
+	conn.Write(append(raw, '\n'))
+}
+
+// writeQMPError answers one QMP request with one GenericError.
+func writeQMPError(conn net.Conn, id uint64, desc string) {
+	raw, _ := json.Marshal(map[string]any{"error": map[string]any{"class": "GenericError", "desc": desc}, "id": id})
+	conn.Write(append(raw, '\n'))
+}
+
+// resetCommands returns the set-action and system_reset commands in arrival
+// order.
+func (s *fakeQMPServer) resetCommands() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.order)
+}
+
+// resetCount returns how many system_reset commands succeeded.
+func (s *fakeQMPServer) resetCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resets
+}
+
+// rebootActions returns every set-action reboot value in arrival order.
+func (s *fakeQMPServer) rebootActions() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.reboots)
 }
 
 // gatedPingGuest blocks Ping until the test releases it, so the terminal

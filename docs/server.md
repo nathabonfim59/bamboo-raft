@@ -77,6 +77,36 @@ Transport rules (enforced at startup):
   absolute `http`/`https`, have a hostname, and carry no userinfo, query or
   fragment.
 
+## Phase 2 configuration
+
+These settings turn on the object-store features: snapshots, fork, cross-node
+resume, node loss, retention and disk-pressure eviction. Object storage is off
+unless `-s3.bucket` (or `BBRAFT_S3_BUCKET`) is set; see
+[Object storage](#object-storage) for the secret-file rules and
+[Lifecycle](#lifecycle) for when each worker runs.
+
+| Setting | Flag | Env | Default |
+|---|---|---|---|
+| [Object-store endpoint](#object-storage) | `-s3.endpoint` | `BBRAFT_S3_ENDPOINT` | empty (AWS S3) |
+| Object-store region | `-s3.region` | `BBRAFT_S3_REGION` | `us-east-1` on AWS; required with a custom endpoint |
+| Bucket | `-s3.bucket` | `BBRAFT_S3_BUCKET` | empty (object store off) |
+| Path-style addressing | `-s3.path-style` | `BBRAFT_S3_PATH_STYLE` | `false` |
+| Access key id | `-s3.access-key-id` | `BBRAFT_S3_ACCESS_KEY_ID` | none; required with a bucket |
+| Secret access key file | `-s3.secret-access-key-file` | `BBRAFT_S3_SECRET_ACCESS_KEY_FILE` (or `BBRAFT_S3_SECRET_ACCESS_KEY`) | none; required with a bucket |
+| Create the bucket | `-s3.create-bucket` | `BBRAFT_S3_CREATE_BUCKET` | `false` |
+| Created-bucket location hint | `-s3.location-hint` | `BBRAFT_S3_LOCATION_HINT` | empty (R2 only) |
+| [Snapshot interval](#lifecycle) | `-lifecycle.snapshot-interval-seconds` | `BBRAFT_LIFECYCLE_SNAPSHOT_INTERVAL_SECONDS` | `60` |
+| Snapshot call timeout | `-lifecycle.snapshot-timeout-seconds` | `BBRAFT_LIFECYCLE_SNAPSHOT_TIMEOUT_SECONDS` | `600` |
+| [Node-loss grace](#node-loss) | `-lifecycle.node-lost-seconds` | `BBRAFT_LIFECYCLE_NODE_LOST_SECONDS` | `120` (`0` off; else at least `60`) |
+| [Data retention](#auto-stop-and-stopped-disk-retention) | `-lifecycle.data-retention-seconds` | `BBRAFT_LIFECYCLE_DATA_RETENTION_SECONDS` | `1209600` (fourteen days; `0` never) |
+| [Disk-pressure threshold](#disk-pressure-eviction) | `-lifecycle.disk-low-percent` | `BBRAFT_LIFECYCLE_DISK_LOW_PERCENT` | `10` (`0` off; else `1`-`90`) |
+| [Stopped-row retention](#auto-stop-and-stopped-disk-retention) | `-lifecycle.stopped-retention-seconds` | `BBRAFT_LIFECYCLE_STOPPED_RETENTION_SECONDS` | `604800` without an object store, `0` with one |
+
+The snapshot worker, node loss, object-store data retention and eviction are
+inert without an object store, and so is chunk garbage collection (its `-gc.*`
+flags are in [its own section](#chunk-garbage-collection)); the stopped-row
+retention still applies.
+
 ## Authentication bootstrap
 
 At startup the `api` role loads the key file once, creates or maps every
@@ -159,7 +189,27 @@ The `lifecycle` role uses its own store and gateway dialer. Intervals:
 | `-lifecycle.retry-seconds` | `5` | `BBRAFT_LIFECYCLE_RETRY_SECONDS` |
 | `-lifecycle.reaper-seconds` | `60` | `BBRAFT_LIFECYCLE_REAPER_SECONDS` |
 | `-lifecycle.job-poll-seconds` | `15` | `BBRAFT_LIFECYCLE_JOB_POLL_SECONDS` |
-| `-lifecycle.stopped-retention-seconds` | `604800` (seven days) | `BBRAFT_LIFECYCLE_STOPPED_RETENTION_SECONDS` |
+| `-lifecycle.stopped-retention-seconds` | `604800` (seven days) without an object store, `0` (off) with one | `BBRAFT_LIFECYCLE_STOPPED_RETENTION_SECONDS` |
+| `-lifecycle.data-retention-seconds` | `1209600` (fourteen days; `0` never) | `BBRAFT_LIFECYCLE_DATA_RETENTION_SECONDS` |
+| `-lifecycle.snapshot-interval-seconds` | `60` | `BBRAFT_LIFECYCLE_SNAPSHOT_INTERVAL_SECONDS` |
+| `-lifecycle.snapshot-timeout-seconds` | `600` | `BBRAFT_LIFECYCLE_SNAPSHOT_TIMEOUT_SECONDS` |
+| `-lifecycle.node-lost-seconds` | `120` (`0` disables, else at least `60`) | `BBRAFT_LIFECYCLE_NODE_LOST_SECONDS` |
+| `-lifecycle.disk-low-percent` | `10` (`0` disables, else `1`–`90`) | `BBRAFT_LIFECYCLE_DISK_LOW_PERCENT` |
+
+With an object store configured, every ready sandbox with snapshots on gets a
+generation every `-lifecycle.snapshot-interval-seconds` (±10 % jitter): the
+lifecycle role enqueues one `sandbox.snapshot` job per due sandbox, and the
+job asks the sandbox's node for `SnapshotVM` under the per-sandbox guard,
+bounded by `-lifecycle.snapshot-timeout-seconds`. A node that refuses
+(`FAILED_PRECONDITION`, for example a node without an object store) is logged
+once per sandbox and node and retried after ten intervals; the sandbox is
+never failed for it. A stop writes a final generation from the stopped disk
+after the VM is off; if that fails the stop is `failing` and retries, unless
+`force` was asked, which stops with the previous generation. A sandbox created
+with `snapshots: false` is never uploaded: its stop deletes the VM and its
+disk, and it cannot be resumed (`409 snapshots_disabled`). Without an object
+store the role behaves as in Phase 1: no snapshot jobs, and stops keep only
+the node-local disk.
 
 Handlers are fixed at worker construction. The lifecycle role constructs the
 saved-snapshot plugin once, passes `plugin.Handlers()` through
@@ -180,18 +230,236 @@ An archived sandbox keeps its retained disk until one of:
 
 1. a resume boots it again on the same node (capacity is re-reserved
    atomically there),
-2. the stopped-retention reaper deletes it, or
-3. an explicit `DELETE`.
+2. its stored data expires (see below),
+3. the stopped-retention reaper deletes it,
+4. a disk-pressure eviction gives the disk up (below), or
+5. an explicit `DELETE`.
 
 The stopped-retention reaper deletes sandboxes that have been stopped longer
-than `-lifecycle.stopped-retention-seconds` (default seven days; `0` disables
-retention deletion; the value must be nonnegative and fit a duration). It
-records an ordinary explicit deletion and uses the normal deletion acceptance
-and delete worker: the acceptance rechecks state, stopped time and concurrent
-stop/resume work under the row lock, so an old candidate can never delete a
-sandbox that resumed meanwhile, and capacity is released exactly once. A
-resume that fails against a missing retained disk ends in a terminal error
-without creating a replacement disk.
+than `-lifecycle.stopped-retention-seconds` (`0` disables retention deletion;
+the value must be nonnegative and fit a duration). Without an object store the
+default is seven days; with one the default is `0` (off), because the data
+itself expires instead and the row should survive so the client can still see
+what happened to its sandbox. It records an ordinary explicit deletion and uses
+the normal deletion acceptance and delete worker: the acceptance rechecks
+state, stopped time and concurrent stop/resume work under the row lock, so an
+old candidate can never delete a sandbox that resumed meanwhile, and capacity
+is released exactly once. A resume that fails against a missing retained disk
+ends in a terminal error without creating a replacement disk.
+
+With an object store configured, the **data-retention reaper** expires the
+stored data of an archived sandbox stopped longer than
+`-lifecycle.data-retention-seconds` (`BBRAFT_LIFECYCLE_DATA_RETENTION_SECONDS`,
+default 14 days; `0` never expires data). Each candidate is accepted in its own
+transaction that rechecks state, stopped time, expiry and concurrent
+stop/resume work under the row lock, oldest stop first. Acceptance sets
+`dataExpiredAt` on the sandbox, releases the retained disk reservation exactly
+once, clears the local disk reference and records an eviction so VM
+reconciliation deletes the copy on the node that held it. The sandbox row
+stays in `archived` with `dataExpiredAt` until an explicit `DELETE`, and an
+event `sandbox.data_expired` records the transition. Resume, fork and
+`POST /saved-snapshots` from an expired sandbox answer
+`409 snapshot_data_expired`. Saved snapshots never expire: they are independent
+artifacts, and one taken before the source expired stays restorable.
+
+Without an object store there is no stored data to expire, so data retention is
+always off and Phase 1's stopped-disk deletion above is the only reaper
+window.
+
+### Node loss
+
+With an object store configured (without one there is nowhere to continue
+from, so node loss stays off), a node is **lost** when the inventory has not
+observed it connected for
+`-lifecycle.node-lost-seconds` (default 120 s; `0` turns node loss off, and any
+other value must be at least 60 s, two inventory polls). A link that drops and
+comes back within that grace moves nothing. The reaper checks every round and,
+for each sandbox of a lost node, decides under the sandbox's guard (so no
+snapshot, stop or resume call is in flight for it) and commits in one
+transaction that rechecks the row and that the node is still lost, so two
+lifecycle workers never act twice on one sandbox:
+
+| Sandbox on the lost node | Snapshot generation | Outcome |
+|---|---|---|
+| ready / idle / running | completed generation | moved: `provisioning` on another node, which restores the last generation (`sandbox.moved` event, chain continued); writes after that generation are lost |
+| ready / idle / running | none, or snapshots off | `error`, reason `node_lost` |
+| archived, disk on the node | completed generation | stays archived with its disk only in the object store; the next resume restores it on another node |
+| archived, disk on the node | none | unchanged: that disk is the only copy, and resume waits for the node |
+| archiving (stop in flight) | completed generation | stop completed, archived from that generation; later writes are lost |
+| archiving (stop in flight) | none | unchanged: the stop keeps retrying |
+| provisioning | | left to its job |
+
+A move places the sandbox like a cross-node resume: never on the lost node or
+a node that still holds an evicted copy, only on nodes with the generation's
+image and a working object store, with a disk never smaller than the
+generation's. When no node has room the sandbox stays where it is (one
+warning) and is moved on a later round. If the restore then fails for good,
+the sandbox ends stopped with no local disk, like a failed cross-node resume.
+Every outcome releases the lost node's reservation and records its copy as an
+eviction: when the node returns, VM reconciliation deletes that copy before
+anything else looks at its inventory, so it is never reported unknown,
+started or snapshotted, and capacity accounting never counts it. Until then
+the old VM may still run on a node that is only cut off from the control
+plane; nothing reaches it through the API.
+
+Node loss therefore assumes the lost node is really gone. A node that is only
+cut off from the server keeps running its copy of a moved sandbox, guest
+network included, until it reconnects; reconciliation then deletes that copy
+first, and anything written to it after the sandbox's last completed
+generation is lost. This release has no node-side self-fence: a node never
+stops its own VMs because it has lost the server. A later candidate is for the
+node to stop its VMs once it has been out of touch with the server for longer
+than the grace.
+
+Three guards keep an outage of the control plane itself from looking like
+node loss:
+
+1. **Startup.** A lifecycle worker does nothing for node loss until it has
+   run for the grace, so nodes can reconnect after a server restart.
+2. **Observer.** A node counts as lost only while at least one other node was
+   observed within the grace. When every node is stale at once, the
+   inventory poller (the `nodehub` role) is the likelier failure, and with
+   split roles a `nodehub` outage would otherwise move or fail every sandbox
+   of the install. A single-node install therefore never declares its node
+   lost: its sandboxes wait for that node, which is also the only place they
+   could run.
+3. **Live probe.** A node whose `Info` still answers through the gateway is
+   not lost, whatever its inventory row says.
+
+A `nodehub` restarted alone while the lifecycle role keeps running can still
+see a node that reconnects slowly as lost once another node has reconnected;
+the live probe narrows that window, and running the roles in one process (the
+default) avoids it.
+
+### Disk-pressure eviction
+
+With an object store configured (without one a stopped sandbox's retained
+disk is the only copy, so eviction stays off), each reaper round finds the
+nodes whose reported free disk is below `-lifecycle.disk-low-percent` of
+their total (default 10; `0` disables, and values above 90 are refused).
+On each pressured node it gives up retained stopped disks, least recently
+stopped first, until the node's estimated free disk reaches the threshold;
+the next inventory poll corrects the estimate.
+
+A disk is only ever given up when it equals the stop's final generation —
+the completed generation cut at or after the stop was requested — so the
+eviction loses nothing. The eviction commits first: one transaction that
+rechecks the row releases the disk reservation, clears the node and
+local-disk pointers, records a `sandbox.disk_evicted` event with reason
+`disk_pressure` and opens an eviction row for the copy. A resume admitted
+after the commit already sees no local disk and restores from the store.
+The node's copy is then deleted — right away, or by VM reconciliation when
+the first delete fails, before anything else uses that node's inventory. A
+stopped sandbox without that generation is never a candidate. After the
+eviction the disk exists only in the object store, and a later resume
+restores it through the ordinary resume path, possibly on the same node.
+
+## Chunk garbage collection
+
+With an object store configured, the lifecycle role runs a collector that
+deletes chunk and manifest objects no generation can restore any more. Only the
+server deletes objects.
+
+| Flag | Default | Env |
+|---|---|---|
+| `-gc.interval-seconds` | `21600` (six hours) | `BBRAFT_GC_INTERVAL_SECONDS` |
+| `-gc.grace-seconds` | `86400` (one day) | `BBRAFT_GC_GRACE_SECONDS` |
+| `-gc.history-seconds` | `86400` (one day) | `BBRAFT_GC_HISTORY_SECONDS` |
+| `-gc.batch` | `1000` | `BBRAFT_GC_BATCH` |
+
+A generation is **live**, and its manifest and chunks are kept, when it is:
+
+1. the latest completed generation of the chain of a sandbox that is neither
+   deleted nor expired, or a completed generation of such a sandbox cut within
+   `-gc.history-seconds`;
+2. the generation such a sandbox was restored from (create from a generation,
+   fork, resume on another node, node loss), until the sandbox has a completed
+   generation of its own that was cut after the restore;
+3. newer than the latest completed generation of such a sandbox, in any status
+   (a failed attempt may have written a manifest whose chunks the next attempt
+   skips uploading) and its manifest exists;
+4. pinned by a saved snapshot that is not deleted or retired, or by a queued or
+   running job (a fork, restore or resume reads it);
+5. pending, for any sandbox: an attempt may still be writing it.
+
+A round marks every manifest in the store that is not a sweep candidate (live,
+or younger than `-gc.grace-seconds`) and deletes manifests of generations that
+are not live and older than the grace, then chunks that no marked manifest
+names and that are older than the grace. A listing or read error aborts the
+round: nothing is deleted that the round could not prove dead. A deleted
+manifest's generation is marked purged and leaves the listings.
+
+An attempt may skip uploading a chunk that exists, so a sweep must not delete a
+chunk an attempt is about to reference. The collector deletes in batches of
+`-gc.batch` objects, each under a fence: it sets the `sweeping` flag in the
+database (a snapshot attempt does not begin while it is set; the snapshot job
+retries a few seconds later), waits until no attempt that could still be writing
+remains (pending, or failed by a takeover before its deadline), re-reads the
+generations that became live meanwhile, and only then purges the batch and
+deletes its objects before clearing the flag. An attempt whose owner died keeps
+the sweep waiting until its deadline plus a minute, and so does a failed or
+taken-over one while its call may still run: only the attempt's own deadline
+proves that call ended. The wait is capped at
+`-lifecycle.snapshot-timeout-seconds` plus that minute, after which the batch is
+dropped, the flag cleared and the round stops (the next round starts over). Two lifecycle roles never sweep at once: the
+second finds the flag set and skips its round.
+
+If a collector dies mid-sweep the flag stays set and snapshot attempts are
+refused. The flag records when its sweep started; one older than the wait cap
+plus ten minutes is a crashed sweep's. The collector clears such a flag at
+start and every minute, and a round that finds one takes it over.
+
+Each round logs one `gc round finished` line at info level with the manifests
+and chunks marked, chunks kept, chunks and manifests deleted, bytes freed and
+the number of batches.
+
+## Object storage
+
+Snapshot data lives in one S3-compatible bucket per installation: Garage
+(the default, self-hosted), Cloudflare R2, AWS S3 or another service that
+offers the core S3 operations. Configuration selects the service; no other
+part of the deployment changes. The `bbraft-server` and `bbraft-node` binaries
+share one `-s3.*` flag set, so the same variable names configure both.
+
+| Flag | Env | Notes |
+|---|---|---|
+| `-s3.endpoint` | `BBRAFT_S3_ENDPOINT` | `http(s)://host[:port]`; empty means AWS S3 |
+| `-s3.region` | `BBRAFT_S3_REGION` | the service's configured region, `auto` for R2, the bucket's region on AWS |
+| `-s3.bucket` | `BBRAFT_S3_BUCKET` | one bucket per install; key prefixes separate data kinds |
+| `-s3.path-style` | `BBRAFT_S3_PATH_STYLE` | `true` for Garage and most self-hosted services |
+| `-s3.access-key-id` | `BBRAFT_S3_ACCESS_KEY_ID` | credential identifier |
+| `-s3.secret-access-key-file` | `BBRAFT_S3_SECRET_ACCESS_KEY_FILE` | file holding the secret |
+| `-s3.location-hint` | `BBRAFT_S3_LOCATION_HINT` | optional, R2 only, applied when the bucket is created |
+| `-s3.create-bucket` | `BBRAFT_S3_CREATE_BUCKET` | create the bucket if it does not exist |
+
+A flag given on the command line wins over its `BBRAFT_S3_*` variable. The
+secret access key never comes from a flag: it is read from
+`BBRAFT_S3_SECRET_ACCESS_KEY` or from the file named by
+`-s3.secret-access-key-file`, never both. The file must be a regular file
+with mode `0600` or stricter, and a symlink is refused; one trailing newline
+is ignored. The key is never written to logs, errors or configuration dumps;
+startup failures name the object store and never the credential.
+
+Startup rules: a bucket needs an access key id and a secret from one of those
+two sources. With no bucket anywhere the object store is off. The endpoint,
+region and bucket are then validated by the object-store implementation when
+the server connects, and a refused endpoint or unreachable bucket fails
+start-up.
+
+**Phase 1 mode.** Without `-s3.bucket` the server runs exactly as before: no
+snapshot uploads, local stop/resume and node-local saved snapshots. Fork and
+cross-node resume are refused until an object store is configured.
+
+**Service notes.** Only core S3 operations are used: PUT, GET with ranges,
+HEAD, DELETE, ListObjectsV2 and presigned GET/PUT. There is deliberately no
+multipart upload: every object is one PUT (a snapshot chunk is at most a few
+MiB compressed, a manifest at most 128 MiB; a single PUT reaches 5 GiB).
+Chunk integrity is computed and verified by bamboo-raft, keys are immutable,
+and retention belongs to the server, so bucket lifecycle rules, versioning,
+tagging and ACLs are never required. Presigned URLs are
+signed for the configured endpoint, so a self-hosted endpoint must be
+reachable by whoever follows the URL, or the server streams the object
+itself.
 
 ## Node inventory
 
@@ -199,7 +467,9 @@ The `nodehub` role polls connected nodes, writes healthy info through
 `UpsertNodeInfo` with the observation time, and keeps canonical reservation
 counters untouched. A disconnected node or a failed `Info` call immediately
 marks the row stale (`TouchNodeSeen` with the Unix epoch) so placement cannot
-use old capacity. Epoch ordering is enforced by the accepted gateway
+use old capacity. Only a connected observation moves `last_up_at`, the clock
+node-loss detection reads, so the stale marker never makes a short blip look
+like a lost node. Epoch ordering is enforced by the accepted gateway
 inventory poller, not by a second role-local state machine. An offline row
 that was never registered is benign.
 

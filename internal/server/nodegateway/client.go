@@ -200,3 +200,13 @@ func (b *boundClient) AttachProcess(ctx context.Context, in *nodev1.AttachProces
 func (b *boundClient) ReadFile(ctx context.Context, in *nodev1.ReadFileRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[nodev1.ReadFileResponse], error) {
 	return b.inner.ReadFile(b.bind(ctx), in, opts...)
 }
+
+// SnapshotVM forwards through the gateway with this client's binding.
+func (b *boundClient) SnapshotVM(ctx context.Context, in *nodev1.SnapshotVMRequest, opts ...grpc.CallOption) (*nodev1.Generation, error) {
+	return b.inner.SnapshotVM(b.bind(ctx), in, opts...)
+}
+
+// ResetVM forwards through the gateway with this client's binding.
+func (b *boundClient) ResetVM(ctx context.Context, in *nodev1.ResetVMRequest, opts ...grpc.CallOption) (*nodev1.VM, error) {
+	return b.inner.ResetVM(b.bind(ctx), in, opts...)
+}

@@ -20,8 +20,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nathabonfim59/bamboo-raft/internal/node"
 	nodenet "github.com/nathabonfim59/bamboo-raft/internal/node/net"
 	"github.com/nathabonfim59/bamboo-raft/internal/node/qemu"
+	"github.com/nathabonfim59/bamboo-raft/internal/objstore/s3"
 	"github.com/nathabonfim59/bamboo-raft/internal/overcommit"
 	"github.com/nathabonfim59/bamboo-raft/internal/proto/nodev1"
 )
@@ -69,6 +71,10 @@ const (
 	// meminfoPath is the procfs file host memory is read from.
 	meminfoPath = "/proc/meminfo"
 
+	// defaultChunkCacheBytes is the local chunk cache cap: 8 GiB. Zero
+	// disables the cache.
+	defaultChunkCacheBytes = uint64(8 << 30)
+
 	// defaultJailQEMUBinary is the Debian QEMU the jailer stages.
 	defaultJailQEMUBinary = "/usr/bin/qemu-system-x86_64"
 	// defaultJailToolBinary is the trusted qemu-img the jailer stages for
@@ -76,8 +82,9 @@ const (
 	defaultJailToolBinary = "/usr/bin/qemu-img"
 )
 
-// options is the parsed command line. It never holds the token: secrets
-// stay out of configuration structs so no dump can print them.
+// options is the parsed command line. It never holds the node token; the S3
+// secret is held only inside s3.Config, whose String and LogValue redact it,
+// so no dump or log line prints it.
 type options struct {
 	serverAddr   string
 	nodeID       string
@@ -90,6 +97,12 @@ type options struct {
 	cpuFeatures  []string
 	cpuAllowHost bool
 	bootTimeout  time.Duration
+
+	// Phase 2 object store: the resolved -s3.* values (off when
+	// s3Configured is false) and the local chunk cache cap.
+	s3Config        s3.Config
+	s3Configured    bool
+	chunkCacheBytes uint64
 
 	capacityVCPUs     uint64
 	capacityMemoryMiB uint64
@@ -113,6 +126,13 @@ type options struct {
 	sshIngressAddr    string
 	sshIngressIface   string
 	sshPortRange      string
+
+	// vsockCIDRange is -node.vsock-cid-range as given; vsockMinCID and
+	// vsockMaxCID are its parsed bounds. Both stay zero when the flag is
+	// empty, which leaves the Manager's default range in place.
+	vsockCIDRange string
+	vsockMinCID   uint32
+	vsockMaxCID   uint32
 
 	// Jailed QEMU (tap mode). jail() turns these into a validated plan.
 	jailUIDRange    string
@@ -233,6 +253,14 @@ func parseFlags(args []string, out io.Writer, lookupEnv func(string) (string, bo
 	fs.Uint64Var(&o.jailIOReadIOPS, "node.jail-io-read-iops", 0, "per-VM read IOPS limit; 0 omits it (env BBRAFT_NODE_JAIL_IO_READ_IOPS)")
 	fs.Uint64Var(&o.jailIOWriteIOPS, "node.jail-io-write-iops", 0, "per-VM write IOPS limit; 0 omits it (env BBRAFT_NODE_JAIL_IO_WRITE_IOPS)")
 
+	// Phase 2 object store: the same -s3.* flags every binary registers, and
+	// the node's local chunk cache cap (implemented in M2).
+	s3Flags := s3.RegisterFlags(fs)
+	fs.Uint64Var(&o.chunkCacheBytes, "node.chunk-cache-bytes", defaultChunkCacheBytes,
+		"local chunk cache cap in bytes under node.data-dir; 0 disables it (env BBRAFT_NODE_CHUNK_CACHE_BYTES)")
+	fs.StringVar(&o.vsockCIDRange, "node.vsock-cid-range", "",
+		"guest vsock CIDs are allocated from this inclusive MIN-MAX range, for example 3-999; empty uses the built-in default range, and two node processes on one host use different ranges to avoid allocating the same CID (env BBRAFT_NODE_VSOCK_CID_RANGE)")
+
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -261,6 +289,15 @@ func parseFlags(args []string, out io.Writer, lookupEnv func(string) (string, bo
 	}
 	o.supplied = supplied
 
+	// The object store resolves like the node token: flags first, BBRAFT_S3_*
+	// as the fallback, and the secret only from its variable or a 0600 file.
+	// A malformed secret file stops startup; errors never print the secret.
+	s3Cfg, s3Configured, err := s3Flags.Config(lookupEnv)
+	if err != nil {
+		return nil, fmt.Errorf("object store: %w", err)
+	}
+	o.s3Config, o.s3Configured = s3Cfg, s3Configured
+
 	if strings.TrimSpace(o.nodeID) == "" {
 		h, err := hostname()
 		if err != nil || strings.TrimSpace(h) == "" {
@@ -280,6 +317,14 @@ func parseFlags(args []string, out io.Writer, lookupEnv func(string) (string, bo
 	if o.bootTimeout <= 0 {
 		return nil, errors.New("node.boot-timeout must be positive")
 	}
+	if o.chunkCacheBytes > math.MaxInt64 {
+		return nil, fmt.Errorf("node.chunk-cache-bytes %d exceeds %d", o.chunkCacheBytes, uint64(math.MaxInt64))
+	}
+	minCID, maxCID, err := parseVSockCIDRange(o.vsockCIDRange)
+	if err != nil {
+		return nil, err
+	}
+	o.vsockMinCID, o.vsockMaxCID = minCID, maxCID
 	if err := checkCPUModel(o.cpuModel, o.cpuAllowHost); err != nil {
 		return nil, err
 	}
@@ -445,6 +490,39 @@ func parsePortRange(value string) (nodenet.PortRange, error) {
 		return nodenet.PortRange{}, fmt.Errorf("-node.ssh-port-range %q: minimum %d is above maximum %d", value, minPort, maxPort)
 	}
 	return nodenet.PortRange{Min: uint16(minPort), Max: uint16(maxPort)}, nil
+}
+
+// parseVSockCIDRange parses -node.vsock-cid-range "MIN-MAX". An empty value
+// leaves the Manager's built-in default range and returns zero bounds. Linux
+// vsock reserves CIDs 0..2 and 2^32-1 is VMADDR_CID_ANY, so both bounds must
+// stay inside the Manager's accepted range; the flag layer refuses them by
+// name before normalizeConfig ever sees them.
+func parseVSockCIDRange(value string) (uint32, uint32, error) {
+	if value == "" {
+		return 0, 0, nil
+	}
+	lo, hi, ok := strings.Cut(value, "-")
+	if !ok || lo == "" || hi == "" {
+		return 0, 0, fmt.Errorf("-node.vsock-cid-range %q is not MIN-MAX, for example 3-999", value)
+	}
+	minCID, err := strconv.ParseUint(lo, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("-node.vsock-cid-range %q: minimum %q is not a decimal integer in 0..4294967295", value, lo)
+	}
+	maxCID, err := strconv.ParseUint(hi, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("-node.vsock-cid-range %q: maximum %q is not a decimal integer in 0..4294967295", value, hi)
+	}
+	if minCID < uint64(node.DefaultMinCID) {
+		return 0, 0, fmt.Errorf("-node.vsock-cid-range %q: minimum %d is below %d, the first CID Linux vsock does not reserve", value, minCID, node.DefaultMinCID)
+	}
+	if maxCID > uint64(node.DefaultMaxCID) {
+		return 0, 0, fmt.Errorf("-node.vsock-cid-range %q: maximum %d is above %d, which is VMADDR_CID_ANY rather than a guest CID", value, maxCID, node.DefaultMaxCID)
+	}
+	if minCID > maxCID {
+		return 0, 0, fmt.Errorf("-node.vsock-cid-range %q: minimum %d is above maximum %d", value, minCID, maxCID)
+	}
+	return uint32(minCID), uint32(maxCID), nil
 }
 
 // networkPlan is the resolved VM networking for one node process: either a

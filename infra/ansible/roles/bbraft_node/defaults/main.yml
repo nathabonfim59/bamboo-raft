@@ -242,3 +242,25 @@ bbraft_node_jail_io_write_iops: 0
 # DelegateSubgroup= needs systemd 254 or newer; checked on real hosts only
 # (bbraft_node_manage_service).
 bbraft_node_systemd_min_version: 254
+
+# --- Phase 2 object store (optional; off when both modes are empty) --------
+#
+# Exactly one mode selects S3. Leave both empty for Phase 1 behavior.
+#
+# Colocated Garage: point at the non-secret file the garage role wrote. The
+# secret stays in its own root-only file; systemd passes a 0400 service-owned
+# copy to bbraft-node through LoadCredential=.
+bbraft_node_s3_env_file: ""
+bbraft_node_s3_secret_file: /etc/bbraft/s3-secret-access-key
+#
+# Remote S3 (Garage on another host, R2, AWS): the role renders its own
+# non-secret env file and secret file under the config directory. The secret
+# comes from the inventory or a vault, never from a flag, and is never logged.
+bbraft_node_s3: {}
+bbraft_node_s3_secret_access_key: ""
+bbraft_node_s3_managed_env_file: "{{ bbraft_node_config_dir }}/s3.env"
+bbraft_node_s3_managed_secret_file: "{{ bbraft_node_config_dir }}/s3-secret-access-key"
+
+# Local chunk cache cap under the data dir; 0 disables it (the binary's own
+# default is 8 GiB). Rendered only when the object store is configured.
+bbraft_node_chunk_cache_bytes: 8589934592

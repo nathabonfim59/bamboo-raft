@@ -76,6 +76,24 @@ replacing an existing version. It is not wired into `site.yml`; the role
 README lists its variables. Upgrading a Phase 0.5 node: see
 [Upgrading from Phase 0.5](#upgrading-from-phase-05).
 
+Phase 2 object storage in the
+[bbraft_node role](../infra/ansible/roles/bbraft_node/README.md) is optional
+and off by default. It enables S3 in one of two mutually exclusive modes:
+**colocated Garage** (`bbraft_node_s3_env_file`, typically pointing at the
+`garage` role's `/etc/bbraft/s3.env`, plus `bbraft_node_s3_secret_file`,
+default `/etc/bbraft/s3-secret-access-key`) or **remote S3** (`bbraft_node_s3`
+with `endpoint`, `region`, `bucket`, `path_style` and `access_key_id`, plus
+`bbraft_node_s3_secret_access_key` from inventory or vault, written by the
+role to `/etc/bbraft-node-v1/s3.env` and
+`/etc/bbraft-node-v1/s3-secret-access-key` with `no_log`). In both modes the
+unit loads non-secret settings with `EnvironmentFile=`, reads the secret
+through `LoadCredential=s3-secret-access-key:<secret file>` (systemd exposes
+a `0400` service-owned copy under `%d`) and sets
+`Environment=BBRAFT_S3_SECRET_ACCESS_KEY_FILE=%d/s3-secret-access-key` after
+`EnvironmentFile=`, so the secret never appears in an environment file, the
+unit or a log. When S3 is enabled, the unit also renders
+`-node.chunk-cache-bytes` (`bbraft_node_chunk_cache_bytes`, default 8 GiB).
+
 ## Flags and environment
 
 Every flag has a `BBRAFT_*` fallback: dots and dashes become underscores,
@@ -114,6 +132,7 @@ unless the matching flag is set.
 | `-node.ssh-ingress-addr` | `BBRAFT_NODE_SSH_INGRESS_ADDR` | empty (required in tap) | Node address SSH ingress ports are published on. |
 | `-node.ssh-ingress-iface` | `BBRAFT_NODE_SSH_INGRESS_IFACE` | empty (the production role requires it) | Host interface SSH ingress is bound to; must differ from the VM bridge. |
 | `-node.ssh-port-range` | `BBRAFT_NODE_SSH_PORT_RANGE` | empty (required in tap) | Inclusive SSH ingress port pool, `min-max`, for example `22000-22999`; ports start at 1024. |
+| `-node.vsock-cid-range` | `BBRAFT_NODE_VSOCK_CID_RANGE` | empty (CIDs 3 to 2^32-2) | Inclusive guest vsock CID pool `min-max`, `3 <= min <= max <= 2^32-2`, for new VMs only (existing VMs keep their CIDs). CIDs are host-global: two node processes on one host need disjoint ranges. |
 | `-node.jail-uid-range` | `BBRAFT_NODE_JAIL_UID_RANGE` | empty (required in tap) | Inclusive host uid=gid pool `min-max`, `0 < min < max < 2^31`: one uid per jailed VM, CPU probe or `qemu-img` attempt. No host account or group may use an id in it. |
 | `-node.jail-cgroup` | `BBRAFT_NODE_JAIL_CGROUP` | empty (required in tap) | `<service cgroup>/vms`, for example `/sys/fs/cgroup/system.slice/bbraft-node.service/vms`. |
 | `-node.jail-qemu-binary` | `BBRAFT_NODE_JAIL_QEMU_BINARY` | `/usr/bin/qemu-system-x86_64` | Trusted root-owned QEMU staged into every VM jail. |
@@ -122,6 +141,30 @@ unless the matching flag is set.
 | `-node.jail-library-dirs` | `BBRAFT_NODE_JAIL_LIBRARY_DIRS` | empty (Debian multiarch) | Comma-separated trusted directories searched for QEMU's ELF libraries. |
 | `-node.jail-io-device` | `BBRAFT_NODE_JAIL_IO_DEVICE` | empty (required in tap) | `MAJ:MIN` of the whole disk holding the data and image dirs. |
 | `-node.jail-io-read-bps`, `-node.jail-io-write-bps`, `-node.jail-io-read-iops`, `-node.jail-io-write-iops` | `BBRAFT_NODE_JAIL_IO_READ_BPS` and so on | `0` (omitted) | Per-VM `io.max` limits. At least one must be positive in tap mode; no hardware default is assumed. |
+| `-node.chunk-cache-bytes` | `BBRAFT_NODE_CHUNK_CACHE_BYTES` | `8589934592` (8 GiB) | Local chunk cache cap in bytes under `<data>/chunks` when an object store is configured; `0` disables disk caching. Must fit in `int64`. |
+| `-s3.endpoint` | `BBRAFT_S3_ENDPOINT` | empty | S3 endpoint URL such as `http://127.0.0.1:3900`; empty uses AWS S3. |
+| `-s3.region` | `BBRAFT_S3_REGION` | empty | Bucket region: the service's configured region, `auto` on R2, or the AWS region. |
+| `-s3.bucket` | `BBRAFT_S3_BUCKET` | empty | Bucket holding snapshot chunks and manifests; empty disables the object store (Phase 2 off). |
+| `-s3.path-style` | `BBRAFT_S3_PATH_STYLE` | `false` | Address the bucket in the URL path instead of a virtual host. |
+| `-s3.access-key-id` | `BBRAFT_S3_ACCESS_KEY_ID` | empty | Access key id (required when `-s3.bucket` is set). The secret never comes from a flag. |
+| `-s3.create-bucket` | `BBRAFT_S3_CREATE_BUCKET` | `false` | Create the bucket when it does not exist. |
+| `-s3.location-hint` | `BBRAFT_S3_LOCATION_HINT` | empty | Location hint when creating a bucket (R2 only). |
+| `-s3.secret-access-key-file` | `BBRAFT_S3_SECRET_ACCESS_KEY_FILE` | empty | File holding the S3 secret access key: a regular file (no symlink), mode `0600` or stricter, at most 8192 bytes. |
+
+With no `-s3.*` flag and no non-empty `BBRAFT_S3_*` variable at all, the
+object store is off: Phase 2 snapshot and manifest-restore RPCs fail with
+`FAILED_PRECONDITION`. Any S3 setting without `-s3.bucket`
+(`BBRAFT_S3_BUCKET`) is a half-applied configuration (for example an
+environment file systemd ignored) and the node refuses to start, naming the
+settings that are set (never their values). When a bucket is set,
+`-s3.access-key-id` (`BBRAFT_S3_ACCESS_KEY_ID`) is required, and the secret
+access key comes **only** from `-s3.secret-access-key-file`
+(`BBRAFT_S3_SECRET_ACCESS_KEY_FILE`, a regular file with mode `0600` or
+stricter, symlinks refused, at most 8192 bytes, one trailing newline
+trimmed) **or** `BBRAFT_S3_SECRET_ACCESS_KEY`, never from a flag value.
+Setting both, setting neither, or supplying an empty, oversized or
+permissive secret is a startup error; the secret never appears in logs or
+errors.
 
 Every jail flag is required or validated in tap mode and **refused** in the
 dev/test user mode, by flag or variable, even when equal to its default.
@@ -267,6 +310,8 @@ Wildcard (`0.0.0.0`, `::`), public, link-local and 4-in-6-mapped public
 addresses and non-`localhost` hostnames are rejected with a config error.
 TLS for the link is a later phase (mTLS is planned); until then a
 node and server on different hosts need a private network between them.
+[deploy.md](deploy.md#connecting-a-node-on-another-host) shows three ways
+to get one: an SSH tunnel, Tailscale's IPv6 addresses, or a private network.
 
 ## VM networking
 
@@ -295,6 +340,14 @@ inside the guest prefix, an ingress interface equal to the bridge, and ports
 below 1024. `-node.network-resolvers` takes at most **two** addresses because
 QEMU's direct-boot `ip=` parameter carries two nameservers; the defaults are
 the public resolvers `1.1.1.1` and `9.9.9.9`, never the host's own resolvers.
+
+The startup host check also lists the host's IPv4 addresses and refuses to
+start when any interface other than the node's bridge holds an address inside
+the guest prefix, or sits on a network that overlaps it: a guest could
+otherwise be given a host address, and an SSH ingress port would reach a host
+service. A node running inside a bamboo-raft sandbox needs a guest prefix
+(`-node.network-prefix`, gateway and resolvers) different from its parent
+sandbox's network (the parent's guest default is `10.42.0.0/16`).
 
 ### SSH ingress
 
@@ -352,8 +405,16 @@ durable record is the restart identity for a running VM.
   vms/<sandbox-id>/            # one dir per VM, mode 0700
     vm.json                    # durable manifest, mode 0600 (holds the VM env)
     disk.qcow2                 # writable overlay on the verified base image
+    phase2.json                # Phase 2 snapshot state, mode 0600
+    last-manifest              # local copy of the last snapshot manifest, mode 0600
+    fleece.qcow2               # temporary fleece image (only during a live snapshot)
     control/qmp.sock           # QEMU control socket, /control/qmp.sock in the jail
+    control/nbd.sock           # QEMU NBD socket in jailed mode (/control/nbd.sock; only during an NBD session)
+    nbd.sock                   # QEMU NBD socket in dev/test user mode (only during an NBD session)
     serial.log                 # guest serial console, /serial.log in the jail
+  phase2/
+    fleece-<size>.qcow2        # standalone empty qcow2 fleece templates, one per virtual size in bytes
+  chunks/                      # content-addressed LRU chunk cache (<first 2 hex>/<64 hex>, tmp/)
   orphans/<name>-<unix>-<random>/  # quarantined VM dirs; never touched again
 <data>/images/
   <image-id>/                  # id: [a-z0-9][a-z0-9._-]{0,63}
@@ -405,6 +466,22 @@ the default and is reported as `Info.default_image`.
   node process can adopt them; a VM that never reached READY is cleaned
   up.
 
+`ResetVM` power-cycles a `READY` VM (or a `FAILED` VM whose QEMU process is
+still running) with a hardware reset while keeping its disk, QEMU process,
+network allocation and reservations. Because every QEMU runs with
+`-no-reboot` (so a guest reboot shuts QEMU down), the node temporarily arms
+QMP `set-action` with `reboot=reset` before issuing `system_reset`, and
+restores `reboot=shutdown` on every exit path while QEMU is alive. The VM
+record moves to `BOOTING` for the duration of the reset and guest wait
+(bounded by `-node.boot-timeout`; the VM operation gate covers only the
+machine reset so `DeleteVM` can fence the wait immediately, and a joining
+`CreateVM` waits on the reset like a boot). Once `system_reset` runs, the
+previous guest connection is closed, the node dials a fresh one and waits
+for `Ping`, ending in `READY` or `FAILED` (QEMU kept); if the last caller
+cancels before the reset runs, the record returns to its prior state.
+Detached guest processes become `LOST` because the guest agent rebuilds its
+registry when the machine reboots.
+
 ## Restart
 
 - The node takes an exclusive lock (`node.lock`, flock) on the data dir; a
@@ -441,6 +518,28 @@ the default and is reported as `Info.default_image`.
   not prove that the filesystem is writable. Failed recovery leaves a FAILED
   record; process ownership and cleanup must be resolved before its resources
   can be reused.
+- Phase 2 live cuts interrupted by a restart (`snapshotInProgress` in
+  `phase2.json`) are settled during reconciliation: on a live adopted QEMU,
+  the node tears down any leftover export, NBD server, backup job, fleece
+  node and fd set, merges `bbraft-cut` back into `bbraft-dirty`, removes
+  scratch files (`fleece.qcow2`, stale `nbd.sock`) and clears the marker; if
+  the merge cannot be proven, it sets `fullScanNext`. If the VM's QEMU is
+  proven gone, the non-persistent `bbraft-cut` was lost with the process, so
+  scratch is removed, the marker cleared and `fullScanNext` set. An adopted
+  QEMU still in `prelaunch` ensures `bbraft-dirty` before `cont` (failing
+  verification on error); an already-running or paused QEMU ensures it best
+  effort and sets `fullScanNext` on failure.
+- A surviving [maintenance launch](#maintenance-launch) QEMU (identified by
+  the `-maint` suffix in `-name`) is verified, quit over QMP (or killed with
+  `SIGKILL` after the quit timeout) and never continued, adopted or booted.
+  Once it exits and its scratch and jail attempt are released, a stopped VM
+  returns to `STOPPED` and a creating VM becomes `FAILED` with its disk
+  kept.
+- A VM record whose QEMU ownership could not be resolved after a restart
+  refuses every operation that acts on or commits state for it (`StopVM`,
+  `StartVM`, `ResetVM`, `SnapshotVM` and maintenance sessions) with
+  `UNAVAILABLE` after re-checking whether ownership can now be resolved;
+  only `DeleteVM` can clear it, and only once absence is proven.
 
 ## Snapshots
 
@@ -466,6 +565,122 @@ private qcow2 disk and the guest root filesystem; shrinking is rejected.
 Deleting the source VM or the saved snapshot cannot break an existing child.
 Saves and VM deletion also serialize, so deletion waits for snapshot cleanup
 and still fences earlier creates.
+
+## Snapshots in the object store (Phase 2)
+
+When `-s3.bucket` is configured and QEMU passes the capability gate below,
+`SnapshotVM` writes content-addressed 4 MiB zstd-compressed chunks
+(`chunks/<sha256>`) and a self-contained whole-disk manifest
+(`manifests/<chain-id>/<generation>.json.zst`) to the object store, and
+`CreateVM` with `from_manifest` restores a VM from a manifest. Without an
+object store, both RPCs fail with `FAILED_PRECONDITION`.
+
+**Dirty bitmap and paused launch.** Every QEMU starts paused (`-S`, status
+`prelaunch`). Before sending `cont`, when the node's QEMU supports Phase 2,
+the node ensures a persistent dirty bitmap named `bbraft-dirty` exists on
+`rootdisk` with 4 MiB granularity and is recording, so no guest write
+predates it. If the bitmap is missing, inconsistent (for example after a
+crash or `SIGKILL`), non-persistent, of the wrong granularity or stored
+disabled, the node durably sets `fullScanNext` in `vms/<id>/phase2.json`
+before repairing the bitmap. The next `SnapshotVM` scans every allocated
+chunk in the sandbox overlay instead of only dirty chunks whenever
+`fullScanNext` is set, no valid local `vms/<id>/last-manifest` matches the
+current image, disk size and chunk size, or a previous cut failed to merge
+back.
+
+**Live and stopped `SnapshotVM`.** Calls for one VM serialize through the VM
+operation gate (with `StopVM`, `StartVM`'s disk phase, `ResetVM` and
+`DeleteVM`). On a `READY` VM, the node copies `vms/<id>/fleece.qcow2` from
+`phase2/fleece-<size>.qcow2`, passes it to QEMU (`add-fd` and `blockdev-add`
+backed by `rootdisk`), marks `snapshotInProgress`, and (unless
+`freeze=false`) freezes the guest with a 5 s lease. One atomic QMP
+`transaction` creates a temporary non-persistent disabled bitmap
+`bbraft-cut`, merges `bbraft-dirty` into `bbraft-cut`, clears
+`bbraft-dirty`, and starts a copy-before-write `blockdev-backup`
+(`sync=none`) job into the fleece node. After proving the same freeze lease
+held through the transaction and thawing the guest (an unproven thaw marks
+the VM `FAILED`, as in Phase 1), QEMU exports the fleece node read-only over
+NBD with `bbraft-cut` and `allocation-depth`. Four parallel workers read
+dirty (or allocated) chunks, upload missing chunks with `PutIfAbsent`, and
+write the manifest last. On success the node tears down the export, NBD
+server, backup job, fleece node and fd set, persists `last-manifest`, clears
+`fullScanNext`, removes `bbraft-cut`, clears `snapshotInProgress`, and drops
+the fleece file and reservation. On any failure (or cancellation, or
+`DeleteVM` fencing which returns `ABORTED`), the node tears down the cut and
+merges `bbraft-cut` back into `bbraft-dirty` (setting `fullScanNext` if the
+merge cannot be proven) and releases the fleece reservation only once QEMU
+holds no fleece node or fd set; already-uploaded chunks remain valid and no
+manifest is written. On a `STOPPED` VM, `SnapshotVM` runs inside a
+[maintenance launch](#maintenance-launch) with no fleece image or backup
+job: it runs the bitmap cut transaction, exports `rootdisk` read-only over
+NBD, uploads chunks and the manifest, persists `last-manifest`, removes
+`bbraft-cut` and quits QEMU cleanly so `bbraft-dirty` is stored in the
+qcow2. An existing manifest returns `ALREADY_EXISTS` and object-store
+outages return `UNAVAILABLE`.
+
+**Fleece reservation and free-space floor.** Before a live cut starts, the
+node reserves `min(disk_gib, max(1, ceil(disk_gib / 8)))` GiB of disk
+capacity for `fleece.qcow2` so concurrent `CreateVM` calls cannot promise
+the same space. Before every chunk read, the node checks both the fleece
+file's allocated size (`st_blocks * 512`) against that reservation and live
+free space on the data directory filesystem against the free-space floor
+(`DefaultSnapshotFreeFloor`, 2 GiB). Exceeding the reservation or dropping
+below the floor aborts the snapshot with `RESOURCE_EXHAUSTED`, tears down
+the cut and merges `bbraft-cut` back into `bbraft-dirty`.
+
+**Eager restore and chunk cache.** `CreateVM` with `from_manifest` (mutually
+exclusive with `from_snapshot`) fetches and validates the manifest (chain
+and generation match, image installed on this node with matching SHA-256
+when recorded, disk large enough for `DiskBytes`) before reserving capacity
+or creating a VM record, so a refused request leaves no VM behind. After
+creating the overlay, the boot worker runs an eager restore inside a
+[maintenance launch](#maintenance-launch): QEMU exports `rootdisk` writable
+over NBD and four parallel workers write every manifest entry (zero entries
+with `WriteZeroes`, data entries fetched through the chunk cache); unlisted
+chunks read from the base image. Restore is not bounded by
+`-node.boot-timeout` (which starts once restore finishes), only by the last
+waiter leaving, `DeleteVM` or node shutdown. After flushing and stopping
+NBD, the node clears `bbraft-dirty`, records `last-manifest` and clears
+`fullScanNext` so the first `SnapshotVM` after boot is incremental, then
+boots the VM normally. Fetches go through the bounded content-addressed LRU
+chunk cache under `<data>/chunks` (`-node.chunk-cache-bytes`, default 8 GiB;
+`0` disables disk caching), which stores compressed chunk objects under
+`<first 2 hex>/<64 hex>`, verifies every read against its SHA-256 (removing
+and refetching corrupt files), coalesces concurrent misses, and rebuilds its
+LRU order from modification times on restart.
+
+**Failed restore.** Once the VM record and disk exist, a restore that fails
+(for example a missing or corrupt chunk, reported as `INTERNAL`, or an
+object-store outage, reported as `UNAVAILABLE`) fails the boot and leaves a
+`FAILED` VM record with its private disk preserved until `DeleteVM` removes
+it (whereas an abort from the last caller canceling or `DeleteVM` fencing
+cleans up per the normal boot policy).
+
+### QEMU capability gate and tested versions
+
+During the startup CPU probe (jailed or unjailed), the node calls
+`query-qmp-schema` on the probe QEMU and checks every QMP command, argument,
+transaction action and enum value Phase 2 uses (`query-named-block-nodes`,
+`transaction`, `blockdev-backup` with `sync=none`, `block-dirty-bitmap-*`,
+`add-fd`/`remove-fd`, `blockdev-add`/`blockdev-del`, `nbd-server-start`/
+`nbd-server-stop`, `block-export-add`/`block-export-del` with `nbd`,
+`bitmaps` and `allocation-depth`, `block-job-cancel`, `query-jobs`,
+`set-action` with `reboot=reset` and `system_reset`). If the probe cannot
+read the schema, the check runs on the first VM's QMP connection instead,
+and the result is cached for the node's lifetime.
+
+If any required command or argument is missing, the node logs a warning
+listing the missing items and still starts: normal VMs launch without dirty
+bitmaps (Phase 1 behavior), while `SnapshotVM` and `CreateVM` with
+`from_manifest` fail with `FAILED_PRECONDITION` naming the QEMU version and
+missing capabilities.
+
+- **QEMU 8.2.2** (Ubuntu 24.04, the test VMs): passes the capability gate
+  and the Phase 2 KVM suite.
+- **QEMU 10.0.13**, an upstream build (`internal/node/qemu10.sh`, used by the
+  KVM tests through `BBRAFT_TEST_QEMU_PREFIX`): passes the capability gate and
+  the Phase 2 KVM suite. Production runs Debian 13's QEMU 10.0, whose distro
+  build may carry patches; the gate is the safety net there.
 
 ## KVM test CPU selection
 
@@ -543,6 +758,42 @@ there is recorded by inode in an intent before it exists, and the node
 removes only recorded inodes no tool still holds. A foreign, mismatched or
 still-held entry is **preserved** and startup fails, naming it.
 
+## Maintenance launch
+
+A maintenance launch is a second, explicit QEMU launch form used to work on
+a VM disk when no guest is running: `SnapshotVM` on a `STOPPED` VM and eager
+restore (`CreateVM` with `from_manifest`) before first boot. In production
+it runs jailed on its own uid and cgroup, holds the VM operation gate
+throughout (serialized with `StartVM`, `StopVM`, `DeleteVM` and other disk
+operations; `DeleteVM` fences it with `ABORTED`), and quits cleanly over QMP
+(10 s timeout, `SIGKILL` fallback which sets `fullScanNext` because the
+dirty bitmap is left inconsistent).
+
+Its argv and descriptors are strictly narrower than a normal VM launch:
+
+- Starts paused (`-S`) and is **never continued**; QEMU only serves the
+  explicit disk graph (`base` read-only and `rootdisk` overlay) over QMP and
+  its Unix NBD server (`/control/nbd.sock` in the jail, `vms/<id>/nbd.sock`
+  in user mode).
+- No network, no vsock and no guest devices: `-netdev`, `-device` and
+  `-object` are refused by the jailer (no `virtio-blk`, `virtio-net`,
+  `vhost-vsock`, `rng`, `balloon` or `vmgenid`), and no TAP, `vhost-net` or
+  `vhost-vsock` descriptors are inherited. Only `kernel`, `initrd`, `base`
+  and `overlay` descriptors are passed.
+- Sized to 1 vCPU (`-smp 1`) and `min(256 MiB, VM memory)` (`-m` and cgroup
+  `memory.max`). For a `STOPPED` VM (which holds no compute reservation),
+  that memory is admitted against node capacity for the session (refused
+  with `UNAVAILABLE` when full) and released when it ends; a creating VM
+  already holds its full reservation.
+- Named with the fixed marker `-name guest=<id>,process=<id>-maint`. Because
+  normal VMs also start with `-S`, a restarted node uses this `-maint`
+  process-name marker to distinguish a maintenance QEMU from a VM launch,
+  proves it (jailer identity, argv digest and maintenance grammar, pins and
+  QMP peer in jailed mode), quits it (or kills it after timeout) and never
+  continues, adopts or boots it. After cleanup, a stopped VM returns to
+  `STOPPED` and a creating VM becomes `FAILED` with its disk kept; an
+  unsettled maintenance QEMU leaves the VM unresolved (`FAILED`).
+
 ## Upgrading from Phase 0.5
 
 Phase 1 starts from a **fresh data dir**. Nothing from a Phase 0.5 node is
@@ -616,11 +867,14 @@ entry, and the entry is left as it was:
   named entries after checking that no `qemu-img` of the jail uid range
   runs.
 
-## Phase 1 limits
+## Phase 1 and Phase 2a limits
 
 - Plaintext node ⇄ server link restricted as above; no mTLS yet.
-- Snapshots are node-local qcow2 copies; no object-store publication, no
-  continuous snapshots, no memory snapshots.
+- Object-store snapshots (Phase 2a) support whole-disk incremental
+  `SnapshotVM` and eager `CreateVM` from a manifest; lazy restore, hydration
+  progress, prefetch and compaction belong to Phase 2b.
+- No snapshot tree, snapshot file browsing or snapshot download yet.
+- No memory snapshots yet.
 - Images are installed under `-node.image-dir` by the operator (or the
   Ansible role); the node verifies but does not yet pull them.
 - The guest agent is reached over vhost-vsock only; the guest holds no

@@ -82,6 +82,11 @@ stay on loopback, the API reaches clients through `tailscale serve`
 `tailscale_serve_scheme: http`: see [API access](#api-access-https-or-http)),
 and SSH is admitted only from the tailnet.
 
+This section sets up one host that runs everything. To add nodes on other
+hosts (the node link over an SSH tunnel or the tailnet, per-node tokens, the
+object store for remote nodes), see
+[docs/deploy.md](../docs/deploy.md).
+
 ### Before the first run
 
 - **Tailnet policy** (admin console): a `tag:bbraft` tag owner, and a grant
@@ -192,19 +197,14 @@ tailnet names) reach the API with `curl` but not with the static `bbraft`
 CLI, which reads only `/etc/resolv.conf`. See
 [docs/cli.md, "Tailnet names and the static binary"](../docs/cli.md#tailnet-names-and-the-static-binary).
 
-### Security limits of this first version
+### Security notes
 
-Configuring `hardening_vm_bridge_interfaces` permits IPv4 forwarding only; the input chain still drops bridge access to host services.
-
-- **A VM can open connections to the host.** QEMU user-mode networking
-  maps the guest's `10.0.2.2` to the host's loopback, and QEMU runs as the
-  node's user, so guest code can reach Postgres, the API, the node link, the
-  gateway and Garage on loopback, and the host's other addresses. Each of
-  them requires a credential the guest never holds. Accepted for dogfooding
-  (only our own jobs run); fixed by the per-VM jail
-  before anyone else's code runs on the host.
-- **All VMs share one Unix user**, so a QEMU escape reaches every VM's disk.
-  Same fix.
+- Every VM runs jailed with its own uid on a TAP (see
+  [docs/node.md, Jailed QEMU](../docs/node.md#jailed-qemu)); a guest cannot
+  reach the host's services, its management networks (the tailnet included)
+  or another VM. Configuring `hardening_vm_bridge_interfaces` permits IPv4
+  forwarding only; the input chain still drops bridge access to host
+  services.
 - `debian` keeps passwordless sudo; it is reachable only from the tailnet.
 
 ## Object storage

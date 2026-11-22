@@ -30,5 +30,5 @@ func TestConformance(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cc.Close() })
-	nodetest.Run(t, nodev1.NewNodeClient(cc), nodetest.Options{Phase1: nodetest.AllPhase1})
+	nodetest.Run(t, nodev1.NewNodeClient(cc), nodetest.Options{Phase1: nodetest.AllPhase1, Phase2: nodetest.Phase2{Snapshots: true, Reset: true, Store: fake.Store}})
 }
